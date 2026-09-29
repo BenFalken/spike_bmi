@@ -114,7 +114,7 @@ def list2str(lst, sep=','):
 
 def str2list(s, sep=',', dtype=str):
     """
-    Convert list into string
+    Convert string into list
     """
     return list(map(dtype, s.split(sep)))
 
@@ -122,13 +122,7 @@ def count_params(model):
     """
     Count trainable, non-trainable, and total parameters of a model.
     """
-    
-    '''
-    trainable_count = np.sum([np.prod(v.get_shape()) for v in model.trainable_weights]).astype(int)
-    non_trainable_count = np.sum([np.prod(v.get_shape()) for v in model.non_trainable_weights]).astype(int)
-    total_count = trainable_count + non_trainable_count
-    '''
-    
+
     trainable_count = np.sum([np.prod(v.shape) for v in model.trainable_weights]).astype(int)
     non_trainable_count = np.sum([np.prod(v.shape) for v in model.non_trainable_weights]).astype(int)
     total_count = trainable_count + non_trainable_count
@@ -154,7 +148,6 @@ def customize_plot(ax, xlabel, ylabel, xticks, xticklabels, title=None, xlim=Non
     ax.set_xlabel(xlabel, fontsize=fontsize)
     ax.set_ylabel(ylabel, fontsize=fontsize)
     ax.set_title(title, fontsize=fontsize+1)
-    #ax.yaxis.set_major_formatter(ticker.StrMethodFormatter("{x:.0f}"))
     for axis in ['bottom','left','top','right']:
         ax.spines[axis].set_linewidth(1.25)
 
@@ -164,8 +157,4 @@ def legend_plot(ax, loc='best', box_xy=None, title=None, fontsize=12, handleleng
     """
     leg = ax.legend(loc=loc, bbox_to_anchor=box_xy, title=title, title_fontsize=fontsize+1, fontsize=fontsize, handlelength=handlelength, ncol=ncol, columnspacing=columnspacing, frameon=frameon)        
     leg.get_frame().set_edgecolor('k')
-    leg.get_frame().set_linewidth(1.25) 
-    '''
-    for legobj in leg.legendHandles:
-        legobj.set_linewidth(2.0)
-    '''
+    leg.get_frame().set_linewidth(1.25)

@@ -1,143 +1,86 @@
 """
-Process the raw data to get spike and kinematic data
+Extract spike trains and kinematics from one raw session file (MATLAB v7.3
+.mat, as distributed at https://zenodo.org/record/3854034).
+
+Input  (--input_filepath):  raw .mat with cursor_pos, target_pos, t, spikes
+                            (a channels x units cell array of spike times;
+                            unit 0 on each channel is unsorted).
+Output (--output_filepath): .h5 with
+    task_time   (N,)       sample times, 4 ms apart
+    task_data   (N, 6)     pos_x, pos_y, vel_x, vel_y, acc_x, acc_y
+    target_pos  (N, 2)
+    sua_trains  ragged     one spike-time array per sorted unit (unit > 0, non-empty)
+    mua_trains  ragged     one spike-time array per channel (all units merged)
+All spike times are restricted to [task_time[0], task_time[-1]].
 """
 
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-
-# import packages
 import argparse
+import os
+import sys
+
 import h5py
 import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from bmi.utils import flatten_list
 
+NUM_CHANNELS = 96
+# make_dataset.py and make_snn_dataset.py assume this sampling interval.
+EXPECTED_DELTA_TIME = 0.004
+
+
 def main(args):
-
-    num_chan = 96
-    print (f"Reading raw data from file: {args.input_filepath}")
+    print(f"Reading raw data from file: {args.input_filepath}")
     with h5py.File(args.input_filepath, 'r') as f:
-        task_pos = f['cursor_pos'][()].T   # transpose to be N x 2 dimension, where N = number of samples
-        target_pos = f['target_pos'][()].T # transpose to be N x 2 dimension, where N = number of samples
-        task_time = f['t'][()].squeeze()   # time associated with the task, squeeze the format data into 1D
-        spikes = f['spikes'][()].T # transpose to be shape: number of channels x number of units
-        num_unit = spikes.shape[1]
-        print(f"Number of channels: {num_chan}, number of units: {num_unit}")
-        all_spikes = [] # list all spikes from num_chan x num_unit
-        for i in range(num_chan):
-            chan_spikes = []
-            for j in range(num_unit):
-                if (f[spikes[i,j]].ndim == 2):
-                    tmp_spikes = f[spikes[i,j]][()].squeeze(axis=0) # dimension: num of spikes, remove first dimension axis=0
-                else:
-                    tmp_spikes = np.empty(0)
-                chan_spikes.append(tmp_spikes)
-            all_spikes.append(chan_spikes)
+        task_pos = f['cursor_pos'][()].T      # (N, 2)
+        target_pos = f['target_pos'][()].T    # (N, 2)
+        task_time = f['t'][()].squeeze()      # (N,)
+        spike_refs = f['spikes'][()].T        # (channels, units) of HDF5 references
+        num_units = spike_refs.shape[1]
+        print(f"Number of channels: {NUM_CHANNELS}, number of units: {num_units}")
+        # MATLAB stores an empty cell as a 1-D placeholder; real spike lists are (1, n_spikes).
+        all_spikes = [[f[spike_refs[c, u]][()].squeeze(axis=0) if f[spike_refs[c, u]].ndim == 2
+                       else np.empty(0)
+                       for u in range(num_units)]
+                      for c in range(NUM_CHANNELS)]
 
-    sua_trains = []
-    len_sua_trains = []    
-    for i in range(num_chan):
-        for j in range(num_unit):
-            if (j > 0) & (all_spikes[i][j].shape[0] > 0): # first unit (j=0) is unsorted unit
-                #print(f"Include channel-{i}, unit-{j}, shape: {all_spikes[i][j].shape}")
-                sua_train = all_spikes[i][j]
-                sua_idx = np.where((sua_train >= task_time[0]) & (sua_train <= task_time[-1]))[0]
-                sua_train = sua_train[sua_idx]
-                sua_trains.append(sua_train)
-                len_sua_trains.append(len(sua_train))      
-    num_sua = len(sua_trains)  
+    def in_task(spikes):
+        return spikes[(spikes >= task_time[0]) & (spikes <= task_time[-1])]
 
-    # Computing MUA or threshold crossings    
-    mua_trains = []   
-    len_mua_trains = []   
-    for i in range(num_chan):
-        chan_mua = []
-        for j in range(num_unit):
-            if (all_spikes[i][j].shape[0] > 0):
-                mua_train = all_spikes[i][j]
-                mua_idx = np.where((mua_train >= task_time[0]) & (mua_train <= task_time[-1]))[0]
-                mua_train = mua_train[mua_idx]
-                chan_mua.append(mua_train)
-        chan_mua = flatten_list(chan_mua)
-        chan_mua.sort()
-        mua_trains.append(np.asarray(chan_mua))
-        len_mua_trains.append(len(chan_mua))
-    num_mua = len(mua_trains) 
+    sua_trains = [in_task(all_spikes[c][u])
+                  for c in range(NUM_CHANNELS) for u in range(1, num_units)
+                  if all_spikes[c][u].shape[0] > 0]
+    mua_trains = [np.asarray(sorted(flatten_list([in_task(s) for s in all_spikes[c] if s.shape[0] > 0])))
+                  for c in range(NUM_CHANNELS)]
+    print(f"Number of SUA: {len(sua_trains)}, Number of MUA: {len(mua_trains)}")
 
-    print(f"[Before filtering] Number of SUA: {len(sua_trains)}, Number of MUA: {len(mua_trains)}")
-
-    # minimum spike rate for unit to be included
-    min_spikerate = -1.0
-    task_duration = task_time[-1] - task_time[0]
-    min_numspike = int(np.round(min_spikerate * task_duration))
-
-    len_sua_trains = np.asarray(len_sua_trains)
-    len_mua_trains = np.asarray(len_mua_trains)
-
-    sua_valid_idx = np.where(len_sua_trains > min_numspike)[0]
-    mua_valid_idx = np.where(len_mua_trains > min_numspike)[0]
-
-    sua_trains_valid = []
-    for idx in sua_valid_idx:
-        sua_trains_valid.append(sua_trains[idx])
-
-    mua_trains_valid = []
-    for idx in mua_valid_idx:
-        mua_trains_valid.append(mua_trains[idx])
-
-    print(f"[After filtering] Number of SUA: {len(sua_trains_valid)}, Number of MUA: {len(mua_trains_valid)}")
-
-    # calculate velocity and acceleration   
-    dt_task = np.diff(task_time).mean() # sampling period (0.004 sec)
-
-    # Downstream (make_dataset.py, make_snn_dataset.py) hardcode
-    # delta_time=0.004 rather than reading it from this file's output --
-    # every window boundary, nperseg computation, and the 256ms/65-sample
-    # train/test alignment throughout this project assumes that constant
-    # is correct. Nothing previously checked it against the RAW data's
-    # actual sampling interval computed here, which is the one place that
-    # could catch a session recorded at a genuinely different rate before
-    # it silently produces wrong windowing downstream with no error
-    # anywhere in the chain. Fails loudly rather than warns, matching this
-    # project's established pattern (e.g. make_snn_dataset.py's own
-    # non-overlapping self-check) -- a wrong delta_time invalidates
-    # everything built on top of it, not something to proceed past.
-    EXPECTED_DELTA_TIME = 0.004
+    dt_task = np.diff(task_time).mean()
     if not np.isclose(dt_task, EXPECTED_DELTA_TIME, rtol=0.01):
         raise ValueError(
-            f"Computed native sampling interval dt_task={dt_task:.6f}s does not match "
-            f"the delta_time=0.004s hardcoded throughout the downstream pipeline "
-            f"(make_dataset.py, make_snn_dataset.py) -- this session appears to be "
-            f"recorded at a different rate than the rest of this project assumes. "
-            f"Every window boundary and the 256ms/65-sample train/test alignment "
-            f"depends on this being correct; do not proceed without either confirming "
-            f"this session's true rate and updating delta_time everywhere it's "
-            f"hardcoded, or investigating why task_time's spacing is off (e.g. "
-            f"dropped samples).")
-    print(f"Native sampling interval: {dt_task*1000:.4f} ms "
-          f"(matches the delta_time={EXPECTED_DELTA_TIME}s hardcoded downstream)")
+            f"Sampling interval is {dt_task:.6f}s, but the downstream windowing assumes "
+            f"{EXPECTED_DELTA_TIME}s. Check this session for dropped samples or a different rate.")
+    print(f"Native sampling interval: {dt_task * 1000:.4f} ms")
 
-    task_vel = np.diff(task_pos, axis=0) / dt_task # in mm/s
-    task_acc = np.diff(task_vel, axis=0) / dt_task # in mm/s^2
-    task_vel = np.concatenate((task_vel, task_vel[-1:,:]), axis=0) # padding with the last element
-    task_acc = np.concatenate((task_acc, task_acc[-2:,:]), axis=0) # padding with the last 2 elements
-    # concatenate position, velocity, and acceleration
-    task_data = np.concatenate((task_pos, task_vel, task_acc), axis=1) 
+    # Forward differences, padded at the end to keep N rows.
+    task_vel = np.diff(task_pos, axis=0) / dt_task   # mm/s
+    task_acc = np.diff(task_vel, axis=0) / dt_task   # mm/s^2
+    task_vel = np.concatenate((task_vel, task_vel[-1:, :]), axis=0)
+    task_acc = np.concatenate((task_acc, task_acc[-2:, :]), axis=0)
+    task_data = np.concatenate((task_pos, task_vel, task_acc), axis=1)
 
     with h5py.File(args.output_filepath, 'w') as f:
         f['task_time'] = task_time
         f['task_data'] = task_data
         f['target_pos'] = target_pos
-        dt = h5py.special_dtype(vlen=np.dtype('f8'))
-        f.create_dataset('sua_trains', data=np.asarray(sua_trains_valid, dtype=dt))
-        f.create_dataset('mua_trains', data=np.asarray(mua_trains_valid, dtype=dt))
-    
+        ragged = h5py.special_dtype(vlen=np.dtype('f8'))
+        f.create_dataset('sua_trains', data=np.asarray(sua_trains, dtype=ragged))
+        f.create_dataset('mua_trains', data=np.asarray(mua_trains, dtype=ragged))
     print(f"Finished processing and storing spike and kinematic data into file: {args.output_filepath}")
 
-if __name__ == '__main__':
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--input_filepath',   type=str,   help='Path to the raw data')
-    parser.add_argument('--output_filepath',  type=str,   help='Path to the spike and kinematic data')
-    
-    args = parser.parse_args()
-    main(args)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--input_filepath', type=str, required=True, help='Raw .mat session file')
+    parser.add_argument('--output_filepath', type=str, required=True, help='Output .h5 file')
+    main(parser.parse_args())
