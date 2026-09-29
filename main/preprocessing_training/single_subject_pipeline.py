@@ -18,8 +18,9 @@ script in this directory, run as a subprocess:
   4. eval_dl_decoders.py    (hyperparameter JSONs written from DL_HYPERPARAMS)
   5. comparison figures
 
-SNN training is separate (snn_training/train_bmi.py), and the cross-decoder
-comparison including the SNN is inference/test_all_decoders.py.
+SNN training is separate (snn_training/train_snn.py, driven by
+sbatch_scripts/run_snn_*.sbatch), and the cross-decoder comparison
+including the SNN is inference/test_all_decoders.py.
 
 Two kinds of session are supported:
   - Continuous sessions (experiment "bmi", raw_stem like 'indy_20160407_02'):
@@ -112,7 +113,7 @@ DECODER_COLORS = {
 #   processed/{exp}/{subj}/{feature}/{raw_stem}.h5
 #   dataset/{exp}/{subj}/{feature}/{raw_stem}_{method}.h5 and {raw_stem}_snn.h5
 #   snn_datasets/{exp}/{subj}/{feature}/{raw_stem}/{train,test}/*.pkl
-#   datasets/{exp}/{subj}/{feature}_{group_size}_group/{raw_stem}/{train,test}/*.pkl
+#   snn_datasets/{exp}/{subj}/{feature}_{group_size}_group/{raw_stem}/{train,test}/*.pkl
 #   results/{exp}/{subj}/decoder/{raw_stem}_{feature}_{method}_{decoder}[_{N}min].h5
 #   results/model_cache/{exp}/{subj}/{raw_stem}/{feature}/   (final model bundles)
 #   params/{exp}/{subj}/   (DL hyperparameter JSONs)
@@ -277,7 +278,7 @@ def build_combined_snn_dataset(raw_stem, snn_dataset_filepath, feature=FEATURE,
     (see combine_snn_dataset.py). discard_remainder drops the shorter final
     train trial so trials can be batched."""
     experiment, subject = experiment_and_subject_from_raw_stem(raw_stem)
-    output_dir = os.path.join(BMI_DATA_ROOT, "datasets", experiment, subject,
+    output_dir = os.path.join(BMI_DATA_ROOT, "snn_datasets", experiment, subject,
                               f"{feature}_{group_size}_group")
     marker_path = os.path.join(output_dir, raw_stem, "train", "0.pkl")
     if _skip_if_exists(marker_path, overwrite, f"combine_snn_dataset (group_size={group_size})"):

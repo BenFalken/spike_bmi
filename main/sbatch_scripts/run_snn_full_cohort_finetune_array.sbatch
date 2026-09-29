@@ -46,14 +46,13 @@ EXP_NAME="bmi_iaf_hard"
 # --- Selected Model Architecture and Parameters (Must Match Pretrained) ---
 HIDDEN_DIMS="256 128 64"
 THRESHOLDS="1.0 1.0 1.0 1.0"
-TAU_SYN=1.0
 TEMPORAL_DECAY_STAGES=2
 BATCH_SIZE=20
 CHECKPOINT_INTERVAL=10
 
 if [ ! -f "$PRETRAINED_CHECKPOINT" ]; then
-    echo "ERROR: pretrained checkpoint not found at $PRETRAINED_CHECKPOINT -- run "
-    echo "       run_full_cohort_pretrain.sbatch for this subject first." >&2
+    echo "ERROR: pretrained checkpoint not found at $PRETRAINED_CHECKPOINT -- pretrain "
+    echo "       this subject first (HIDDEN_DIMS/THRESHOLDS below must match it)." >&2
     exit 1
 fi
 
@@ -112,7 +111,7 @@ echo "  init-weights-from=$PRETRAINED_CHECKPOINT batch-size=$BATCH_SIZE"
 echo "  checkpoint-dir=$CHECKPOINT_DIR"
 mkdir -p "$CHECKPOINT_DIR"
 
-python3 ../snn_training/train_bmi_no_tau_syn.py \
+python3 ../snn_training/train_snn.py \
     --data-path "$SESSION_DIR" \
     --config "$CONFIG_YAML" \
     --spike-fn multi \
@@ -120,11 +119,9 @@ python3 ../snn_training/train_bmi_no_tau_syn.py \
     --use-iaf-squeeze \
     --weight-init kaiming \
     --checkpoint-dir "$CHECKPOINT_DIR" \
-    --training-mode windowed \
     --batch-size "$BATCH_SIZE" \
     --num-workers 0 \
     --neuron-type iaf \
-    --tau-syn "$TAU_SYN" \
     --temporal-decay-stages "$TEMPORAL_DECAY_STAGES" \
     --hidden-dims $HIDDEN_DIMS \
     --spike-thresholds $THRESHOLDS \

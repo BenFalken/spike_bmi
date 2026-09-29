@@ -2,19 +2,26 @@
 #SBATCH --time=4:00:00
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=2
-#SBATCH -J SNN_SWEEP_NO_TAU
-#SBATCH -o snn_logs/SNN_SWEEP_NO_TAU_%A_%a.out
-#SBATCH -e snn_logs/SNN_SWEEP_NO_TAU_%A_%a.out
+#SBATCH -J SNN_SWEEP
+#SBATCH -o snn_logs/SNN_SWEEP_%A_%a.out
+#SBATCH -e snn_logs/SNN_SWEEP_%A_%a.out
 #
-# Hardware-aware SNN hyperparameter sweep (Speck2F / DYNAP-CNN compatible).
+# SNN architecture/hyperparameter sweep: every config in SWEEP_TABLE is
+# trained separately on every session's grouped dataset (mua_8_group).
+#
+# TAU_SYN selects the sweep variant:
+#   TAU_SYN=none (default)  no synaptic-current stage -> <subject>/no_tau_syn_sweep/
+#   TAU_SYN=8.0             tau_syn fixed at 8.0      -> <subject>/tau_syn_8.0_sweep/
+# It only needs to be set when planning; the manifest records it.
 #
 # Two-step workflow
 # -----------------
 # 1. PLAN (plain bash, from the directory you will submit from):
 #
-#      bash run_snn_no_tau_syn_sweep.sbatch --plan bmi            # every subject
-#      bash run_snn_no_tau_syn_sweep.sbatch --plan bmi indy       # one subject
-#      SWEEP_FILTER='^deep[68]_' bash run_snn_no_tau_syn_sweep.sbatch --plan bmi
+#      bash run_snn_sweep.sbatch --plan bmi                      # every subject
+#      bash run_snn_sweep.sbatch --plan bmi indy                 # one subject
+#      TAU_SYN=8.0 bash run_snn_sweep.sbatch --plan bmi indy     # tau_syn = 8.0 variant
+#      SWEEP_FILTER='^wide' bash run_snn_sweep.sbatch --plan bmi
 #
 #    This enumerates every (subject, session, config) triple, drops every
 #    triple that already has a final checkpoint, writes the rest to a
@@ -23,29 +30,39 @@
 #    matched against config names.
 #
 # 2. SUBMIT the printed command, e.g.
-#      sbatch --export=ALL,MANIFEST=/abs/path/manifest.txt --array=0-219 run_snn_no_tau_syn_sweep.sbatch
+#      sbatch --export=ALL,MANIFEST=/abs/path/manifest.txt --array=0-219 run_snn_sweep.sbatch
 #
 # Array task i runs line i of the manifest. Each task re-checks for a final
 # checkpoint (skip) and resumes from its latest epoch checkpoint if present,
 # so after timeouts you can simply re-plan and re-submit.
 #
-# Notes
-# -----
-# * tau_syn is fixed at 1.0: the target deployment does not support a
-#   trained tau_syn in this workflow.
-# * Checkpoint paths and experiment names are identical to the original
-#   sweep, so already-finished runs are recognised and skipped:
-#     ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/no_tau_syn_sweep/<session>/<config>/
-#         final_model_bmi_iaf_hard_no_tau_<config>.pth
+# Outputs, one directory per (session, config):
+#   ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/<sweep tag>/<session>/<config>/
+#       final_model_bmi_iaf_hard.pth, best_model_weights.pth,
+#       checkpoint_bmi_iaf_hard_epoch<N>.pth
+# Summarize with plot_snn_sweep_heatmap.py --checkpoint-root <.../sweep tag>.
 
 set -eo pipefail
 
 DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
 DATASET_SUBDIR="mua_8_group"
-SWEEP_TAG="no_tau_syn_sweep"
-BASE_EXP_NAME="bmi_iaf_hard_no_tau"
 CONFIG_YAML="../configs/iaf_hard_reset.yaml"
-TRAIN_SCRIPT="../snn_training/train_bmi_no_tau_syn.py"
+TRAIN_SCRIPT="../snn_training/train_snn.py"
+# File prefix train_snn.py uses for an IAF / hard-reset model.
+EXP_NAME="bmi_iaf_hard"
+
+# set_tau_syn VALUE -> sets TAU_SYN, SWEEP_TAG (checkpoint subdirectory) and TAU_SYN_ARGS.
+set_tau_syn() {
+    TAU_SYN="$1"
+    if [ "$TAU_SYN" = "none" ]; then
+        SWEEP_TAG="no_tau_syn_sweep"
+        TAU_SYN_ARGS=()
+    else
+        SWEEP_TAG="tau_syn_${TAU_SYN}_sweep"
+        TAU_SYN_ARGS=(--tau-syn "$TAU_SYN")
+    fi
+}
+set_tau_syn "${TAU_SYN:-none}"
 
 # ---------------------------------------------------------------------------
 # Training controls (shared by every config)
@@ -58,7 +75,6 @@ CHECKPOINT_INTERVAL=10
 
 SPIKE_FN="multi"
 NEURON_TYPE="iaf"
-TAU_SYN=1.0
 MIN_VMEM=-1
 WEIGHT_INIT="kaiming"
 
@@ -137,6 +153,24 @@ SWEEP_TABLE=(
 
     "deep8_small_thr125|128 160 192 192 160 128 64|1.25|2"
     "deep8_wide_thr125|256 320 384 384 320 256 128|1.25|2"
+
+    # ----- Wide, shallow nets beyond 512 units -----
+    # Naming: wide<first hidden width>_<hidden layers>x; each layer halves
+    # the previous one unless marked _flat.
+    "wide512_1x|512|1.0|2"
+    "wide512_2x|512 256|1.0|2"
+    "wide768_1x|768|1.0|2"
+    "wide768_2x|768 384|1.0|2"
+    "wide768_3x|768 384 192|1.0|2"
+    "wide768_2x_flat|768 768|1.0|2"
+    "wide1024_1x|1024|1.0|2"
+    "wide1024_2x|1024 512|1.0|2"
+    "wide1024_3x|1024 512 256|1.0|2"
+
+    "wide768_2x_thr125|768 384|1.25|2"
+    "wide1024_2x_thr125|1024 512|1.25|2"
+    "wide768_2x_decay3|768 384|1.0|3"
+    "wide1024_2x_decay3|1024 512|1.0|3"
 )
 
 # ---------------------------------------------------------------------------
@@ -225,7 +259,7 @@ if [ "${1:-}" = "--plan" ]; then
     fi
 
     mkdir -p snn_logs/manifests
-    manifest="$(pwd)/snn_logs/manifests/${PLAN_EXPERIMENT}_${PLAN_SUBJECT:-all}_$(date +%Y%m%d_%H%M%S)_$$.txt"
+    manifest="$(pwd)/snn_logs/manifests/${SWEEP_TAG}_${PLAN_EXPERIMENT}_${PLAN_SUBJECT:-all}_$(date +%Y%m%d_%H%M%S)_$$.txt"
     : > "$manifest"
 
     n_sessions=0; n_done=0; n_partial=0; n_fresh=0; n_filtered=0
@@ -245,21 +279,21 @@ if [ "${1:-}" = "--plan" ]; then
                 continue
             fi
             ckpt_dir="$(checkpoint_dir "$PLAN_EXPERIMENT" "$subject" "$session_id" "$CFG_NAME")"
-            exp_name="${BASE_EXP_NAME}_${CFG_NAME}"
-            if [ -f "${ckpt_dir}/final_model_${exp_name}.pth" ]; then
+            if [ -f "${ckpt_dir}/final_model_${EXP_NAME}.pth" ]; then
                 n_done=$((n_done + 1))
                 continue
             fi
-            if compgen -G "${ckpt_dir}/checkpoint_${exp_name}_epoch*.pth" > /dev/null; then
+            if compgen -G "${ckpt_dir}/checkpoint_${EXP_NAME}_epoch*.pth" > /dev/null; then
                 n_partial=$((n_partial + 1))
             else
                 n_fresh=$((n_fresh + 1))
             fi
-            echo "${PLAN_EXPERIMENT}|${session_dir}|${CFG_NAME}" >> "$manifest"
+            echo "${PLAN_EXPERIMENT}|${session_dir}|${CFG_NAME}|${TAU_SYN}" >> "$manifest"
         done
     done
 
     n_pending=$(wc -l < "$manifest")
+    echo "# sweep:             $SWEEP_TAG (TAU_SYN=$TAU_SYN)"
     echo "# sessions:          $n_sessions"
     echo "# configs in table:  ${#SWEEP_TABLE[@]}${SWEEP_FILTER:+  (filter: $SWEEP_FILTER, $n_filtered triples excluded)}"
     echo "# already finished:  $n_done"
@@ -294,13 +328,15 @@ if [ -z "$LINE" ]; then
     exit 0
 fi
 
-IFS='|' read -r EXPERIMENT SESSION_DIR SWEEP_NAME <<< "$LINE"
+# Manifest lines are EXPERIMENT|SESSION_DIR|CONFIG|TAU_SYN; the manifest's
+# TAU_SYN wins over the environment so a task always matches its plan.
+IFS='|' read -r EXPERIMENT SESSION_DIR SWEEP_NAME MANIFEST_TAU_SYN <<< "$LINE"
+set_tau_syn "${MANIFEST_TAU_SYN:-none}"
 find_config "$SWEEP_NAME"
 
 SUBJECT="$(subject_of "$SESSION_DIR")"
 SESSION_ID="$(basename "$SESSION_DIR")"
 CHECKPOINT_DIR="$(checkpoint_dir "$EXPERIMENT" "$SUBJECT" "$SESSION_ID" "$SWEEP_NAME")"
-EXP_NAME="${BASE_EXP_NAME}_${SWEEP_NAME}"
 FINAL_CHECKPOINT="${CHECKPOINT_DIR}/final_model_${EXP_NAME}.pth"
 
 if [ ! -d "$SESSION_DIR/train" ] || [ ! -d "$SESSION_DIR/test" ]; then
@@ -327,7 +363,7 @@ read -ra HIDDEN_DIMS_ARR <<< "$CFG_DIMS"
 read -ra THRESHOLDS_ARR <<< "$CFG_THRESHOLDS"
 
 echo "============================================================"
-echo "SNN Speck2F-compatible sweep"
+echo "SNN sweep: $SWEEP_TAG"
 echo "============================================================"
 echo "Array task:      $SLURM_ARRAY_TASK_ID / $((N_TASKS - 1))"
 echo "Manifest:        $MANIFEST"
@@ -337,7 +373,7 @@ echo "Session:         $SESSION_ID"
 echo "Configuration:   $SWEEP_NAME"
 echo "Hidden dims:     $CFG_DIMS  (${#HIDDEN_DIMS_ARR[@]} hidden, $(( ${#HIDDEN_DIMS_ARR[@]} + 1 )) weight layers)"
 echo "Thresholds:      $CFG_THRESHOLDS"
-echo "Tau syn:         $TAU_SYN [FIXED]"
+echo "Tau syn:         $TAU_SYN (fixed)"
 echo "Temporal decay:  $CFG_DECAY"
 echo "Batch size:      $BATCH_SIZE"
 echo "Epochs:          $EPOCHS"
@@ -361,7 +397,6 @@ python3 "$TRAIN_SCRIPT" \
     --use-iaf-squeeze \
     --weight-init "$WEIGHT_INIT" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
-    --training-mode windowed \
     --batch-size "$BATCH_SIZE" \
     --num-workers 0 \
     --epochs "$EPOCHS" \
@@ -369,7 +404,7 @@ python3 "$TRAIN_SCRIPT" \
     --scheduler-patience "$SCHEDULER_PATIENCE" \
     --checkpoint-interval "$CHECKPOINT_INTERVAL" \
     --neuron-type "$NEURON_TYPE" \
-    --tau-syn "$TAU_SYN" \
+    "${TAU_SYN_ARGS[@]}" \
     --temporal-decay-stages "$CFG_DECAY" \
     --hidden-dims "${HIDDEN_DIMS_ARR[@]}" \
     --spike-thresholds "${THRESHOLDS_ARR[@]}" \

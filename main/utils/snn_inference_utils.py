@@ -32,7 +32,7 @@ def load_snn_model(checkpoint_path, num_input_channels=None):
     if 'args' not in checkpoint:
         raise KeyError(
             f"{checkpoint_path}: no 'args' key found. This loader expects checkpoints "
-            f"written by the CURRENT train_bmi.py (which saves training args directly "
+            f"written by the CURRENT train_snn.py (which saves training args directly "
             f"in the checkpoint) -- a checkpoint from the old training script isn't "
             f"compatible with this loader or with model_bmi.py's architecture.")
     train_args = checkpoint['args']
@@ -74,7 +74,10 @@ def load_snn_model(checkpoint_path, num_input_channels=None):
         temporal_decay_stages=train_args.get('temporal_decay_stages', 1),
         num_input_channels=n_channels,
         hidden_dims=train_args.get('hidden_dims'),
-        tau_syn=train_args.get('tau_syn'),
+        # train_snn.py stores the tau_syn it applied. Checkpoints without that key
+        # load with no synaptic stage, which is how train_bmi_no_tau_syn.py
+        # trained them (their args record a --tau-syn it ignored).
+        tau_syn=checkpoint.get('tau_syn'),
         velocity_lo=train_args.get('velocity_lo', _FALLBACK_VELOCITY_LO),
         velocity_hi=train_args.get('velocity_hi', _FALLBACK_VELOCITY_HI),
         velocity_margin=train_args.get('velocity_margin', _FALLBACK_VELOCITY_MARGIN),

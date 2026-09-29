@@ -1,7 +1,7 @@
 """
 Comparison/TEST script for KF, WF, LSTM, QRNN, and SNN decoders -- reads
 ALREADY-TRAINED, cached model bundles (produced by eval_wf_decoder.py,
-eval_kf_decoder.py, eval_dl_decoders.py, and train_bmi.py) and evaluates
+eval_kf_decoder.py, eval_dl_decoders.py, and train_snn.py) and evaluates
 them side by side over the SAME stretch of a session's chronological test
 set. This script never builds or trains a model itself -- renamed from
 eval_all_decoders.py specifically to make that distinction unambiguous:
@@ -15,7 +15,7 @@ run_snn_over_full_test_set()'s docstring for what changed and why). Every
 trial independently resets (SNN_Speck.forward() resets state
 unconditionally on every call now -- an earlier reset_state parameter
 that made this optional was tried, found worse, and removed entirely) --
-there is only one training mode now (see train_bmi.py); 'continuous' and
+there is only one training mode now (see train_snn.py); 'continuous' and
 'chunked' modes were both tried and removed after real comparative
 results showed windowed outperforming both.
 
@@ -42,10 +42,10 @@ printed WARNING (not a silent guess) if no confident match is found.
 
 SNN model loading goes through model_bmi.py (single-purpose feedforward
 architecture, no dropout/spike-sparsity mechanisms -- both were tried and
-removed, see train_bmi.py), via a plain load_state_dict() (sinabs's
+removed, see train_snn.py), via a plain load_state_dict() (sinabs's
 lazily-shaped v_mem state buffer is deliberately excluded -- it's state,
 not a learned parameter, see load_snn_model()). No separate summary_*.txt
-either: train_bmi.py's save_checkpoint() stores training args directly in
+either: train_snn.py's save_checkpoint() stores training args directly in
 the checkpoint (checkpoint['args']), so it's self-describing, including
 velocity-scaling constants.
 
@@ -58,7 +58,7 @@ produced (full overlay, rolling RMSE, RMSE bar chart, error boxplot,
 scatter+R^2, cumulative loss, error-vs-speed), PLUS a new trajectory-grid
 figure (make_test_window_trajectory_grid()): the first --n_segments
 (default 16) non-overlapping --segment_samples-wide (default 260 = 4x256ms
-= ~1s, matching train_bmi.py's --truncation-chunks default -- the same
+= ~1s, matching train_snn.py's --truncation-chunks default -- the same
 "unit of analysis" used for the SNN's own gradient truncation) segments of
 the comparison range, each showing every decoder's reconstructed 2D
 trajectory (predicted velocity integrated from the segment's true starting
@@ -206,7 +206,7 @@ def load_snn_model(checkpoint_path, experiment, num_input_channels=None):
     """Load the SNN architecture + weights via models.model_bmi or
     models.model_hkm (whichever `experiment` selects -- see
     _get_model_module()), using the training args saved directly inside
-    the checkpoint (checkpoint['args'], written by train_bmi.py's
+    the checkpoint (checkpoint['args'], written by train_snn.py's
     save_checkpoint() for its 'best' save). No separate summary.txt is
     needed -- see module docstring.
 
@@ -220,7 +220,7 @@ def load_snn_model(checkpoint_path, experiment, num_input_channels=None):
     if 'args' not in checkpoint:
         raise KeyError(
             f"{checkpoint_path}: no 'args' key found. This loader expects checkpoints "
-            f"written by the CURRENT train_bmi.py (which saves training args directly "
+            f"written by the CURRENT train_snn.py (which saves training args directly "
             f"in the checkpoint) -- a checkpoint from the old training script isn't "
             f"compatible with this loader or with model_bmi.py's architecture.")
     train_args = checkpoint['args']
@@ -234,7 +234,7 @@ def load_snn_model(checkpoint_path, experiment, num_input_channels=None):
         # Fall back to inferring directly from the first Linear layer's
         # own weight shape -- see snn_inference_utils.py's own copy of
         # this same fix for the full reasoning (a real bug in
-        # train_bmi.py's final-checkpoint save, fixed at the source, but
+        # train_snn.py's final-checkpoint save, fixed at the source, but
         # not retroactively for already-saved checkpoints).
         state_dict = checkpoint.get('model_state_dict', {})
         if 'layers.0.weight' in state_dict:
@@ -264,21 +264,10 @@ def load_snn_model(checkpoint_path, experiment, num_input_channels=None):
         temporal_decay_stages=train_args.get('temporal_decay_stages', 1),
         num_input_channels=n_channels,
         hidden_dims=train_args.get('hidden_dims'),
-        # BUG FIX: was tau_syn=train_args.get('tau_syn'), which reads the checkpoint's
-        # RECORDED training args -- but this project's checkpoints (train_bmi_no_tau_syn.py)
-        # build their OWN model with tau_syn=None regardless of that recorded value (it is
-        # just the --tau-syn CLI argument, never actually applied at training time), and the
-        # Speck2f chip cannot realize tau_syn as hardware dynamics at all regardless. Passing
-        # the recorded value through built a DIFFERENT network than the one that was trained.
-        # Verified two ways on a real checkpoint (indy_20160407_02): (1) a model built with
-        # tau_syn=None reproduces the checkpoint's own best_loss EXACTLY (41.8054 = 41.8054),
-        # while tau_syn=1.0 (the recorded value) scores 47.8490; (2) the physical chip's
-        # behavior is IDENTICAL under both settings (it has no synaptic-current stage to
-        # configure), so tau_syn=1.0 only ever produced a torch/CPU-side number that matched
-        # neither the trained model nor the chip. snn_inference_utils.py's own load_snn_model()
-        # (used by infer_snn_speck.py) carries the identical fix, with the identical evidence,
-        # in its own comment -- keep the two in step.
-        tau_syn=None,
+        # train_snn.py stores the tau_syn it applied. Checkpoints without that key
+        # load with no synaptic stage, which is how train_bmi_no_tau_syn.py
+        # trained them (their args record a --tau-syn it ignored).
+        tau_syn=checkpoint.get('tau_syn'),
         velocity_lo=train_args.get('velocity_lo', _FALLBACK_VELOCITY_LO),
         velocity_hi=train_args.get('velocity_hi', _FALLBACK_VELOCITY_HI),
         velocity_margin=train_args.get('velocity_margin', _FALLBACK_VELOCITY_MARGIN),
@@ -833,7 +822,7 @@ def make_test_window_trajectory_grid(label, y_pos_common, pred_common, segment_s
                                       n_segments=16, step_time=0.004, save_path=None):
     """First n_segments consecutive, non-overlapping segment_samples-wide
     chunks of the comparison range (default: 260 samples = 4x256ms = ~1s
-    each, matching train_bmi.py's --truncation-chunks default -- the SAME
+    each, matching train_snn.py's --truncation-chunks default -- the SAME
     "unit of analysis" used for the SNN's own gradient truncation, not a
     coincidence). For each segment, reconstructs every requested decoder's
     predicted 2D trajectory (integrating predicted velocity, anchored at
@@ -1647,7 +1636,7 @@ def build_parser():
     parser.add_argument('--speed_bins', type=int, default=8)
     parser.add_argument('--segment_samples', type=int, default=260,
                          help='Trajectory-grid segment width, in samples (default 260 = '
-                              '4x256ms=~1s, matching train_bmi.py --truncation-chunks default)')
+                              '4x256ms=~1s, matching train_snn.py --truncation-chunks default)')
     parser.add_argument('--n_segments', type=int, default=16,
                          help='Number of segments shown in the trajectory-grid figure '
                               '(first N segments of the comparison range)')

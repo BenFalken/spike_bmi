@@ -13,7 +13,7 @@ THIS REVISION fixes two real problems, not just a rename:
    predict_snn_window() no longer exists (renamed/restructured to
    predict_snn_trial()) -- imports/calls updated to match. load_snn_model()
    also changed shape: it now takes only checkpoint_path (no separate
-   summary_path -- train_bmi.py's save_checkpoint() stores training args
+   summary_path -- train_snn.py's save_checkpoint() stores training args
    directly inside the checkpoint file itself now, so there's nothing
    separate to load), and returns (model, checkpoint, velocity_scale).
    --snn_summary_path is removed entirely as a result.
@@ -30,7 +30,7 @@ THIS REVISION fixes two real problems, not just a rename:
    time_snn_per_timestep() now measures the SAME 4ms-per-sample
    granularity as everything else: the marginal cost of ONE additional
    T=1 forward() call, resetting only at each trial's own first timestep
-   (matching train_bmi.py's windowed training exactly) and carrying state
+   (matching train_snn.py's windowed training exactly) and carrying state
    for every subsequent timestep within that trial -- which is also
    exactly how a real online decoder would actually be run, feeding one
    new 4ms spike-bin at a time rather than waiting for a full window to
@@ -298,7 +298,7 @@ def time_snn_per_timestep(snn_model, snn_dataset_path, n_timing_samples, n_repea
     Draws real timesteps sequentially from the SNN's own test .pkl
     trials (not the ANN's X_test -- those are the only genuine spike-
     raster input the SNN actually consumes), resetting ONLY at each
-    trial's own first timestep (matching train_bmi.py's windowed
+    trial's own first timestep (matching train_snn.py's windowed
     training) and carrying state for every subsequent timestep within
     that trial. This is also exactly how a real online decoder would
     run: fed one new 4ms spike-bin at a time, not a whole pre-assembled

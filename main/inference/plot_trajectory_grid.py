@@ -21,7 +21,7 @@ trials, each trial is independently reset. Confirmed directly against
 run_snn_over_full_test_set()'s own current source -- NOT the
 checkpoint['args']['training_mode'] windowed/continuous dispatch an
 earlier revision of this docstring described, which no longer exists
-(train_bmi.py now has only one training mode; see its own module
+(train_snn.py now has only one training mode; see its own module
 docstring for why 'continuous'/'chunked' were tried and removed).
 Either way, chunking into segment_samples-wide pieces for THIS figure's
 own grid layout happens AFTER the full, uninterrupted prediction stream
@@ -47,7 +47,7 @@ TWO --trial_mode options now, answering different questions:
     output, RE-RUN against the CURRENT dense ANN windowing
     (--wdw_time/--ol_time matching whatever produced --dataset_filepath).
   'segment': fixed-length, non-overlapping chunks of the comparison range
-    (default 260 samples = 4x256ms=~1s, matching train_bmi.py's
+    (default 260 samples = 4x256ms=~1s, matching train_snn.py's
     --truncation-chunks) -- needs NO trials file at all. Calls
     test_all_decoders.make_test_window_trajectory_grid() directly (the
     SAME function that script's own trajectory-grid figure uses), rather

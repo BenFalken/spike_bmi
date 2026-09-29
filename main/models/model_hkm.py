@@ -462,7 +462,7 @@ class SNN_Speck(nn.Module):
         # individual samples in a batch produce zero spikes in a given
         # axis at a given timestep (no accumulated population-vector
         # signal to decode). Computed as the exact algebraic inverse of
-        # train_bmi.py's unscale_velocity(): v = lo + (hi-lo)*(scaled-
+        # train_snn.py's unscale_velocity(): v = lo + (hi-lo)*(scaled-
         # margin)/(1-2*margin), solved for scaled at v=0. MUST be built
         # from the SAME velocity_lo/hi/margin the dataloader's forward
         # scaling and unscale_velocity() use, or "no spikes" stops
@@ -633,7 +633,7 @@ class SNN_Speck(nn.Module):
                     # potential combined with an aggressive learning rate)
                     # this has been observed to go negative, which would
                     # otherwise silently corrupt the spike-sparsity loss
-                    # term downstream (see train_bmi.py's
+                    # term downstream (see train_snn.py's
                     # spike_sparsity_lambda) into something that no longer
                     # means "average spikes per neuron per timestep" at
                     # all. --min-vmem should still be set (as it already
@@ -718,7 +718,7 @@ def create_model(
     """Factory function to create an SNN_Speck model.
 
     velocity_lo/hi/margin MUST match whatever the dataloader's forward
-    scaling and train_bmi.py's unscale_velocity() actually use -- see
+    scaling and train_snn.py's unscale_velocity() actually use -- see
     SNN_Speck.__init__()'s neutral_scaled_pred, computed from these three
     values as the exact inverse of unscale_velocity() at physical v=0.
 
@@ -780,7 +780,7 @@ def load_model_weights(model: SNN_Speck, state_dict: dict, neuron_type: str,
     exclusion logic needed updating twice already in two separate,
     independently-maintained call sites (test_all_decoders.py's and
     snn_inference_utils.py's own load_snn_model()) -- a third,
-    independent copy (for train_bmi.py's --init-weights-from) would mean
+    independent copy (for train_snn.py's --init-weights-from) would mean
     a fourth future change needs to be made in three places instead of
     one. Both of those callers should be migrated to call this function
     too, rather than keep their own inline copies.

@@ -238,7 +238,7 @@ def main():
     # filtered the ENTIRE plot down to just that one, arbitrarily-sorted
     # session -- silently discarding every other session's data, even
     # though the sweep now genuinely trains across many sessions per
-    # config (see run_snn_no_tau_syn_sweep_indy_bmi_fixed.sbatch's own
+    # config (see run_snn_sweep.sbatch's own
     # flattened session x sweep indexing). "Best option" now means best
     # ON AVERAGE ACROSS SESSIONS, not best-for-whichever-session-happened-
     # to-sort-first -- grouped by config, aggregating (mean) across every
