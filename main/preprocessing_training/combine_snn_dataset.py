@@ -3,7 +3,8 @@ Build a long-trial SNN dataset for one session by concatenating runs of
 --group-size consecutive windows from make_snn_dataset.py's output.
 
 make_snn_dataset.py's back-to-back windows are first rejoined into the
-continuous recording, which is then split chronologically:
+continuous recording, which is then split chronologically at the same
+boundary export_snn_pkl.py and the ANN decoders use:
   - train: consecutive trials of group_size * nperseg timesteps each. The
     shorter trailing trial is kept unless --discard-train-remainder is given
     (equal-length trials are needed for batch_size > 1).
@@ -34,11 +35,16 @@ STEP_TIME_S = 0.004
 
 
 def load_continuous_recording(h5_path):
-    """Rejoin back-to-back SNN windows into (input_spikes (C, T), velocity (T, 2), nperseg)."""
+    """Rejoin back-to-back SNN windows into the continuous recording.
+
+    Returns (input_spikes (C, T), velocity (T, 2), nperseg, total_raw_samples).
+    T is n_windows * nperseg, a few samples shorter than the raw session,
+    whose length total_raw_samples is used for the train/test boundary."""
     with h5py.File(h5_path, "r") as f:
         window_start_time = f["window_start_time"][:]
         X_raster = f["X_raster"][:]   # (n_windows, C, nperseg)
         y_trace = f["y_trace"][:]     # (n_windows, nperseg, 2)
+        total_raw_samples = int(f.attrs["total_raw_samples"])
 
     n_windows, n_channels, nperseg = X_raster.shape
     stride = np.diff(window_start_time)
@@ -50,7 +56,7 @@ def load_continuous_recording(h5_path):
 
     input_spikes = np.transpose(X_raster, (1, 0, 2)).reshape(n_channels, -1)
     velocity = y_trace.reshape(-1, 2)
-    return input_spikes, velocity, nperseg
+    return input_spikes, velocity, nperseg, total_raw_samples
 
 
 def _save_trial(split_dir, idx, input_spikes, velocity):
@@ -78,10 +84,12 @@ def save_chunked(split_dir, input_spikes, velocity, chunk_len, discard_remainder
 
 
 def main(args):
-    input_spikes, velocity, nperseg = load_continuous_recording(args.h5_path)
+    input_spikes, velocity, nperseg, total_raw_samples = load_continuous_recording(args.h5_path)
     total_len = input_spikes.shape[1]
-    n_train = aligned_train_boundary(total_len, args.test_frac, base_nperseg=nperseg)
-    print(f"Train/test boundary at sample {n_train} of {total_len} (test_frac={args.test_frac})")
+    # Same boundary as export_snn_pkl.py and the ANN decoders.
+    n_train = aligned_train_boundary(total_raw_samples, args.test_frac, base_nperseg=nperseg)
+    print(f"Train/test boundary at sample {n_train} of {total_raw_samples} "
+          f"(test_frac={args.test_frac})")
 
     output_dir = os.path.join(args.output_dir, args.session_id)
     n_train_trials = save_chunked(os.path.join(output_dir, "train"),
@@ -92,7 +100,7 @@ def main(args):
     # not require chunking, and per-trial metric averages are not skewed by a
     # short remainder trial.
     n_test_trials = 0
-    if total_len - nperseg - n_train > 0:
+    if n_train < total_len:
         test_dir = os.path.join(output_dir, "test")
         os.makedirs(test_dir, exist_ok=True)
         _save_trial(test_dir, 0, input_spikes[:, n_train:], velocity[n_train:])
