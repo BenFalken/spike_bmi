@@ -78,7 +78,8 @@ def main(args):
         model = build(config)
         count_params(model)
         fit_start = time.time()
-        model.fit(X_train, y_train, epochs=config['epochs'], verbose=args.verbose)
+        model.fit(X_train, y_train, epochs=config['epochs'], batch_size=config['batch_size'],
+                  verbose=args.verbose)
         print(f"  Training took {(time.time() - fit_start) / 60:.2f} minutes")
         return y_test, model.predict(X_test, batch_size=config['batch_size'], verbose=args.verbose)
 
@@ -86,7 +87,8 @@ def main(args):
         X_train, y_train = to_sequences(X_train, y_train)
         model = build(config)
         seed_tensorflow(args.seed)
-        model.fit(X_train, y_train, epochs=config['epochs'], verbose=args.verbose)
+        model.fit(X_train, y_train, epochs=config['epochs'], batch_size=config['batch_size'],
+                  verbose=args.verbose)
         weights_path, scaler_path, config_path = bundle_paths(args.model_dir, args.decoder, suffix)
         model.save_weights(weights_path)
         with open(scaler_path, 'wb') as f:
@@ -115,7 +117,7 @@ if __name__ == '__main__':
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
     parser.add_argument('--optimizer', type=str, default='Adam', help="'Adam' or 'RMSprop'")
     parser.add_argument('--epochs', type=int, default=50, help='Training epochs')
-    parser.add_argument('--batch_size', type=int, default=32, help='Prediction batch size')
+    parser.add_argument('--batch_size', type=int, default=32, help='Training and prediction batch size')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--loss', type=str, default='mse', help='Loss function')
     parser.add_argument('--metric', type=str, default='mse', help='Training metric')
