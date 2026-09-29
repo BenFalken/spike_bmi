@@ -771,9 +771,7 @@ def load_model_weights(model: SNN_Speck, state_dict: dict, neuron_type: str,
     architecture mismatch (a missing Linear.weight, an unexpected key)
     rather than silently loading a partially-wrong model.
     """
-    # tau_syn is fixed during training (train_snn.py), so the value the model was
-    # constructed with is already correct and the stored copy is skipped.
-    exclude_suffixes = ['.v_mem', '.neuron.v', '.i_syn', '.tau_syn']
+    exclude_suffixes = ['.v_mem', '.neuron.v', '.i_syn']
     filtered_state_dict = {k: v for k, v in state_dict.items()
                             if not any(k.endswith(suffix) for suffix in exclude_suffixes)}
     missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)

@@ -14,9 +14,9 @@ true velocity in physical units.
 
 Synaptic time constant: --tau-syn is off by default (no synaptic-current
 stage). With a value, every spiking layer low-pass filters its input
-current with that time constant (in 4 ms timesteps) and the value is held
-fixed during training. The applied value is saved in every checkpoint as
-checkpoint['tau_syn'], which the inference loaders use to rebuild the model.
+current with a time constant (in 4 ms timesteps) initialized to that value
+and trained with the weights, like the readout's EMA decay. The trained
+per-layer values are part of the model state dict.
 
 Outputs in --checkpoint-dir, with exp_name = bmi_{neuron_type}_{reset_type}:
     best_model_weights.pth                   lowest test loss so far
@@ -67,7 +67,7 @@ def parse_arguments():
                        help="Reset for the output layer (default: same as --reset-type)")
     model.add_argument("--tau-mem", type=float, default=12.0, help="LIF membrane time constant")
     model.add_argument("--tau-syn", type=float, default=None,
-                       help="Synaptic time constant, held fixed during training (default: none)")
+                       help="Initial synaptic time constant, trained per layer (default: none)")
     model.add_argument("--hidden-dims", type=int, nargs="+", default=None,
                        help="Hidden layer widths (default: 512 256 128)")
     model.add_argument("--spike-thresholds", type=float, nargs="+", default=None,
@@ -297,10 +297,6 @@ def build_model(args, experiment, num_input_channels, device):
         velocity_hi=args.velocity_hi,
         velocity_margin=args.velocity_margin,
     ).to(device)
-    # sinabs registers tau_syn as a trainable parameter; keep it at the given value.
-    for name, param in model.named_parameters():
-        if name.endswith("tau_syn"):
-            param.requires_grad_(False)
     return model_module, model
 
 
@@ -382,7 +378,7 @@ def main():
         return {"input_shape": input_shape, "best_loss": best_loss, "train_losses": train_losses,
                 "test_losses": test_losses, "lr_history": lr_history,
                 "lr_reduction_count": lr_reduction_count, "args": vars(args),
-                "tau_syn": args.tau_syn, "experiment": experiment, **extra}
+                "experiment": experiment, **extra}
 
     scale = (args.velocity_lo, args.velocity_hi, args.velocity_margin)
     training_start = time.time()

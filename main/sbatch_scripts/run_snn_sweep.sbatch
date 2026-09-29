@@ -11,7 +11,7 @@
 #
 # TAU_SYN selects the sweep variant:
 #   TAU_SYN=none (default)  no synaptic-current stage -> <subject>/no_tau_syn_sweep/
-#   TAU_SYN=8.0             tau_syn fixed at 8.0      -> <subject>/tau_syn_8.0_sweep/
+#   TAU_SYN=8.0             tau_syn initialized at 8.0 and trained -> <subject>/tau_syn_8.0_sweep/
 # It only needs to be set when planning; the manifest records it.
 #
 # Two-step workflow
@@ -373,7 +373,7 @@ echo "Session:         $SESSION_ID"
 echo "Configuration:   $SWEEP_NAME"
 echo "Hidden dims:     $CFG_DIMS  (${#HIDDEN_DIMS_ARR[@]} hidden, $(( ${#HIDDEN_DIMS_ARR[@]} + 1 )) weight layers)"
 echo "Thresholds:      $CFG_THRESHOLDS"
-echo "Tau syn:         $TAU_SYN (fixed)"
+echo "Tau syn (init):  $TAU_SYN"
 echo "Temporal decay:  $CFG_DECAY"
 echo "Batch size:      $BATCH_SIZE"
 echo "Epochs:          $EPOCHS"

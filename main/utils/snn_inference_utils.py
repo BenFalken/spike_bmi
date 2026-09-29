@@ -74,10 +74,11 @@ def load_snn_model(checkpoint_path, num_input_channels=None):
         temporal_decay_stages=train_args.get('temporal_decay_stages', 1),
         num_input_channels=n_channels,
         hidden_dims=train_args.get('hidden_dims'),
-        # train_snn.py stores the tau_syn it applied. Checkpoints without that key
-        # load with no synaptic stage, which is how train_bmi_no_tau_syn.py
-        # trained them (their args record a --tau-syn it ignored).
-        tau_syn=checkpoint.get('tau_syn'),
+        # Build a synaptic stage only if the checkpoint has trained tau_syn values
+        # (train_bmi_no_tau_syn.py checkpoints record a --tau-syn they never
+        # used); load_model_weights then restores the trained values.
+        tau_syn=(train_args.get('tau_syn') or 1.0)
+        if any(k.endswith('.tau_syn') for k in checkpoint['model_state_dict']) else None,
         velocity_lo=train_args.get('velocity_lo', _FALLBACK_VELOCITY_LO),
         velocity_hi=train_args.get('velocity_hi', _FALLBACK_VELOCITY_HI),
         velocity_margin=train_args.get('velocity_margin', _FALLBACK_VELOCITY_MARGIN),
