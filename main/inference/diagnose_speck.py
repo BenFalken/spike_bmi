@@ -15,6 +15,13 @@ and compared with the chip's own predictions ('speck') from that session's
 test_all_decoders.py results. pytorch -> quantized is the cost of
 quantization; quantized -> speck is what the chip itself adds.
 
+When the results also hold the chip's output spike counts, a second table
+compares them with the quantized network's on the same steps: total spikes,
+exactly matching steps, per-feature rates, the delay at which the two agree
+best (spikes read after --speck_wait_time land in later steps), and the RMSE
+once that delay is removed. The chip's counts are also re-decoded on the
+host, which must reproduce the 'speck' RMSE.
+
 Every column is scored on the rows and targets of the session results
 (<session>_arrays.npz), after checking that the 'snn' predictions stored
 there are the ones this checkpoint produces; results made with a different
@@ -49,7 +56,8 @@ MATCH_TOL = 1e-3
 
 def decode_versions(checkpoint_path, snn_dataset_path, experiment, use_specksim=True):
     """({version: (n, 2) velocity}, (n, 2) SNN dataset velocity, {version:
-    output spikes}) over the test trials, first window dropped."""
+    (n, 2 * n_bins) output spike counts}, decode) over the test trials, first
+    window dropped; decode(counts) -> velocity, as for the chip."""
     model, checkpoint, scale = load_snn_model(checkpoint_path, experiment)
     speck.check_deployable(model, checkpoint)
     snn_seq = speck.flatten_snn(model)
@@ -61,7 +69,7 @@ def decode_versions(checkpoint_path, snn_dataset_path, experiment, use_specksim=
         runners['specksim'] = lambda x: speck.run_specksim(quant_seq, x, 2 * model.n_bins)
 
     files = snn_test_files(snn_dataset_path)
-    preds, spikes, targets = {v: [] for v in runners}, {v: 0.0 for v in runners}, []
+    preds, counts_kept, targets = {v: [] for v in runners}, {v: [] for v in runners}, []
     for i, path in enumerate(files):
         if i == 0 and len(files) > 1:
             continue                                # dropped, as in test_all_decoders.py
@@ -70,9 +78,11 @@ def decode_versions(checkpoint_path, snn_dataset_path, experiment, use_specksim=
         targets.append(trial['velocity'][keep])
         for version, run in runners.items():
             counts = run(trial['input_spikes'])
-            spikes[version] += counts[keep].sum()
+            counts_kept[version].append(counts[keep])
             preds[version].append(unscale_velocity(speck.decode_spike_counts(model, counts), scale)[keep])
-    return {v: np.concatenate(p) for v, p in preds.items()}, np.concatenate(targets), spikes
+    decode = lambda counts: unscale_velocity(speck.decode_spike_counts(model, counts), scale)
+    return ({v: np.concatenate(p) for v, p in preds.items()}, np.concatenate(targets),
+            {v: np.concatenate(c) for v, c in counts_kept.items()}, decode)
 
 
 def find_offset(pred, reference, tol=MATCH_TOL):
@@ -89,8 +99,39 @@ def rmse(pred, target):
     return float(np.sqrt(((pred - target) ** 2).mean()))
 
 
+def _corr(a, b):
+    return float(np.corrcoef(a, b)[0, 1]) if a.std() > 0 and b.std() > 0 else float('nan')
+
+
+def compare_chip_output(chip, reference, decode, target, chip_pred, max_lag=5, warmup=200):
+    """The chip's output spike counts against the quantized network's on the
+    same steps: spike totals, how often a step matches exactly, per-feature
+    rate agreement, the delay (in steps) at which the two correlate best,
+    and the RMSE of the chip's spikes decoded after removing that delay.
+
+    The chip's spikes are also re-decoded without any shift; that RMSE must
+    equal the chip's own ('speck_same_rows'), or the host-side decode
+    differs. Re-decoding starts the EMA from zero, so all three RMSEs skip
+    the first `warmup` steps, by which the EMA has forgotten its start."""
+    total_chip, total_ref = chip.sum(axis=1), reference.sum(axis=1)
+    lags = range(0, max_lag + 1)
+    lag_corr = {lag: _corr(total_chip[lag:], total_ref[:len(total_ref) - lag]) for lag in lags}
+    best = max(lag_corr, key=lambda lag: -1 if np.isnan(lag_corr[lag]) else lag_corr[lag])
+    shifted = np.vstack([chip[best:], np.zeros((best, chip.shape[1]))])
+    return {
+        'spike_ratio': float(chip.sum() / max(reference.sum(), 1)),
+        'steps_identical': float((chip == reference).all(axis=1).mean()),
+        'feature_rate_corr': _corr(chip.mean(axis=0), reference.mean(axis=0)),
+        'step_corr_lag0': lag_corr[0],
+        'best_lag': int(best), 'step_corr_best_lag': lag_corr[best],
+        'rmse_speck_same_rows': rmse(chip_pred[warmup:], target[warmup:]),
+        'rmse_redecoded': rmse(decode(chip)[warmup:], target[warmup:]),
+        'rmse_lag_corrected': rmse(decode(shifted)[warmup:], target[warmup:]),
+    }
+
+
 def diagnose_session(session, checkpoint, snn_dataset_path, results_dir, experiment, use_specksim):
-    preds, target, spikes = decode_versions(checkpoint, snn_dataset_path, experiment, use_specksim)
+    preds, target, counts, decode = decode_versions(checkpoint, snn_dataset_path, experiment, use_specksim)
     arrays_path = os.path.join(results_dir, 'sessions', f'{session}_arrays.npz')
     row, note = {}, None
     if os.path.isfile(arrays_path):
@@ -103,13 +144,18 @@ def diagnose_session(session, checkpoint, snn_dataset_path, results_dir, experim
             n = len(saved['y_true'])
             target = saved['y_true']
             preds = {v: p[offset:offset + n] for v, p in preds.items()}
+            counts = {v: c[offset:offset + n] for v, c in counts.items()}
             for name in ('snn', 'speck'):
                 if f'pred_{name}' in saved:
                     row[name] = {'rmse': rmse(saved[f'pred_{name}'], target)}
+            if 'speck_counts' in saved:
+                row['chip_vs_quantized'] = compare_chip_output(
+                    saved['speck_counts'].astype(float), counts['quantized'], decode, target,
+                    saved['pred_speck'])
     else:
         note = f'no {os.path.basename(arrays_path)}; scored on the SNN dataset, snn/speck left out'
     for version, p in preds.items():
-        row[version] = {'rmse': rmse(p, target), 'output_spikes_per_step': float(spikes[version] / len(p))}
+        row[version] = {'rmse': rmse(p, target), 'output_spikes_per_step': float(counts[version].sum() / len(p))}
     if 'speck' in row:
         results_path = os.path.join(results_dir, 'sessions', f'{session}.json')
         with open(results_path, 'r') as f:
@@ -154,6 +200,23 @@ def main(args):
     fmt = lambda c, m: f"{report['mean'][c][m]:11.2f}" if m in report['mean'][c] else f"{'-':>11s}"
     print(f"{'mean':<20s}" + ''.join(fmt(c, 'rmse') for c in COLUMNS))
     print(f"{'out spikes/step':<20s}" + ''.join(fmt(c, 'output_spikes_per_step') for c in COLUMNS))
+
+    chip_rows = {s: r['chip_vs_quantized'] for s, r in report['sessions'].items() if 'chip_vs_quantized' in r}
+    if chip_rows:
+        cols = [('spike_ratio', 'spk ratio'), ('steps_identical', 'same steps'),
+                ('feature_rate_corr', 'feat corr'), ('step_corr_lag0', 'corr lag0'),
+                ('best_lag', 'best lag'), ('step_corr_best_lag', 'corr best'),
+                ('rmse_speck_same_rows', 'speck'), ('rmse_redecoded', 'redecoded'),
+                ('rmse_lag_corrected', 'lag-fixed')]
+        print(f"\nChip output vs. quantized network, same steps; RMSEs after a 200-step warm-up "
+              f"(redecoded must equal speck)\n"
+              f"{'session':<20s}" + ''.join(f"{label:>11s}" for _, label in cols))
+        for session, c in chip_rows.items():
+            print(f"{session:<20s}" + ''.join(f"{c[k]:11d}" if k == 'best_lag' else f"{c[k]:11.2f}"
+                                              for k, _ in cols))
+    elif rows:
+        print("\nNo chip spike counts saved (runs before this version); re-run test_all_decoders.py "
+              "with 'speck' to compare the chip's output spikes with the quantized network.")
     path = args.output or os.path.join(results_dir, 'speck_diagnosis.json')
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w') as f:

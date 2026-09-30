@@ -206,7 +206,9 @@ class SpeckDevkit:
         config.dvs_layer.pass_sensor_events = False
         for core in self.cores:
             config.cnn_layers[core].return_to_zero = True
-            config.cnn_layers[core].monitor_enable = True
+            # Only the output layer is read; monitoring the hidden layers would
+            # stream all of their spikes to the host as well.
+            config.cnn_layers[core].monitor_enable = core == self.cores[-1]
         self.device.get_model().apply_configuration(config)
         print(f"  [speck] {devkit}: chip layers {self.cores}, {self.param_count:,} parameters deployed")
 
@@ -232,17 +234,21 @@ class SpeckDevkit:
 
     def run(self, input_spikes, n_outputs):
         """Feed one trial (C, T) a timestep at a time. Returns (output spike
-        counts (T, n_outputs), loop seconds, mean power in W)."""
+        counts (T, n_outputs), loop seconds, mean power in W, input events
+        sent). Output spikes still in flight after the wait are counted in
+        a later timestep."""
         frames = torch.from_numpy(input_spikes.T.astype(np.float32))[:, None, :, None, None]
         spike_type, last_core = self.samna.speck2f.event.Spike, self.cores[-1]
         counts = np.zeros((len(frames), n_outputs))
+        n_input_events = 0
         self.power_monitor.start_auto_power_measurement(POWER_SAMPLE_RATE_HZ)
         start = time.perf_counter()
         for t, frame in enumerate(frames):
             if frame.any():
+                events = self.chip_factory.raster_to_events(frame, self.cores[0], dt=self.raster_dt)
+                n_input_events += len(events)
                 self.stop_watch.start(reset=True)
-                self.input_source.write(self.chip_factory.raster_to_events(frame, self.cores[0],
-                                                                           dt=self.raster_dt))
+                self.input_source.write(events)
             time.sleep(self.wait_time)
             features = [ev.feature for ev in self.output_sink.get_events()
                         if isinstance(ev, spike_type) and ev.layer == last_core]
@@ -254,7 +260,7 @@ class SpeckDevkit:
         if not count_ok:
             print(f"  WARNING: {len(power_events)} power samples over {loop_s:.2f} s is not what "
                   f"{POWER_SAMPLE_RATE_HZ} Hz per channel predicts; this trial's power may be unreliable")
-        return counts, loop_s, power_w
+        return counts, loop_s, power_w, n_input_events
 
     def close(self):
         self.graph.stop()
@@ -279,20 +285,24 @@ def predict_speck_test_set(model, velocity_scale, snn_dataset_path, device, expe
     """The chip counterpart of decoder_eval.predict_snn_test_set(): the same
     trials, the same dropped first window, so its output aligns the same way.
 
-    Returns (pred (n, 2), chip) with chip = {latency_s, energy_j (per
-    sample), power_w, param_count, n_timesteps, output_spikes_per_step,
-    wait_time_s, raster_dt}."""
+    Returns (pred (n, 2), chip, output spike counts (n, 2 * n_bins)) with
+    chip = {latency_s, energy_j (per sample), power_w, param_count,
+    n_timesteps, output_spikes_per_step, input_events_sent,
+    input_spikes, wait_time_s, raster_dt}; input_events_sent should equal
+    input_spikes (the summed input counts)."""
     files = snn_test_files(snn_dataset_path)
     continuous = continuous_stream and experiment == 'hkm'
     n_outputs = 2 * model.n_bins
-    preds, loop_s, energy_j, n_timed, n_spikes = [], 0.0, 0.0, 0, 0.0
+    preds, kept_counts, loop_s, energy_j, n_timed, n_spikes = [], [], 0.0, 0.0, 0, 0.0
+    n_events, n_input = 0, 0
     for i, path in enumerate(files):
         if i == 0 and len(files) > 1 and not continuous:
             continue                                  # dropped anyway; skip the chip time
         if i == 0 or not continuous:
             device.reset()
         spikes = _load_pickle(path)['input_spikes']
-        counts, seconds, power_w = device.run(spikes, n_outputs)
+        counts, seconds, power_w, events = device.run(spikes, n_outputs)
+        n_events, n_input = n_events + events, n_input + int(np.round(spikes).sum())
         print(f"  [speck] trial {i + 1}/{len(files)}: {spikes.shape[1]} timesteps, "
               f"{seconds * 1000 / spikes.shape[1]:.3f} ms/timestep, {power_w * 1000:.3f} mW")
         loop_s, energy_j, n_timed = loop_s + seconds, energy_j + power_w * seconds, n_timed + len(counts)
@@ -300,11 +310,16 @@ def predict_speck_test_set(model, velocity_scale, snn_dataset_path, device, expe
         y_pred = unscale_velocity(decode_spike_counts(model, counts), velocity_scale)
         if len(files) == 1:
             preds.append(y_pred[BASE_NPERSEG:])
+            kept_counts.append(counts[BASE_NPERSEG:])
         elif i > 0:
             preds.append(y_pred)
+            kept_counts.append(counts)
+    if n_events != n_input:
+        print(f"  WARNING: {n_events} input events sent to the chip for {n_input} input spikes")
     chip = {'latency_s': loop_s / n_timed, 'energy_j': energy_j / n_timed,
             'power_w': energy_j / loop_s if loop_s > 0 else None,
             'param_count': int(device.param_count), 'n_timesteps': n_timed,
             'output_spikes_per_step': float(n_spikes / n_timed),
+            'input_events_sent': int(n_events), 'input_spikes': int(n_input),
             'wait_time_s': device.wait_time, 'raster_dt': device.raster_dt}
-    return np.concatenate(preds, axis=0), chip
+    return np.concatenate(preds, axis=0), chip, np.concatenate(kept_counts, axis=0)

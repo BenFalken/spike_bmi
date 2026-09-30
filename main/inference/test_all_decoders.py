@@ -83,13 +83,16 @@ def _json_ready(result):
 
 
 def save_arrays(arrays, path):
-    np.savez_compressed(path, y_true=arrays['y_true'], y_pos=arrays['y_pos'],
+    extra = {} if arrays.get('speck_counts') is None else {
+        'speck_counts': arrays['speck_counts'].astype(np.uint16)}
+    np.savez_compressed(path, y_true=arrays['y_true'], y_pos=arrays['y_pos'], **extra,
                         **{f"pred_{name}": y for name, y in arrays['pred'].items()})
 
 
 def load_arrays(path):
     with np.load(path) as f:
         return {'y_true': f['y_true'], 'y_pos': f['y_pos'],
+                'speck_counts': f['speck_counts'] if 'speck_counts' in f.files else None,
                 'pred': {k[len('pred_'):]: f[k] for k in f.files if k.startswith('pred_')}}
 
 

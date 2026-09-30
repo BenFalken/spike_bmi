@@ -297,7 +297,7 @@ def predict_snn_test_set(model, velocity_scale, snn_dataset_path, experiment,
 
 def predict_speck_test_set(model, checkpoint, velocity_scale, cfg):
     """predict_snn_test_set() on the Speck devkit: returns (pred, chip
-    timing and power), see speck.py."""
+    timing and power, output spike counts), see speck.py."""
     import speck
     device = speck.open_speck(model, checkpoint, cfg.snn_dataset_path, cfg.speck_devkit,
                               cfg.speck_wait_time, cfg.speck_raster_dt)
@@ -383,7 +383,8 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
     Returns None if no decoder is available, else a dict with the scored
     range (start_raw, end_raw, n_samples), per-decoder 'metrics' (each with
     its 'op_estimate', None for 'speck', which has its measured 'chip'
-    timing and power instead), and the aligned arrays under 'arrays'.
+    timing and power instead), and the aligned arrays under 'arrays'
+    (with the chip's output spike counts per step as 'speck_counts').
     """
     tag = f"{duration_minutes:g}min" if duration_minutes is not None else None
     label = tag or 'full'
@@ -406,7 +407,7 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
     end = min([n_test] + [offset + len(y) for y, offset in preds.values()])
 
     snn_names = [d for d in SNN_DECODERS if d in decoders]
-    snn_preds, chip = {}, None
+    snn_preds, chip, speck_counts = {}, None, None
     if snn_names and snn_checkpoint_path and os.path.exists(snn_checkpoint_path):
         model, checkpoint, scale = load_snn_model(snn_checkpoint_path, cfg.experiment)
         if 'snn' in snn_names:
@@ -415,7 +416,7 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
                 model, scale, cfg.snn_dataset_path, cfg.experiment, cfg.continuous_snn_test_stream)
         if 'speck' in snn_names:
             print(f"  Evaluating SNN on Speck ({label}): {snn_checkpoint_path}")
-            snn_preds['speck'], chip = predict_speck_test_set(model, checkpoint, scale, cfg)
+            snn_preds['speck'], chip, speck_counts = predict_speck_test_set(model, checkpoint, scale, cfg)
             op_estimates['speck'] = None
         # Both run the same trials, so they share one alignment. Intersect
         # their rows with the ANN decoders' range.
@@ -426,6 +427,8 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
         if snn_end > snn_start:
             start, end = snn_start, snn_end
             snn_preds = {name: p[trim:trim + end - start] for name, p in snn_preds.items()}
+            if speck_counts is not None:
+                speck_counts = speck_counts[trim:trim + end - start]
         else:
             print(f"  [skip] {', '.join(snn_preds)} ({label}): no overlap with the other decoders' test rows")
             snn_preds = {}
@@ -464,4 +467,5 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
     return {'duration_tag': tag, 'train_duration_minutes': duration_minutes,
             'start_raw': start, 'end_raw': end, 'n_samples': n,
             'decoders': list(aligned), 'metrics': metrics,
-            'arrays': {'y_true': y_true, 'y_pos': data['y_test_pos'][start:end], 'pred': aligned}}
+            'arrays': {'y_true': y_true, 'y_pos': data['y_test_pos'][start:end], 'pred': aligned,
+                       'speck_counts': speck_counts if 'speck' in aligned else None}}
