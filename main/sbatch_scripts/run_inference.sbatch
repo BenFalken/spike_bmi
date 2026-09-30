@@ -41,6 +41,7 @@
 #   FIGURES=1 bash run_inference.sbatch --submit bmi indy     # also per-session diagnostic figures
 #   DATA_ROOT=~/data VENV=~/speck-env bash run_inference.sbatch --local bmi indy
 #   (--local without DATA_ROOT uses the data/ folder next to main/, if there is one)
+#   SPECK_WAIT_TIME=0.005 ...   seconds the chip gets per timestep before its output is read
 #   Only rebuild the report:  MODE=report EXPERIMENT=bmi SUBJECT=indy bash run_inference.sbatch
 
 set -eo pipefail
@@ -179,6 +180,7 @@ run_session() {  # run_session SESSION_ID
         --test_frac "$TEST_FRAC" \
         --train_durations "$TRAIN_DURATIONS" \
         --machine "$MACHINE" \
+        ${SPECK_WAIT_TIME:+--speck_wait_time "$SPECK_WAIT_TIME"} \
         "${figure_args[@]}"
 }
 
