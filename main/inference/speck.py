@@ -13,6 +13,12 @@ Latency is wall time per timestep of that loop (including the wait), and
 power is the devkit PowerMonitor's mean over the same loop, so energy per
 sample = power x latency.
 
+Two software stand-ins for the chip (diagnose_speck.py) separate its
+sources of error: run_discretized() steps the discretized network (8-bit
+weights, integer thresholds) one timestep at a time, like training;
+run_specksim() replays the same events through samna's event-driven Speck
+simulator, where each input event updates the membranes on its own.
+
 samna and the dynapcnn backend are imported only when a chip run is
 requested, so machines without a devkit never need them.
 """
@@ -60,6 +66,63 @@ def decode_spike_counts(model, spike_counts):
     with torch.no_grad():
         return torch.cat([model.decode_output(ema_cascade_update(stages, counts[t:t + 1], decay))
                           for t in range(len(counts))]).numpy()
+
+
+def discretize(snn_seq, n_inputs):
+    """The DynapcnnNetwork deployed to the chip (weights and thresholds
+    quantized to the chip's integer ranges)."""
+    from sinabs.backend.dynapcnn import DynapcnnNetwork
+    return DynapcnnNetwork(nn.Sequential(nn.Flatten(), *snn_seq), input_shape=(n_inputs, 1, 1),
+                           discretize=True, dvs_input=False)
+
+
+def discretized_sequential(network):
+    """A DynapcnnNetwork's quantized layers as a plain nn.Sequential of
+    Conv2d and IAF layers."""
+    if hasattr(network, 'sequence'):                     # sinabs < 3
+        pairs = [(l.conv_layer, l.spk_layer) for l in network.sequence if hasattr(l, 'conv_layer')]
+    else:
+        layers = network._dynapcnn_module._dynapcnn_layers
+        pairs = [(layers[k].conv, layers[k].spk) for k in sorted(layers, key=int)]
+    return nn.Sequential(*[m for pair in pairs for m in pair])
+
+
+def run_float(snn_seq, input_spikes):
+    """(C, T) input -> (T, n_out) output spikes of the flattened network."""
+    import sinabs
+    x = torch.from_numpy(input_spikes.T.astype(np.float32))
+    sinabs.reset_states(snn_seq)
+    with torch.no_grad():
+        return torch.cat([snn_seq(x[t:t + 1]) for t in range(len(x))]).numpy()
+
+
+def run_discretized(disc_seq, input_spikes):
+    """(C, T) input -> (T, n_out) output spikes of the quantized network,
+    one timestep per call (state carried between calls, as in training)."""
+    import sinabs
+    x = torch.from_numpy(input_spikes.T.astype(np.float32))[:, :, None, None]
+    sinabs.reset_states(disc_seq)
+    with torch.no_grad():
+        return torch.cat([disc_seq(x[t:t + 1]).reshape(1, -1) for t in range(len(x))]).numpy()
+
+
+def run_specksim(disc_seq, input_spikes, n_outputs, step_us=4000):
+    """(C, T) input -> (T, n_out) output spikes from samna's event-driven
+    Speck simulator. The trial is sent as one event stream, input count k
+    of channel c at step t becoming k events at t * step_us; IAF neurons
+    do not leak, so only the event order matters, not the spacing."""
+    from sinabs.backend.dynapcnn.specksim import from_sequential
+    sim = from_sequential(disc_seq, input_shape=(input_spikes.shape[0], 1, 1))
+    counts = np.round(input_spikes.T).astype(int)
+    steps, channels = np.nonzero(counts)
+    n = counts[steps, channels]
+    events = np.zeros(n.sum(), dtype=[('t', np.uint32), ('p', np.uint32), ('y', np.uint32), ('x', np.uint32)])
+    events['t'], events['p'] = np.repeat(steps * step_us + 1, n), np.repeat(channels, n)
+    sim.reset_states()
+    out = sim(events)
+    spikes = np.zeros((counts.shape[0], n_outputs))
+    np.add.at(spikes, (np.minimum(out['t'] // step_us, len(spikes) - 1), out['p']), 1)
+    return spikes
 
 
 def check_deployable(model, checkpoint):
@@ -116,12 +179,10 @@ class SpeckDevkit:
     def __init__(self, snn_seq, n_inputs, devkit='speck2fdevkit:0', wait_time=0.001, raster_dt=0.1):
         import samna
         import sinabs.backend.dynapcnn.io as sio
-        from sinabs.backend.dynapcnn import DynapcnnNetwork
         from sinabs.backend.dynapcnn.chip_factory import ChipFactory
 
         self.samna, self.wait_time, self.raster_dt = samna, wait_time, raster_dt
-        self.network = DynapcnnNetwork(nn.Sequential(nn.Flatten(), *snn_seq), input_shape=(n_inputs, 1, 1),
-                                       discretize=True, dvs_input=False)
+        self.network = discretize(snn_seq, n_inputs)
         self.param_count = sum(p.numel() for m in self.network.modules() if isinstance(m, nn.Conv2d)
                                for p in (m.weight, m.bias) if p is not None)
 
@@ -219,11 +280,12 @@ def predict_speck_test_set(model, velocity_scale, snn_dataset_path, device, expe
     trials, the same dropped first window, so its output aligns the same way.
 
     Returns (pred (n, 2), chip) with chip = {latency_s, energy_j (per
-    sample), power_w, param_count, n_timesteps, wait_time_s, raster_dt}."""
+    sample), power_w, param_count, n_timesteps, output_spikes_per_step,
+    wait_time_s, raster_dt}."""
     files = snn_test_files(snn_dataset_path)
     continuous = continuous_stream and experiment == 'hkm'
     n_outputs = 2 * model.n_bins
-    preds, loop_s, energy_j, n_timed = [], 0.0, 0.0, 0
+    preds, loop_s, energy_j, n_timed, n_spikes = [], 0.0, 0.0, 0, 0.0
     for i, path in enumerate(files):
         if i == 0 and len(files) > 1 and not continuous:
             continue                                  # dropped anyway; skip the chip time
@@ -234,6 +296,7 @@ def predict_speck_test_set(model, velocity_scale, snn_dataset_path, device, expe
         print(f"  [speck] trial {i + 1}/{len(files)}: {spikes.shape[1]} timesteps, "
               f"{seconds * 1000 / spikes.shape[1]:.3f} ms/timestep, {power_w * 1000:.3f} mW")
         loop_s, energy_j, n_timed = loop_s + seconds, energy_j + power_w * seconds, n_timed + len(counts)
+        n_spikes += counts.sum()
         y_pred = unscale_velocity(decode_spike_counts(model, counts), velocity_scale)
         if len(files) == 1:
             preds.append(y_pred[BASE_NPERSEG:])
@@ -242,5 +305,6 @@ def predict_speck_test_set(model, velocity_scale, snn_dataset_path, device, expe
     chip = {'latency_s': loop_s / n_timed, 'energy_j': energy_j / n_timed,
             'power_w': energy_j / loop_s if loop_s > 0 else None,
             'param_count': int(device.param_count), 'n_timesteps': n_timed,
+            'output_spikes_per_step': float(n_spikes / n_timed),
             'wait_time_s': device.wait_time, 'raster_dt': device.raster_dt}
     return np.concatenate(preds, axis=0), chip
