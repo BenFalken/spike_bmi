@@ -8,9 +8,6 @@ test_all_decoders.py) are decoded by the same checkpoint in software:
                 'snn' decoder of test_all_decoders.py
     quantized   the network as deployed to the chip (8-bit weights, integer
                 thresholds), still one timestep per call
-    specksim    the quantized network in samna's event-driven Speck simulator,
-                where each input event updates the membranes on its own (it
-                subtracts the threshold on a spike whatever the trained reset)
 
 and compared with the chip's own predictions ('speck') from that session's
 test_all_decoders.py results. pytorch -> quantized is the cost of
@@ -32,7 +29,7 @@ checkpoint are reported and left out of the snn/speck columns. Without the
 
 Writes {results_dir}/speck_diagnosis.json.
 
-Usage (no devkit needed; specksim needs samna):
+Usage (no devkit needed):
     python diagnose_speck.py --experiment bmi --subject indy --data_root ../../data \
         --snn_checkpoint_root ../../data/snn_checkpoints/bmi/indy/full_cohort_finetuned_medium \
         --results_dir ../../data/results/test_all_decoders_finetuned/bmi/indy
@@ -51,12 +48,12 @@ from decoder_eval import (BASE_NPERSEG, _load_pickle, load_snn_model, snn_test_f
                           unscale_velocity)
 import speck  # noqa: E402
 
-VERSIONS = ('pytorch', 'quantized', 'specksim')
+VERSIONS = ('pytorch', 'quantized')
 COLUMNS = VERSIONS + ('snn', 'speck')
 MATCH_TOL = 1e-3
 
 
-def decode_versions(checkpoint_path, snn_dataset_path, experiment, use_specksim=True):
+def decode_versions(checkpoint_path, snn_dataset_path, experiment):
     """({version: (n, 2) velocity}, (n, 2) SNN dataset velocity, {version:
     (n, 2 * n_bins) output spike counts}, decode) over the test trials, first
     window dropped; decode(counts) -> velocity, as for the chip."""
@@ -67,8 +64,6 @@ def decode_versions(checkpoint_path, snn_dataset_path, experiment, use_specksim=
     quant_seq = speck.discretized_sequential(speck.discretize(snn_seq, model.layers[0].in_features))
     runners = {'pytorch': lambda x: speck.run_float(snn_seq, x),
                'quantized': lambda x: speck.run_discretized(quant_seq, x)}
-    if use_specksim:
-        runners['specksim'] = lambda x: speck.run_specksim(quant_seq, x, 2 * model.n_bins)
 
     files = snn_test_files(snn_dataset_path)
     preds, counts_kept, targets = {v: [] for v in runners}, {v: [] for v in runners}, []
@@ -145,8 +140,8 @@ def compare_chip_output(chip, reference, decode, target, chip_pred, max_lag=5, w
     }
 
 
-def diagnose_session(session, checkpoint, snn_dataset_path, results_dir, experiment, use_specksim):
-    preds, target, counts, decode = decode_versions(checkpoint, snn_dataset_path, experiment, use_specksim)
+def diagnose_session(session, checkpoint, snn_dataset_path, results_dir, experiment):
+    preds, target, counts, decode = decode_versions(checkpoint, snn_dataset_path, experiment)
     arrays_path = os.path.join(results_dir, 'sessions', f'{session}_arrays.npz')
     row, note = {}, None
     if os.path.isfile(arrays_path):
@@ -187,12 +182,6 @@ def main(args):
                                 'mua' if args.experiment == 'hkm' else 'mua_8_group')
     results_dir = args.results_dir or os.path.join(
         args.data_root, 'results', 'test_all_decoders', args.experiment, args.subject)
-    try:
-        import samna  # noqa: F401
-        use_specksim = not args.skip_specksim
-    except ImportError:
-        print("samna is not installed: skipping specksim")
-        use_specksim = False
 
     sessions = args.sessions or sorted(os.listdir(root))
     report = {'snn_checkpoint_root': root, 'results_dir': results_dir, 'sessions': {}}
@@ -203,7 +192,7 @@ def main(args):
         if not os.path.isfile(checkpoint):
             continue
         row, note = diagnose_session(session, checkpoint, os.path.join(dataset_root, session),
-                                     results_dir, args.experiment, use_specksim)
+                                     results_dir, args.experiment)
         report['sessions'][session] = dict(row, note=note) if note else row
         print(f"{session:<20s}" + ''.join(f"{row[c]['rmse']:11.2f}" if c in row else f"{'-':>11s}"
                                           for c in COLUMNS) + (f"   ({note})" if note else ''))
@@ -252,6 +241,5 @@ if __name__ == '__main__':
     parser.add_argument('--results_dir', default=None,
                         help='Session results made with these checkpoints (default: results/test_all_decoders/...)')
     parser.add_argument('--sessions', nargs='*', default=None)
-    parser.add_argument('--skip_specksim', action='store_true')
     parser.add_argument('--output', default=None)
     main(parser.parse_args())

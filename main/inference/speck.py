@@ -13,11 +13,15 @@ Latency is wall time per timestep of that loop (including the wait), and
 power is the devkit PowerMonitor's mean over the same loop, so energy per
 sample = power x latency.
 
-Two software stand-ins for the chip (diagnose_speck.py) separate its
-sources of error: run_discretized() steps the discretized network (8-bit
-weights, integer thresholds) one timestep at a time, like training;
-run_specksim() replays the same events through samna's event-driven Speck
-simulator, where each input event updates the membranes on its own.
+Each layer's reset after a spike follows training: sinabs's make_config sets
+return_to_zero for a hard reset and subtracts the threshold for a soft one.
+Unlike training, which sums a timestep's input and then fires, the chip
+updates a neuron after every input event and fires at most once per event
+(probe_speck.py measures this), so a hard reset discards the charge above
+threshold at every spike rather than once per timestep.
+
+run_discretized() steps the discretized network (8-bit weights, integer
+thresholds) one timestep at a time, like training, for diagnose_speck.py.
 
 samna and the dynapcnn backend are imported only when a chip run is
 requested, so machines without a devkit never need them.
@@ -106,25 +110,6 @@ def run_discretized(disc_seq, input_spikes):
         return torch.cat([disc_seq(x[t:t + 1]).reshape(1, -1) for t in range(len(x))]).numpy()
 
 
-def run_specksim(disc_seq, input_spikes, n_outputs, step_us=4000):
-    """(C, T) input -> (T, n_out) output spikes from samna's event-driven
-    Speck simulator. The trial is sent as one event stream, input count k
-    of channel c at step t becoming k events at t * step_us; IAF neurons
-    do not leak, so only the event order matters, not the spacing."""
-    from sinabs.backend.dynapcnn.specksim import from_sequential
-    sim = from_sequential(disc_seq, input_shape=(input_spikes.shape[0], 1, 1))
-    counts = np.round(input_spikes.T).astype(int)
-    steps, channels = np.nonzero(counts)
-    n = counts[steps, channels]
-    events = np.zeros(n.sum(), dtype=[('t', np.uint32), ('p', np.uint32), ('y', np.uint32), ('x', np.uint32)])
-    events['t'], events['p'] = np.repeat(steps * step_us + 1, n), np.repeat(channels, n)
-    sim.reset_states()
-    out = sim(events)
-    spikes = np.zeros((counts.shape[0], n_outputs))
-    np.add.at(spikes, (np.minimum(out['t'] // step_us, len(spikes) - 1), out['p']), 1)
-    return spikes
-
-
 def check_deployable(model, checkpoint):
     args = checkpoint['args']
     if args.get('neuron_type') != 'iaf':
@@ -176,11 +161,7 @@ def measure_chip_power(power_events, loop_s, sample_rate_hz=POWER_SAMPLE_RATE_HZ
 class SpeckDevkit:
     """A converted network deployed on a Speck2f devkit."""
 
-    def __init__(self, snn_seq, n_inputs, devkit='speck2fdevkit:0', wait_time=0.001, raster_dt=0.1,
-                 hard_reset=None):
-        """hard_reset: per spiking layer, whether it was trained with a hard
-        reset (return to zero) rather than subtracting the threshold;
-        default all hard."""
+    def __init__(self, snn_seq, n_inputs, devkit='speck2fdevkit:0', wait_time=0.001, raster_dt=0.1):
         import samna
         import sinabs.backend.dynapcnn.io as sio
         from sinabs.backend.dynapcnn.chip_factory import ChipFactory
@@ -204,18 +185,18 @@ class SpeckDevkit:
         self.graph.start()
         self.stop_watch.set_enable_value(True)
 
-        config = self.network.make_config(device=devkit)
+        config = self.network.make_config(device=devkit)       # reset from each layer's reset_fn
         ordering = self.network.chip_layers_ordering   # list, or {layer: core} in sinabs >= 3
         self.cores = [ordering[k] for k in sorted(ordering)] if isinstance(ordering, dict) else list(ordering)
         config.dvs_layer.pass_sensor_events = False
-        hard_reset = hard_reset or [True] * len(self.cores)
-        for core, hard in zip(self.cores, hard_reset):
-            config.cnn_layers[core].return_to_zero = bool(hard)
+        for core in self.cores:
             # Only the output layer is read; monitoring the hidden layers would
             # stream all of their spikes to the host as well.
             config.cnn_layers[core].monitor_enable = core == self.cores[-1]
         self.device.get_model().apply_configuration(config)
-        print(f"  [speck] {devkit}: chip layers {self.cores}, {self.param_count:,} parameters deployed")
+        self.resets = ['hard' if config.cnn_layers[c].return_to_zero else 'soft' for c in self.cores]
+        print(f"  [speck] {devkit}: chip layers {self.cores}, reset {'/'.join(self.resets)}, "
+              f"{self.param_count:,} parameters deployed")
 
     def reset(self):
         """Zero every membrane potential and drop pending output and power events."""
@@ -282,18 +263,7 @@ def open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt
     snn_seq = flatten_snn(model)
     snn_seq.eval()
     cross_check_flattened(model, snn_seq, _load_pickle(snn_test_files(snn_dataset_path)[0])['input_spikes'])
-    hard_reset = layer_hard_reset(checkpoint['args'], sum(1 for m in snn_seq if hasattr(m, 'spike_threshold')))
-    if any(hard_reset):
-        print("  [speck] note: hard-reset layers reset after each input event on the chip, not once per "
-              "timestep as in training; subtract (soft) reset behaves the same on both")
-    return SpeckDevkit(snn_seq, model.layers[0].in_features, devkit, wait_time, raster_dt, hard_reset)
-
-
-def layer_hard_reset(args, n_layers):
-    """Per spiking layer, whether training used a hard reset."""
-    reset = args.get('reset_type', 'hard')
-    final = args.get('final_layer_reset_type') or reset
-    return [r == 'hard' for r in [reset] * (n_layers - 1) + [final]]
+    return SpeckDevkit(snn_seq, model.layers[0].in_features, devkit, wait_time, raster_dt)
 
 
 def predict_speck_test_set(model, velocity_scale, snn_dataset_path, device, experiment,

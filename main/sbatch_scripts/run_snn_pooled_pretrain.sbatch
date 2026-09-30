@@ -20,6 +20,7 @@
 #   mkdir -p snn_logs
 #   sbatch --export=ALL,EXPERIMENT=bmi,SUBJECT=indy run_snn_pooled_pretrain.sbatch
 #   sbatch --export=ALL,EXPERIMENT=bmi,SUBJECT=indy,TAU_SYN=8.0 run_snn_pooled_pretrain.sbatch
+#   sbatch --export=ALL,EXPERIMENT=bmi,SUBJECT=indy,RESET_TYPE=soft run_snn_pooled_pretrain.sbatch
 #
 # Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/full_cohort_pretrained_medium[_tau_syn_<T>]/
 # Re-submitting skips a finished run and resumes an interrupted one.
@@ -65,7 +66,7 @@ if [ ${#RESUME_ARGS[@]} -eq 0 ] && [ -f "${PRETRAIN_DIR}/best_model_weights.pth"
 fi
 
 echo "Pooled pretraining ${EXPERIMENT}/${SUBJECT}: hidden=${HIDDEN_DIMS[*]} thresholds=${THRESHOLDS[*]}" \
-     "tau_syn=${TAU_SYN} -> ${PRETRAIN_DIR}"
+     "tau_syn=${TAU_SYN} reset=${RESET_TYPE} -> ${PRETRAIN_DIR}"
 mkdir -p "$PRETRAIN_DIR"
 
 python3 "$TRAIN_SCRIPT" \

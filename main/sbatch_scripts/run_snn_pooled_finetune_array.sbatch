@@ -10,7 +10,7 @@
 # subject (array task i = session i). Each run starts from the pretrained
 # model's weights (--init-weights-from, fresh optimizer) and uses exactly the
 # network and training settings of pretraining (snn_medium_config.sh). With
-# TAU_SYN set, it fine-tunes the matching tau_syn pretrained model.
+# TAU_SYN and/or RESET_TYPE set, it fine-tunes the matching pretrained model.
 #
 # Submit (from this directory), validating one session first:
 #   mkdir -p snn_logs
@@ -34,7 +34,7 @@ source ./snn_medium_config.sh
 PRETRAINED_CHECKPOINT="${PRETRAIN_DIR}/best_model_weights.pth"
 if [ ! -f "$PRETRAINED_CHECKPOINT" ]; then
     echo "ERROR: $PRETRAINED_CHECKPOINT not found; run run_snn_pooled_pretrain.sbatch" \
-         "for ${EXPERIMENT}/${SUBJECT} (TAU_SYN=${TAU_SYN}) first." >&2
+         "for ${EXPERIMENT}/${SUBJECT} (TAU_SYN=${TAU_SYN}, RESET_TYPE=${RESET_TYPE}) first." >&2
     exit 1
 fi
 
@@ -76,7 +76,7 @@ export OPENBLAS_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 echo "Fine-tuning ${EXPERIMENT}/${SUBJECT}/${SESSION_ID} ($((SLURM_ARRAY_TASK_ID + 1))/${N_SESSIONS}):" \
-     "hidden=${HIDDEN_DIMS[*]} thresholds=${THRESHOLDS[*]} tau_syn=${TAU_SYN} -> ${CHECKPOINT_DIR}"
+     "hidden=${HIDDEN_DIMS[*]} thresholds=${THRESHOLDS[*]} tau_syn=${TAU_SYN} reset=${RESET_TYPE} -> ${CHECKPOINT_DIR}"
 mkdir -p "$CHECKPOINT_DIR"
 
 python3 "$TRAIN_SCRIPT" \
