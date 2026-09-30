@@ -3,22 +3,16 @@ Combine one subject's per-session results (test_all_decoders.py output) and
 draw the report figures.
 
 Reads   {results_dir}/sessions/*.json
-        {results_dir}/aggregated_summary.json   (optional; the Speck laptop
-                                                 run, aggregate_speck_results.py)
 Writes  {results_dir}/combined_metrics.json            {session: {decoder: metrics}}
         {results_dir}/combined_metrics_durations.json  {session: {"Nmin": {decoder: metrics}}}
-        {results_dir}/efficiency_summary.json          per-decoder means across sessions
+        {results_dir}/efficiency_summary.json          {machine: {decoder: means across sessions}}
         {results_dir}/decoder_efficiency.png, decoder_energy.png, decoder_comparison_4x2.png
-
-The Speck results ('speck' and 'snn_pytorch') are added to the figures only;
-the combined JSON files hold the cluster evaluation alone.
 
 Usage:
     python make_report.py --results_dir $BMI_DATA_ROOT/results/test_all_decoders/bmi/indy
 """
 
 import argparse
-import copy
 import glob
 import json
 import os
@@ -26,8 +20,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 
-from report_figures import (DECODER_ORDER, LAPTOP_DECODERS, comparison_4x2_figure, energy_figure,
-                            efficiency_figure, mean_ci)
+from report_figures import DECODER_ORDER, comparison_4x2_figure, energy_figure, efficiency_figure, mean_ci
 
 
 def load_sessions(sessions_dir):
@@ -47,86 +40,55 @@ def load_sessions(sessions_dir):
     return sessions
 
 
-def load_speck_summary(path):
-    """{name: {session: {...}}, ...} for 'speck' (on chip) and 'snn_pytorch'
-    (the laptop's PyTorch run) from an aggregate_speck_results.py summary."""
-    if not path or not os.path.isfile(path):
-        print(f"[speck] no Speck summary at {path}; figures show the cluster decoders only")
-        return {}
-    with open(path, 'r') as f:
-        summary = json.load(f)
-    merged = {}
-    for impl_key, name in (('torch', 'snn_pytorch'), ('speck', 'speck')):
-        impl = summary.get('impls', {}).get(impl_key)
-        if impl is None:
-            continue
-        n = len(impl['sessions'])
-        power = impl.get('power_mw', {}).get('values')
-        latency_ms = impl['latency_per_timestep_ms']['values']
-        energy = ([(p / 1000) * (ms / 1000) for p, ms in zip(power, latency_ms)]
-                  if power is not None and len(power) == len(latency_ms) else [None] * n)
-        merged[name] = {
-            'accuracy': {s: {'rmse': r, 'cc_x': cx, 'cc_y': cy} for s, r, cx, cy in zip(
-                impl['sessions'], impl['rmse_vs_gt']['values'], impl['cc_x_vs_gt']['values'],
-                impl['cc_y_vs_gt']['values'])},
-            'latency_s': [ms / 1000 for ms in latency_ms],
-            'energy_j': energy,
-            'param_count': summary.get('dynapcnn_param_count'),
-            'energy_method': impl.get('energy_method'),
-        }
-        print(f"[speck] merged {n} session(s) of '{impl_key}' as {name}")
-    return merged
+def _profiles(content):
+    """{machine: {decoder: profile}}, also for files with the older single
+    'profile' section (cluster only, one energy_method for all decoders)."""
+    if 'profiles' in content:
+        return {m: p.get('decoders', {}) for m, p in content['profiles'].items()}
+    old = content.get('profile') or {}
+    return {'cluster': {name: {**p, 'energy_method': p.get('energy_method', old.get('energy_method'))}
+                        for name, p in old.get('decoders', {}).items()}} if old else {}
 
 
-def efficiency_records(sessions, speck):
-    """One record per decoder: means (and CIs) across sessions of RMSE,
-    latency, parameter count and energy."""
-    samples = {}
+def efficiency_records(sessions):
+    """One record per (machine, decoder): means (and CIs) across sessions of
+    RMSE, latency, parameter count and energy."""
+    samples = {}   # (machine, decoder) -> lists
     for content in sessions.values():
-        for name, m in content['full']['metrics'].items():
-            samples.setdefault(name, {'rmse': [], 'latency_s': [], 'param_count': [], 'energy_j': [],
-                                      'methods': {}})['rmse'].append(m['rmse'])
-        profile = content.get('profile') or {}
-        for name, p in profile.get('decoders', {}).items():
-            entry = samples.setdefault(name, {'rmse': [], 'latency_s': [], 'param_count': [],
-                                              'energy_j': [], 'methods': {}})
-            entry['latency_s'].append(p['latency_s'])
-            entry['param_count'].append(p['param_count'])
-            entry['energy_j'].append(p['energy_j'])
-            method = profile.get('energy_method')
-            if method and p['energy_j'] is not None:
-                entry['methods'][method] = entry['methods'].get(method, 0) + 1
-    for name, s in speck.items():
-        if s['param_count'] is None:
-            print(f"[speck] {name}: summary has no dynapcnn_param_count; left out of efficiency figures")
-            continue
-        samples[name] = {'rmse': [a['rmse'] for a in s['accuracy'].values()], 'latency_s': s['latency_s'],
-                         'param_count': [s['param_count']] * len(s['latency_s']), 'energy_j': s['energy_j'],
-                         'methods': {s['energy_method']: len(s['latency_s'])} if s['energy_method'] else {}}
+        metrics = content['full']['metrics']
+        for machine, profile in _profiles(content).items():
+            for name, p in profile.items():
+                if name not in metrics:
+                    continue
+                s = samples.setdefault((machine, name), {'rmse': [], 'latency_s': [], 'param_count': [],
+                                                         'energy_j': [], 'methods': {}})
+                s['rmse'].append(metrics[name]['rmse'])
+                s['latency_s'].append(p['latency_s'])
+                s['param_count'].append(p['param_count'])
+                s['energy_j'].append(p['energy_j'])
+                if p.get('energy_method') and p['energy_j'] is not None:
+                    s['methods'][p['energy_method']] = s['methods'].get(p['energy_method'], 0) + 1
 
     records = []
-    for name in (d for d in DECODER_ORDER if d in samples):
-        s = samples[name]
-        if not s['rmse'] or not s['latency_s']:
-            print(f"[efficiency] {name}: missing {'RMSE' if not s['rmse'] else 'profiling'} data, left out")
-            continue
+    order = {d: i for i, d in enumerate(DECODER_ORDER)}
+    for machine, name in sorted(samples, key=lambda k: (k[0], order.get(k[1], len(order)))):
+        s = samples[(machine, name)]
+        label = f"{name.upper()} ({machine})"
         if len(set(s['param_count'])) > 1:
-            print(f"WARNING: {name.upper()} parameter count differs across sessions: {sorted(set(s['param_count']))}")
+            print(f"WARNING: {label} parameter count differs across sessions: {sorted(set(s['param_count']))}")
         if len(s['methods']) > 1:
-            print(f"WARNING: {name.upper()} energy mixes measurement methods across sessions: {s['methods']}")
+            print(f"WARNING: {label} energy mixes measurement methods across sessions: {s['methods']}")
         rmse, rmse_lo, rmse_hi = mean_ci(s['rmse'])
         latency, latency_lo, latency_hi = mean_ci(s['latency_s'])
         energies = [e for e in s['energy_j'] if e is not None]
         energy = mean_ci(energies) if energies else (None, None, None)
         records.append({
-            'name': name, 'rmse': rmse, 'rmse_lo': rmse_lo, 'rmse_hi': rmse_hi,
+            'name': name, 'machine': machine, 'rmse': rmse, 'rmse_lo': rmse_lo, 'rmse_hi': rmse_hi,
             'latency_s': latency, 'latency_lo': latency_lo, 'latency_hi': latency_hi,
             'param_count': float(np.mean(s['param_count'])),
             'energy_j': energy[0], 'energy_lo': energy[1], 'energy_hi': energy[2],
             'energy_method': max(s['methods'], key=s['methods'].get) if energies and s['methods'] else None,
-            'n_sessions': len(s['latency_s']), 'n_rmse_sessions': len(s['rmse']),
-            'n_energy_sessions': len(energies),
-            'latency_cohort': 'laptop' if name in LAPTOP_DECODERS else 'cluster',
+            'n_sessions': len(s['latency_s']), 'n_energy_sessions': len(energies),
         })
     return records
 
@@ -155,15 +117,18 @@ def main(args):
     _write_json(combined, os.path.join(results_dir, 'combined_metrics.json'))
     _write_json(durations, os.path.join(results_dir, 'combined_metrics_durations.json'))
 
-    speck = load_speck_summary(args.speck_summary_path or os.path.join(results_dir, 'aggregated_summary.json'))
-    records = efficiency_records(sessions, speck)
-    _write_json({'decoders': {r['name']: {k: v for k, v in r.items() if k != 'name'} for r in records}},
-                os.path.join(results_dir, 'efficiency_summary.json'))
+    records = efficiency_records(sessions)
+    summary = {}
+    for r in records:
+        summary.setdefault(r['machine'], {})[r['name']] = {k: v for k, v in r.items()
+                                                          if k not in ('name', 'machine')}
+    _write_json(summary, os.path.join(results_dir, 'efficiency_summary.json'))
     for r in records:
         energy = (f"{r['energy_j'] * 1e6:.3f} uJ ({r['energy_method']})" if r['energy_j'] is not None
                   else 'n/a')
-        print(f"  {r['name']:>11s} | RMSE {r['rmse']:.2f} | {r['latency_s'] * 1000:.4f} ms/sample | "
-              f"{r['param_count']:,.0f} params | energy {energy} | {r['n_sessions']} sessions")
+        print(f"  {r['machine']:>10s} {r['name']:>5s} | RMSE {r['rmse']:.2f} | "
+              f"{r['latency_s'] * 1000:.4f} ms/sample | {r['param_count']:,.0f} params | "
+              f"energy {energy} | {r['n_sessions']} sessions")
 
     if records:
         _save_figure(efficiency_figure(records, error_bars=args.error_bars),
@@ -172,12 +137,7 @@ def main(args):
         if fig is not None:
             _save_figure(fig, os.path.join(results_dir, 'decoder_energy.png'))
 
-    combined_for_figure = copy.deepcopy(combined)
-    for name, s in speck.items():
-        for session, metrics in s['accuracy'].items():
-            if session in combined_for_figure:
-                combined_for_figure[session][name] = metrics
-    _save_figure(comparison_4x2_figure(combined_for_figure, durations),
+    _save_figure(comparison_4x2_figure(combined, durations),
                  os.path.join(results_dir, 'decoder_comparison_4x2.png'))
 
 
@@ -186,8 +146,6 @@ if __name__ == '__main__':
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--results_dir', required=True,
                         help='Subject results directory containing sessions/')
-    parser.add_argument('--speck_summary_path', default=None,
-                        help='Default: {results_dir}/aggregated_summary.json')
     parser.add_argument('--error_bars', action='store_true',
                         help='Draw 95%% CI error bars on the efficiency figure')
     main(parser.parse_args())

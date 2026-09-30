@@ -776,14 +776,8 @@ def load_model_weights(model: SNN_Speck, state_dict: dict, neuron_type: str,
     correctly excluding sinabs' lazily-shaped STATE buffers (not learned
     parameters) rather than letting load_state_dict fail on them.
 
-    Extracted here, as a single shared function, after this exact
-    exclusion logic needed updating twice already in two separate,
-    independently-maintained call sites (test_all_decoders.py's and
-    snn_inference_utils.py's own load_snn_model()) -- a third,
-    independent copy (for train_snn.py's --init-weights-from) would mean
-    a fourth future change needs to be made in three places instead of
-    one. Both of those callers should be migrated to call this function
-    too, rather than keep their own inline copies.
+    Shared by every checkpoint loader (inference's load_snn_model() and
+    train_snn.py's --init-weights-from).
 
     v_mem/i_syn are lazily shaped for EVERY neuron type (sinabs only
     gives them their real shape the first time forward() actually runs

@@ -28,10 +28,8 @@ just applied ONCE across nperseg = the trial's own FULL length, not a
 fixed small window repeated many times. Deliberately NOT importing
 make_snn_dataset.py directly (its own main() is built around single-
 whole-session --input_filepath/--output_filepath and internal window-
-stepping this script has no use for) -- same reasoning
-snn_inference_utils.py's own module docstring gives for copying rather
-than importing: the two scripts solve genuinely different shaped
-problems even though the core bin-the-spikes-against-bin_edges step is
+stepping this script has no use for): the two scripts solve genuinely
+different shaped problems even though the core bin-the-spikes-against-bin_edges step is
 identical, and forcing a shared import here would mean threading dead
 windowing parameters through a function that doesn't need them.
 

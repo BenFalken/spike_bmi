@@ -8,9 +8,10 @@
 #
 # Evaluate every decoder on every session of one subject, then build the report.
 #
-#   bash run_inference.sbatch --submit bmi indy
+#   bash run_inference.sbatch --submit bmi indy     # on the cluster
+#   bash run_inference.sbatch --local bmi indy      # on one machine, e.g. the Speck laptop
 #
-# submits (from this directory):
+# --submit submits (from this directory):
 #   1. an array job, one task per session with an SNN checkpoint, running
 #      inference/test_all_decoders.py: accuracy (full data and per training
 #      duration) and latency / energy profiling -> sessions/<session>.json
@@ -19,30 +20,43 @@
 #      and the efficiency, energy and 4x2 figures
 # all under ${DATA_ROOT}/results/test_all_decoders/<experiment>/<subject>/.
 #
-# Re-submitting is safe: finished session sections are skipped, and the
-# report is always rebuilt. Put the Speck laptop summary (aggregate_speck_results.py
-# output) at <results dir>/aggregated_summary.json to include it in the figures.
+# --local runs the same steps in series without Slurm. Its defaults suit the
+# Speck-connected laptop: DECODERS adds 'speck' (the SNN on the devkit),
+# TRAIN_DURATIONS is empty (durations come from the cluster run), MACHINE=laptop
+# labels its profile, and math libraries use one thread. The data layout under
+# DATA_ROOT is the same as on the cluster; to extend the cluster results, copy
+# the cluster's sessions/*.json into the laptop's results directory first: their
+# durations and cluster profile are kept, and full-data results gain 'speck'.
 #
-# Settings below can be overridden from the environment when submitting, e.g.
+# Re-running is safe: finished session sections are skipped, and the report is
+# always rebuilt. Settings below can be overridden from the environment, e.g.
 #   SNN_CHECKPOINT_ROOT=.../full_cohort_finetuned_medium bash run_inference.sbatch --submit bmi indy
 #   FIGURES=1 bash run_inference.sbatch --submit bmi indy     # also per-session diagnostic figures
+#   DATA_ROOT=~/data VENV=~/speck-env bash run_inference.sbatch --local bmi indy
 #   Only rebuild the report:  MODE=report EXPERIMENT=bmi SUBJECT=indy bash run_inference.sbatch
 
 set -eo pipefail
 
-if [ "${1:-}" = "--submit" ]; then
-    EXPERIMENT="$2"; SUBJECT="$3"
-fi
+case "${1:-}" in
+    --submit|--local) RUN="$1"; EXPERIMENT="$2"; SUBJECT="$3" ;;
+esac
 if [ -z "${EXPERIMENT:-}" ] || [ -z "${SUBJECT:-}" ]; then
-    echo "Usage: bash $0 --submit <experiment> <subject>" >&2
+    echo "Usage: bash $0 --submit|--local <experiment> <subject>" >&2
     exit 1
+fi
+if [ "${RUN:-}" = "--local" ]; then
+    DECODERS="${DECODERS:-kf,wf,lstm,qrnn,snn,speck}"
+    TRAIN_DURATIONS="${TRAIN_DURATIONS-}"
+    MACHINE="${MACHINE:-laptop}"
+    export ENERGY_METER_NUM_THREADS="${ENERGY_METER_NUM_THREADS:-1}"
 fi
 
 DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
 FEATURE="mua"
 DECODERS="${DECODERS:-kf,wf,lstm,qrnn,snn}"
 TEST_FRAC=0.1
-TRAIN_DURATIONS="${TRAIN_DURATIONS:-1,2,3,4,5,6,7,8,9,10}"
+TRAIN_DURATIONS="${TRAIN_DURATIONS-1,2,3,4,5,6,7,8,9,10}"
+MACHINE="${MACHINE:-cluster}"
 
 DATASET_ROOT="${DATA_ROOT}/dataset/${EXPERIMENT}/${SUBJECT}/mua"
 MODEL_CACHE_ROOT="${DATA_ROOT}/results/model_cache/${EXPERIMENT}/${SUBJECT}"
@@ -70,14 +84,14 @@ done
 # --------------------------------------------------------------------------
 # SUBMIT: array + dependent report job
 # --------------------------------------------------------------------------
-if [ "${1:-}" = "--submit" ]; then
-    if [ "${#SESSION_IDS[@]}" -eq 0 ]; then
-        echo "ERROR: no $(snn_checkpoint '<session>') under $SNN_CHECKPOINT_ROOT" >&2
-        exit 1
-    fi
+if [ -n "${RUN:-}" ] && [ "${#SESSION_IDS[@]}" -eq 0 ]; then
+    echo "ERROR: no $(snn_checkpoint '<session>') under $SNN_CHECKPOINT_ROOT" >&2
+    exit 1
+fi
+if [ "${RUN:-}" = "--submit" ]; then
     mkdir -p logs
     EXPORTS="ALL,EXPERIMENT=${EXPERIMENT},SUBJECT=${SUBJECT},DATA_ROOT=${DATA_ROOT},DECODERS=${DECODERS//,/:}"
-    EXPORTS+=",TRAIN_DURATIONS=${TRAIN_DURATIONS//,/:},SNN_CHECKPOINT_ROOT=${SNN_CHECKPOINT_ROOT}"
+    EXPORTS+=",TRAIN_DURATIONS=${TRAIN_DURATIONS//,/:},MACHINE=${MACHINE},SNN_CHECKPOINT_ROOT=${SNN_CHECKPOINT_ROOT}"
     EXPORTS+=",SNN_CHECKPOINT_SUBDIR=${SNN_CHECKPOINT_SUBDIR},RESULTS_DIR=${RESULTS_DIR},FIGURES=${FIGURES:-}"
     ARRAY_ID=$(sbatch --parsable --array=0-$(( ${#SESSION_IDS[@]} - 1 )) \
         --export="${EXPORTS},MODE=session" "$0")
@@ -93,17 +107,59 @@ fi
 TRAIN_DURATIONS="${TRAIN_DURATIONS//:/,}"
 DECODERS="${DECODERS//:/,}"
 
-deactivate 2>/dev/null || true
-source "$HOME/ann-env/bin/activate"
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
+VENV="${VENV:-$HOME/ann-env}"
+if [ -f "$VENV/bin/activate" ]; then
+    deactivate 2>/dev/null || true
+    source "$VENV/bin/activate"
+fi
+export OMP_NUM_THREADS=${ENERGY_METER_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-1}}
 export OPENBLAS_NUM_THREADS=$OMP_NUM_THREADS
 export MKL_NUM_THREADS=$OMP_NUM_THREADS
+# sbatch runs a copy of this script, so locate inference/ from the submit directory.
+INFERENCE_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}/../inference"
+
+run_report() {
+    python3 "$INFERENCE_DIR/make_report.py" --results_dir "$RESULTS_DIR"
+}
+
+run_session() {  # run_session SESSION_ID
+    local figure_args=()
+    [ -n "${FIGURES:-}" ] && figure_args=(--figures_dir "${RESULTS_DIR}/figures/$1")
+    python3 "$INFERENCE_DIR/test_all_decoders.py" \
+        --experiment "$EXPERIMENT" \
+        --session "$1" \
+        --input_filepath "${DATASET_ROOT}/$1_binning.h5" \
+        --model_dir "${MODEL_CACHE_ROOT}/$1" \
+        --snn_checkpoint_path "$(snn_checkpoint "${SNN_CHECKPOINT_ROOT}/$1")" \
+        --snn_dataset_path "${SNN_DATASET_ROOT}/$1" \
+        --output "${RESULTS_DIR}/sessions/$1.json" \
+        --feature "$FEATURE" \
+        --decoders "$DECODERS" \
+        --test_frac "$TEST_FRAC" \
+        --train_durations "$TRAIN_DURATIONS" \
+        --machine "$MACHINE" \
+        "${figure_args[@]}"
+}
+
+# --------------------------------------------------------------------------
+# LOCAL: every session in series, then the report
+# --------------------------------------------------------------------------
+if [ "${RUN:-}" = "--local" ]; then
+    FAILED=()
+    for i in "${!SESSION_IDS[@]}"; do
+        echo "=== Session ${SESSION_IDS[$i]} ($(( i + 1 ))/${#SESSION_IDS[@]}), host $(hostname) ==="
+        run_session "${SESSION_IDS[$i]}" || FAILED+=("${SESSION_IDS[$i]}")
+    done
+    [ "${#FAILED[@]}" -gt 0 ] && echo "Failed sessions (see above): ${FAILED[*]}"
+    run_report
+    exit 0
+fi
 
 # --------------------------------------------------------------------------
 # REPORT
 # --------------------------------------------------------------------------
 if [ "${MODE:-}" = "report" ]; then
-    python3 ../inference/make_report.py --results_dir "$RESULTS_DIR"
+    run_report
     exit 0
 fi
 
@@ -114,21 +170,5 @@ if [ "${SLURM_ARRAY_TASK_ID:-0}" -ge "${#SESSION_IDS[@]}" ]; then
     echo "Array task $SLURM_ARRAY_TASK_ID has no session (${#SESSION_IDS[@]} found); exiting."
     exit 0
 fi
-SESSION_ID="${SESSION_IDS[${SLURM_ARRAY_TASK_ID:-0}]}"
-FIGURE_ARGS=()
-[ -n "${FIGURES:-}" ] && FIGURE_ARGS=(--figures_dir "${RESULTS_DIR}/figures/${SESSION_ID}")
-
-echo "Session ${SESSION_ID} ($(( ${SLURM_ARRAY_TASK_ID:-0} + 1 ))/${#SESSION_IDS[@]}), host $(hostname)"
-python3 ../inference/test_all_decoders.py \
-    --experiment "$EXPERIMENT" \
-    --session "$SESSION_ID" \
-    --input_filepath "${DATASET_ROOT}/${SESSION_ID}_binning.h5" \
-    --model_dir "${MODEL_CACHE_ROOT}/${SESSION_ID}" \
-    --snn_checkpoint_path "$(snn_checkpoint "${SNN_CHECKPOINT_ROOT}/${SESSION_ID}")" \
-    --snn_dataset_path "${SNN_DATASET_ROOT}/${SESSION_ID}" \
-    --output "${RESULTS_DIR}/sessions/${SESSION_ID}.json" \
-    --feature "$FEATURE" \
-    --decoders "$DECODERS" \
-    --test_frac "$TEST_FRAC" \
-    --train_durations "$TRAIN_DURATIONS" \
-    "${FIGURE_ARGS[@]}"
+echo "Session ${SESSION_IDS[${SLURM_ARRAY_TASK_ID:-0}]} ($(( ${SLURM_ARRAY_TASK_ID:-0} + 1 ))/${#SESSION_IDS[@]}), host $(hostname)"
+run_session "${SESSION_IDS[${SLURM_ARRAY_TASK_ID:-0}]}"

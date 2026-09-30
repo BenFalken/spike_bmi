@@ -3,13 +3,15 @@ Load trained decoders and evaluate them on one session's chronological test spli
 
 ANN-side decoders (KF, WF, LSTM, QRNN) are the bundles written by the
 preprocessing_training/eval_*.py scripts to {model_dir}/{feature}/; the SNN is
-a train_snn.py checkpoint evaluated on the session's SNN .pkl test trials.
+a train_snn.py checkpoint evaluated on the session's SNN .pkl test trials,
+in PyTorch ('snn') and, on a machine with a Speck2f devkit, on the chip
+('speck', full-data model only; see speck.py).
 
 Alignment: the ANN dataset has one row per 4 ms step, and row j predicts the
 velocity at raw sample j + nperseg. SNN test trials are back-to-back 65-sample
 windows (or one long trial), so SNN timestep t of trial i lines up with ANN
 row (i - 1) * nperseg + t; trial 0 (or the first nperseg timesteps of a single
-trial) has no ANN counterpart and is dropped. calibrate_snn_ann_offset() checks
+trial) has no ANN counterpart and is dropped (for 'speck' too). calibrate_snn_ann_offset() checks
 the two test splits start at the same moment and corrects any residual offset.
 Every decoder is then scored over the range of rows they all cover.
 """
@@ -32,7 +34,8 @@ from op_energy_estimate import (estimate_ops_kf, estimate_ops_lstm, estimate_ops
 
 DL_DECODERS = ('lstm', 'qrnn')
 ANN_DECODERS = ('kf', 'wf') + DL_DECODERS
-ALL_DECODERS = ANN_DECODERS + ('snn',)
+SNN_DECODERS = ('snn', 'speck')
+ALL_DECODERS = ANN_DECODERS + SNN_DECODERS
 BASE_NPERSEG = 65          # SNN window length in raw samples (256 ms)
 STEP_S = 0.004
 DEFAULT_CI_N_SPLITS = 10
@@ -292,12 +295,26 @@ def predict_snn_test_set(model, velocity_scale, snn_dataset_path, experiment,
     return np.concatenate(preds, axis=0), finalize_snn_ops(mac, acc, elementwise, n_samples=n_samples)
 
 
-def models_exist(cfg, decoders, duration_tag, snn_checkpoint_path):
-    """Whether any decoder has a trained model for this duration."""
+def predict_speck_test_set(model, checkpoint, velocity_scale, cfg):
+    """predict_snn_test_set() on the Speck devkit: returns (pred, chip
+    timing and power), see speck.py."""
+    import speck
+    device = speck.open_speck(model, checkpoint, cfg.snn_dataset_path, cfg.speck_devkit,
+                              cfg.speck_wait_time, cfg.speck_raster_dt)
+    try:
+        return speck.predict_speck_test_set(model, velocity_scale, cfg.snn_dataset_path, device,
+                                            cfg.experiment, cfg.continuous_snn_test_stream)
+    finally:
+        device.close()
+
+
+def available_decoders(cfg, decoders, duration_tag, snn_checkpoint_path):
+    """The decoders with a trained model for this duration."""
     bundle_dir = os.path.join(cfg.model_dir, cfg.feature)
-    ann = any(os.path.exists(os.path.join(bundle_dir, f"{_tag(d, duration_tag)}_config.json"))
-              for d in decoders if d in ANN_DECODERS)
-    return ann or bool('snn' in decoders and snn_checkpoint_path and os.path.exists(snn_checkpoint_path))
+    snn = bool(snn_checkpoint_path and os.path.exists(snn_checkpoint_path))
+    return [d for d in decoders
+            if (d in SNN_DECODERS and snn) or (d in ANN_DECODERS and os.path.exists(
+                os.path.join(bundle_dir, f"{_tag(d, duration_tag)}_config.json")))]
 
 
 def duration_checkpoint_path(snn_checkpoint_path, duration_minutes):
@@ -361,10 +378,12 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
 
     data: dict with X_test, y_test_full (6 columns), y_test_vel.
     cfg: namespace with model_dir, feature, test_frac, experiment,
-        snn_dataset_path, continuous_snn_test_stream, ci_n_splits, verbose.
+        snn_dataset_path, continuous_snn_test_stream, ci_n_splits, verbose,
+        and for 'speck' speck_devkit, speck_wait_time, speck_raster_dt.
     Returns None if no decoder is available, else a dict with the scored
     range (start_raw, end_raw, n_samples), per-decoder 'metrics' (each with
-    its 'op_estimate'), and the aligned arrays under 'arrays' for figures.
+    its 'op_estimate', None for 'speck', which has its measured 'chip'
+    timing and power instead), and the aligned arrays under 'arrays'.
     """
     tag = f"{duration_minutes:g}min" if duration_minutes is not None else None
     label = tag or 'full'
@@ -386,33 +405,36 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
     start = max((offset for _, offset in preds.values()), default=0)
     end = min([n_test] + [offset + len(y) for y, offset in preds.values()])
 
-    snn_pred = None
-    if 'snn' in decoders and snn_checkpoint_path:
-        if os.path.exists(snn_checkpoint_path):
+    snn_names = [d for d in SNN_DECODERS if d in decoders]
+    snn_preds, chip = {}, None
+    if snn_names and snn_checkpoint_path and os.path.exists(snn_checkpoint_path):
+        model, checkpoint, scale = load_snn_model(snn_checkpoint_path, cfg.experiment)
+        if 'snn' in snn_names:
             print(f"  Evaluating SNN ({label}): {snn_checkpoint_path}")
-            model, _, scale = load_snn_model(snn_checkpoint_path, cfg.experiment)
-            snn_pred, op_estimates['snn'] = predict_snn_test_set(
+            snn_preds['snn'], op_estimates['snn'] = predict_snn_test_set(
                 model, scale, cfg.snn_dataset_path, cfg.experiment, cfg.continuous_snn_test_stream)
-            snn_start = calibrate_snn_ann_offset(cfg.snn_dataset_path, data['y_test_vel'])
-            # Intersect the SNN's rows with the ANN decoders' range.
-            trim = max(0, start - snn_start)
-            snn_start, snn_pred = snn_start + trim, snn_pred[trim:]
-            snn_end = min(end, snn_start + len(snn_pred))
-            if snn_end > snn_start:
-                start, end = snn_start, snn_end
-                snn_pred = snn_pred[:end - start]
-            else:
-                print(f"  [skip] snn ({label}): no overlap with the other decoders' test rows")
-                snn_pred = None
-                del op_estimates['snn']
+        if 'speck' in snn_names:
+            print(f"  Evaluating SNN on Speck ({label}): {snn_checkpoint_path}")
+            snn_preds['speck'], chip = predict_speck_test_set(model, checkpoint, scale, cfg)
+            op_estimates['speck'] = None
+        # Both run the same trials, so they share one alignment. Intersect
+        # their rows with the ANN decoders' range.
+        snn_start = calibrate_snn_ann_offset(cfg.snn_dataset_path, data['y_test_vel'])
+        trim = max(0, start - snn_start)
+        snn_start += trim
+        snn_end = min(end, snn_start + min(len(p) for p in snn_preds.values()) - trim)
+        if snn_end > snn_start:
+            start, end = snn_start, snn_end
+            snn_preds = {name: p[trim:trim + end - start] for name, p in snn_preds.items()}
         else:
-            missing.append('snn')
-    elif 'snn' in decoders:
-        missing.append('snn')
+            print(f"  [skip] {', '.join(snn_preds)} ({label}): no overlap with the other decoders' test rows")
+            snn_preds = {}
+    else:
+        missing += snn_names
     if missing:
         print(f"  No {label} model for: {', '.join(missing)}")
 
-    if not preds and snn_pred is None:
+    if not preds and not snn_preds:
         return None
     if start >= end:
         raise ValueError(f"No test rows are covered by every decoder ({label}: {start}-{end})")
@@ -420,8 +442,7 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
     n = end - start
     y_true = data['y_test_vel'][start:end]
     aligned = {name: y[start - offset:start - offset + n] for name, (y, offset) in preds.items()}
-    if snn_pred is not None:
-        aligned['snn'] = snn_pred
+    aligned.update(snn_preds)
 
     metrics = {}
     for name, y_pred in aligned.items():
@@ -429,11 +450,16 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
         if duration_minutes is not None:
             m['train_duration_minutes'] = duration_minutes
         m['op_estimate'] = op_estimates[name]
+        if name == 'speck':
+            m['chip'] = chip
+            energy = f"measured energy/sample {chip['energy_j'] * 1e6:.4f} uJ"
+        else:
+            per_sample = op_estimates[name]['per_sample']
+            energy = (f"est. energy/sample {per_sample['energy_total_j_low'] * 1e6:.4f}-"
+                      f"{per_sample['energy_total_j_high'] * 1e6:.4f} uJ")
         metrics[name] = m
         print(f"  {name.upper():>5s} | RMSE={m['rmse']:.4f} | CC_x={m['cc_x']:.4f} CC_y={m['cc_y']:.4f} "
-              f"| R2_x={m['r2_x']:.4f} R2_y={m['r2_y']:.4f} | est. energy/sample "
-              f"{op_estimates[name]['per_sample']['energy_total_j_low'] * 1e6:.4f}-"
-              f"{op_estimates[name]['per_sample']['energy_total_j_high'] * 1e6:.4f} uJ")
+              f"| R2_x={m['r2_x']:.4f} R2_y={m['r2_y']:.4f} | {energy}")
     print(f"  Scored test rows [{start}, {end}) ({n} samples)")
     return {'duration_tag': tag, 'train_duration_minutes': duration_minutes,
             'start_raw': start, 'end_raw': end, 'n_samples': n,

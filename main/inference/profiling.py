@@ -14,6 +14,9 @@ energy_j: per-sample energy from one separate, longer block of
     counters need a longer window than one pass of a fast decoder.
 param_count: model parameters. Not comparable across families: KF's count is
     dominated by its channel x channel noise covariance.
+
+The 'speck' decoder is not profiled here: its latency and power are
+measured on the chip during evaluation (speck.py).
 """
 
 import time
@@ -105,16 +108,18 @@ def _snn_single_timestep_pass(model, snn_dataset_path, n_timesteps):
 
 
 def profile_decoders(data, cfg, decoders, snn_checkpoint_path=None, energy_meter_cls=None):
-    """{'energy_method': ..., 'decoders': {name: {latency_s, energy_j,
-    param_count}}} for the full-data model of every available decoder."""
+    """{name: {latency_s, energy_j, energy_method, param_count}} for the
+    full-data model of every available decoder except 'speck'."""
     rng = np.random.default_rng(0)
     X_test = data['X_test']
     timing_idx = rng.choice(len(X_test), size=min(cfg.n_timing_samples, len(X_test)), replace=False)
     y_init = data['y_test_full'][:1, :]
     common = dict(energy_meter_cls=energy_meter_cls, n_energy_repeats=cfg.n_energy_repeats)
 
-    results, methods = {}, set()
+    results = {}
     for name in decoders:
+        if name == 'speck':
+            continue
         if name == 'snn':
             if not snn_checkpoint_path:
                 continue
@@ -134,11 +139,9 @@ def profile_decoders(data, cfg, decoders, snn_checkpoint_path=None, energy_meter
             repeats = dict(n_repeats=2, n_warmup=2) if name in ('lstm', 'qrnn') else {}
             timing = time_per_sample(run_pass, n, **repeats, **common)
         latency_s, energy_j, method = timing
-        methods.add(method)
-        results[name] = {'latency_s': latency_s, 'energy_j': energy_j,
+        results[name] = {'latency_s': latency_s, 'energy_j': energy_j, 'energy_method': method,
                          'param_count': count_params(name, model)}
         energy = f"{energy_j * 1e6:.3f} uJ ({method})" if energy_j is not None else "n/a"
         print(f"  {name.upper():>5s} | {latency_s * 1000:.4f} ms/sample | {energy} | "
               f"{results[name]['param_count']:,} params")
-    methods.discard(None)
-    return {'energy_method': next(iter(methods), None), 'decoders': results}
+    return results

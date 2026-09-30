@@ -2,18 +2,17 @@
 Report figures across the sessions of one subject (called by make_report.py).
 
     efficiency figure   RMSE vs. per-sample latency, marker area ~ parameter
-                        count; one panel per measurement machine (the cluster,
-                        and the Speck-connected laptop if its results are merged)
-    energy figure       measured energy per sample, with proxy estimates and
-                        real (RAPL / chip) measurements in separate panels
+                        count; one panel per profiled machine (e.g. the cluster
+                        and the Speck-connected laptop)
+    energy figure       energy per sample, with proxy estimates and real
+                        (RAPL / chip) measurements in separate panels
     4x2 figure          a/b RMSE and CC boxplots with Wilcoxon significance
                         against the best decoder, c/d pairwise p-value matrices,
                         e/f accuracy vs. training duration, g/h accuracy vs.
                         days since the first session
 
-Decoder names 'speck' and 'snn_pytorch' are the laptop's on-chip and PyTorch
-runs of the SNN (aggregate_speck_results.py); they share the SNN's colour and
-are told apart by hatching.
+'speck' (the SNN run on the chip) shares the SNN's colour and is told apart
+by hatching (dashed in line plots).
 """
 
 import re
@@ -26,19 +25,18 @@ import numpy as np
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.stats import t as t_dist, wilcoxon
 
-DECODER_ORDER = ['kf', 'wf', 'lstm', 'qrnn', 'snn', 'snn_pytorch', 'speck']
-LAPTOP_DECODERS = {'snn_pytorch', 'speck'}
+DECODER_ORDER = ['kf', 'wf', 'lstm', 'qrnn', 'snn', 'speck']
 REAL_ENERGY_METHODS = {'rapl', 'chip_power_monitor'}
 
 EFFICIENCY_COLORS = {'lstm': 'darkorange', 'qrnn': 'seagreen', 'kf': 'purple', 'wf': 'goldenrod',
-                     'snn': 'royalblue', 'speck': 'royalblue', 'snn_pytorch': 'royalblue'}
+                     'snn': 'royalblue', 'speck': 'royalblue'}
 COMPARISON_COLORS = {'kf': '#e8271c', 'wf': '#8fdc3c', 'snn': '#00bcd4', 'lstm': '#6a1fc9',
-                     'qrnn': '#e91e8c', 'speck': '#00bcd4', 'snn_pytorch': '#00bcd4'}
-HATCHES = {'speck': '///', 'snn_pytorch': '...'}
+                     'qrnn': '#e91e8c', 'speck': '#00bcd4'}
+HATCHES = {'speck': '///'}
 
 
 def display_label(name):
-    return {'speck': 'SNN *speck', 'snn_pytorch': 'SNN *PyTorch'}.get(name, name.upper())
+    return 'SNN (Speck)' if name == 'speck' else name.upper()
 
 
 def mean_ci(values, confidence=0.95):
@@ -89,13 +87,10 @@ def efficiency_panel(ax, records, colors=EFFICIENCY_COLORS, error_bars=False):
 
 
 def efficiency_figure(records, error_bars=False):
-    """One panel per measurement machine: latency is only comparable within a
-    panel (the laptop and the cluster run at different speeds)."""
-    cohorts = [(title, recs) for title, recs in [
-        ('Cluster (KF/WF/LSTM/QRNN/SNN)', [r for r in records if r['name'] not in LAPTOP_DECODERS]),
-        ('Speck-connected laptop (SNN on chip / PyTorch)',
-         [r for r in records if r['name'] in LAPTOP_DECODERS]),
-    ] if recs]
+    """One panel per profiled machine: latency is only comparable within a
+    panel."""
+    machines = list(dict.fromkeys(r['machine'] for r in records))
+    cohorts = [(m, [r for r in records if r['machine'] == m]) for m in machines]
     fig, axes = plt.subplots(1, len(cohorts), figsize=(7 * len(cohorts), 6 if len(cohorts) > 1 else 5.5),
                              sharex=True, sharey=True, squeeze=False)
     for ax, (title, recs) in zip(axes[0], cohorts):
@@ -116,9 +111,9 @@ def _energy_panel(ax, records, title):
         if rec['n_energy_sessions'] > 1:
             ax.errorbar(i, e, yerr=[[max(0, e - rec['energy_lo'] * 1e6)], [max(0, rec['energy_hi'] * 1e6 - e)]],
                         fmt='none', ecolor='black', elinewidth=1.2, capsize=3, zorder=4)
-        method = {'rapl': 'real (RAPL)', 'chip_power_monitor': 'real (chip)',
+        method = {'rapl': 'RAPL', 'chip_power_monitor': 'chip',
                   'proxy_psutil': 'proxy'}.get(rec['energy_method'], rec['energy_method'] or 'unknown')
-        ax.annotate(f"{display_label(rec['name'])}\n{method}", (i, e), textcoords='offset points',
+        ax.annotate(f"{display_label(rec['name'])}\n{rec['machine']}, {method}", (i, e), textcoords='offset points',
                     xytext=(0, 8), ha='center', fontsize=8, fontweight='bold')
     ax.set_xticks(np.arange(len(records)), [])
     ax.set_yscale('log')
@@ -231,8 +226,8 @@ def _over_x(ax, x_values, series, decoders, ylabel, xlabel, fmt, clip_decoder=No
     for d in decoders:
         y, lo, hi = (np.asarray(a, dtype=float)[order] for a in series[d])
         ax.errorbar(x_pos, y, yerr=np.vstack([np.clip(y - lo, 0, None), np.clip(hi - y, 0, None)]),
-                    marker='o', linestyle='-', color=COMPARISON_COLORS[d], linewidth=1.5, markersize=5,
-                    capsize=2, elinewidth=1, label=d.upper())
+                    marker='o', linestyle='--' if d in HATCHES else '-', color=COMPARISON_COLORS[d],
+                    linewidth=1.5, markersize=5, capsize=2, elinewidth=1, label=display_label(d))
     ax.set_xticks(x_pos, [fmt(v) for v in np.asarray(x_values)[order]], rotation=90, fontsize=8)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
@@ -289,8 +284,7 @@ def comparison_4x2_figure(combined, durations=None):
                 r, c = samples.setdefault((d, float(tag[:-3])), ([], []))
                 r.append(m['rmse'])
                 c.append(average_cc(m))
-    duration_decoders = [d for d in DECODER_ORDER if d not in LAPTOP_DECODERS
-                         and any(k[0] == d for k in samples)]
+    duration_decoders = [d for d in DECODER_ORDER if any(k[0] == d for k in samples)]
     minutes = sorted({k[1] for k in samples})
     for col, (idx, ylabel, clip) in enumerate([(0, 'RMSE', 'wf'), (1, 'Correlation', None)]):
         ax = axes[2, col]
@@ -307,13 +301,12 @@ def comparison_4x2_figure(combined, durations=None):
         _over_x(ax, minutes, series, duration_decoders, ylabel, 'Training Duration (min)',
                 lambda x: f"{x:g}", clip_decoder=clip)
 
-    # g/h: accuracy vs. days since the first session (cluster decoders only)
+    # g/h: accuracy vs. days since the first session
     first = min(session_date(s) for s in sessions)
     days = [(session_date(s) - first).days for s in sessions]
-    day_decoders = [d for d in decoders if d not in LAPTOP_DECODERS]
     for col, (key, ylabel) in enumerate([('rmse', 'RMSE'), ('cc', 'Correlation')]):
         series = {}
-        for d in day_decoders:
+        for d in decoders:
             entries = [combined[s][d] for s in sessions]
             if key == 'rmse':
                 series[d] = ([e['rmse'] for e in entries], [e.get('rmse_ci_low', e['rmse']) for e in entries],
@@ -322,7 +315,7 @@ def comparison_4x2_figure(combined, durations=None):
                 mean = [average_cc(e) for e in entries]
                 series[d] = (mean, [e.get('cc_ci_low', m) for e, m in zip(entries, mean)],
                              [e.get('cc_ci_high', m) for e, m in zip(entries, mean)])
-        _over_x(axes[3, col], days, series, day_decoders, ylabel, 'Days Since Implantation',
+        _over_x(axes[3, col], days, series, decoders, ylabel, 'Days Since Implantation',
                 lambda x: str(int(round(x))))
 
     handles, labels = axes[3, 0].get_legend_handles_labels()
