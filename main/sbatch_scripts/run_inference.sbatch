@@ -40,6 +40,7 @@
 #   SNN_CHECKPOINT_ROOT=.../full_cohort_finetuned_medium bash run_inference.sbatch --submit bmi indy
 #   FIGURES=1 bash run_inference.sbatch --submit bmi indy     # also per-session diagnostic figures
 #   DATA_ROOT=~/data VENV=~/speck-env bash run_inference.sbatch --local bmi indy
+#   (--local without DATA_ROOT uses the data/ folder next to main/, if there is one)
 #   Only rebuild the report:  MODE=report EXPERIMENT=bmi SUBJECT=indy bash run_inference.sbatch
 
 set -eo pipefail
@@ -50,6 +51,12 @@ esac
 if [ -z "${EXPERIMENT:-}" ] || { [ -z "${SUBJECT:-}" ] && [ -z "${RUN:-}" ]; }; then
     echo "Usage: bash $0 --submit|--local <experiment> [<subject>]" >&2
     exit 1
+fi
+# Data root: $DATA_ROOT if exported; for --local, else the data/ folder next to
+# main/ (repo/main/../data) when it exists; else the cluster scratch directory.
+LOCAL_DATA_ROOT="$(cd "$(dirname "$0")/../.." && pwd)/data"
+if [ -z "${DATA_ROOT:-}" ] && [ "${RUN:-}" = "--local" ] && [ -d "$LOCAL_DATA_ROOT" ]; then
+    DATA_ROOT="$LOCAL_DATA_ROOT"
 fi
 DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
 
@@ -179,6 +186,9 @@ run_session() {  # run_session SESSION_ID
 # LOCAL: every session in series, then the report
 # --------------------------------------------------------------------------
 if [ "${RUN:-}" = "--local" ]; then
+    echo "DATA_ROOT=${DATA_ROOT}"
+    echo "SNN checkpoints: ${SNN_CHECKPOINT_ROOT}${SNN_CHECKPOINT_SUBDIR:+ (/<session>/${SNN_CHECKPOINT_SUBDIR})}"
+    echo "Results: ${RESULTS_DIR}"
     FAILED=()
     for i in "${!SESSION_IDS[@]}"; do
         echo "=== Session ${SESSION_IDS[$i]} ($(( i + 1 ))/${#SESSION_IDS[@]}), host $(hostname) ==="
