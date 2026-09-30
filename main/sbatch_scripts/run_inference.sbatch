@@ -10,6 +10,10 @@
 #
 #   bash run_inference.sbatch --submit bmi indy     # on the cluster
 #   bash run_inference.sbatch --local bmi indy      # on one machine, e.g. the Speck laptop
+#   bash run_inference.sbatch --local bmi           # every subject of the experiment in turn
+#
+# Without a subject, every subject with a ${DATA_ROOT}/snn_checkpoints/<experiment>/
+# <subject>/per_session/ directory is run as if named (one report per subject).
 #
 # --submit submits (from this directory):
 #   1. an array job, one task per session with an SNN checkpoint, running
@@ -41,11 +45,39 @@
 set -eo pipefail
 
 case "${1:-}" in
-    --submit|--local) RUN="$1"; EXPERIMENT="$2"; SUBJECT="$3" ;;
+    --submit|--local) RUN="$1"; EXPERIMENT="${2:-}"; SUBJECT="${3:-}" ;;
 esac
-if [ -z "${EXPERIMENT:-}" ] || [ -z "${SUBJECT:-}" ]; then
-    echo "Usage: bash $0 --submit|--local <experiment> <subject>" >&2
+if [ -z "${EXPERIMENT:-}" ] || { [ -z "${SUBJECT:-}" ] && [ -z "${RUN:-}" ]; }; then
+    echo "Usage: bash $0 --submit|--local <experiment> [<subject>]" >&2
     exit 1
+fi
+DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
+
+# --------------------------------------------------------------------------
+# No subject: run this script once per subject of the experiment
+# --------------------------------------------------------------------------
+if [ -z "${SUBJECT:-}" ]; then
+    if [ -n "${SNN_CHECKPOINT_ROOT:-}" ] || [ -n "${RESULTS_DIR:-}" ]; then
+        echo "ERROR: SNN_CHECKPOINT_ROOT and RESULTS_DIR are per subject; name a subject to set them" >&2
+        exit 1
+    fi
+    SUBJECTS=()
+    for d in $(find "${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}" -mindepth 2 -maxdepth 2 -type d \
+                    -name per_session 2>/dev/null | sort); do
+        SUBJECTS+=("$(basename "$(dirname "$d")")")
+    done
+    if [ "${#SUBJECTS[@]}" -eq 0 ]; then
+        echo "ERROR: no ${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/<subject>/per_session/" >&2
+        exit 1
+    fi
+    echo "Subjects of ${EXPERIMENT}: ${SUBJECTS[*]}"
+    FAILED=()
+    for subject in "${SUBJECTS[@]}"; do
+        echo "##### ${EXPERIMENT}/${subject} #####"
+        DATA_ROOT="$DATA_ROOT" bash "$0" "$RUN" "$EXPERIMENT" "$subject" || FAILED+=("$subject")
+    done
+    [ "${#FAILED[@]}" -gt 0 ] && { echo "Failed subjects (see above): ${FAILED[*]}"; exit 1; }
+    exit 0
 fi
 if [ "${RUN:-}" = "--local" ]; then
     DECODERS="${DECODERS:-kf,wf,lstm,qrnn,snn,speck}"
@@ -54,7 +86,6 @@ if [ "${RUN:-}" = "--local" ]; then
     export ENERGY_METER_NUM_THREADS="${ENERGY_METER_NUM_THREADS:-1}"
 fi
 
-DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
 FEATURE="mua"
 DECODERS="${DECODERS:-kf,wf,lstm,qrnn,snn}"
 TEST_FRAC=0.1
