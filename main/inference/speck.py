@@ -176,7 +176,11 @@ def measure_chip_power(power_events, loop_s, sample_rate_hz=POWER_SAMPLE_RATE_HZ
 class SpeckDevkit:
     """A converted network deployed on a Speck2f devkit."""
 
-    def __init__(self, snn_seq, n_inputs, devkit='speck2fdevkit:0', wait_time=0.001, raster_dt=0.1):
+    def __init__(self, snn_seq, n_inputs, devkit='speck2fdevkit:0', wait_time=0.001, raster_dt=0.1,
+                 hard_reset=None):
+        """hard_reset: per spiking layer, whether it was trained with a hard
+        reset (return to zero) rather than subtracting the threshold;
+        default all hard."""
         import samna
         import sinabs.backend.dynapcnn.io as sio
         from sinabs.backend.dynapcnn.chip_factory import ChipFactory
@@ -204,8 +208,9 @@ class SpeckDevkit:
         ordering = self.network.chip_layers_ordering   # list, or {layer: core} in sinabs >= 3
         self.cores = [ordering[k] for k in sorted(ordering)] if isinstance(ordering, dict) else list(ordering)
         config.dvs_layer.pass_sensor_events = False
-        for core in self.cores:
-            config.cnn_layers[core].return_to_zero = True
+        hard_reset = hard_reset or [True] * len(self.cores)
+        for core, hard in zip(self.cores, hard_reset):
+            config.cnn_layers[core].return_to_zero = bool(hard)
             # Only the output layer is read; monitoring the hidden layers would
             # stream all of their spikes to the host as well.
             config.cnn_layers[core].monitor_enable = core == self.cores[-1]
@@ -277,7 +282,18 @@ def open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt
     snn_seq = flatten_snn(model)
     snn_seq.eval()
     cross_check_flattened(model, snn_seq, _load_pickle(snn_test_files(snn_dataset_path)[0])['input_spikes'])
-    return SpeckDevkit(snn_seq, model.layers[0].in_features, devkit, wait_time, raster_dt)
+    hard_reset = layer_hard_reset(checkpoint['args'], sum(1 for m in snn_seq if hasattr(m, 'spike_threshold')))
+    if any(hard_reset):
+        print("  [speck] note: hard-reset layers reset after each input event on the chip, not once per "
+              "timestep as in training; subtract (soft) reset behaves the same on both")
+    return SpeckDevkit(snn_seq, model.layers[0].in_features, devkit, wait_time, raster_dt, hard_reset)
+
+
+def layer_hard_reset(args, n_layers):
+    """Per spiking layer, whether training used a hard reset."""
+    reset = args.get('reset_type', 'hard')
+    final = args.get('final_layer_reset_type') or reset
+    return [r == 'hard' for r in [reset] * (n_layers - 1) + [final]]
 
 
 def predict_speck_test_set(model, velocity_scale, snn_dataset_path, device, experiment,

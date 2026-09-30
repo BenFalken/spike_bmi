@@ -9,7 +9,8 @@ test_all_decoders.py) are decoded by the same checkpoint in software:
     quantized   the network as deployed to the chip (8-bit weights, integer
                 thresholds), still one timestep per call
     specksim    the quantized network in samna's event-driven Speck simulator,
-                where each input event updates the membranes on its own
+                where each input event updates the membranes on its own (it
+                subtracts the threshold on a spike whatever the trained reset)
 
 and compared with the chip's own predictions ('speck') from that session's
 test_all_decoders.py results. pytorch -> quantized is the cost of
@@ -17,7 +18,8 @@ quantization; quantized -> speck is what the chip itself adds.
 
 When the results also hold the chip's output spike counts, a second table
 compares them with the quantized network's on the same steps: total spikes,
-exactly matching steps, per-feature rates, the delay at which the two agree
+exactly matching steps, per-feature rates, the agreement of the EMA-smoothed
+spike trains the decoder reads, the delay at which the two agree
 best (spikes read after --speck_wait_time land in later steps), and the RMSE
 once that delay is removed. The chip's counts are also re-decoded on the
 host, which must reproduce the 'speck' RMSE.
@@ -81,6 +83,7 @@ def decode_versions(checkpoint_path, snn_dataset_path, experiment, use_specksim=
             counts_kept[version].append(counts[keep])
             preds[version].append(unscale_velocity(speck.decode_spike_counts(model, counts), scale)[keep])
     decode = lambda counts: unscale_velocity(speck.decode_spike_counts(model, counts), scale)
+    decode.smooth = lambda counts: smooth(counts, model.temporal_decay, model.temporal_decay_stages)
     return ({v: np.concatenate(p) for v, p in preds.items()}, np.concatenate(targets),
             {v: np.concatenate(c) for v, c in counts_kept.items()}, decode)
 
@@ -97,6 +100,17 @@ def find_offset(pred, reference, tol=MATCH_TOL):
 
 def rmse(pred, target):
     return float(np.sqrt(((pred - target) ** 2).mean()))
+
+
+def smooth(counts, decay, stages):
+    """The model's EMA cascade applied to spike counts (what decode_output reads)."""
+    out, state = np.zeros_like(counts, dtype=float), [np.zeros(counts.shape[1]) for _ in range(stages)]
+    for t, x in enumerate(counts):
+        for i in range(stages):
+            state[i] = decay * state[i] + x
+            x = state[i]
+        out[t] = x
+    return out
 
 
 def _corr(a, b):
@@ -122,6 +136,7 @@ def compare_chip_output(chip, reference, decode, target, chip_pred, max_lag=5, w
         'spike_ratio': float(chip.sum() / max(reference.sum(), 1)),
         'steps_identical': float((chip == reference).all(axis=1).mean()),
         'feature_rate_corr': _corr(chip.mean(axis=0), reference.mean(axis=0)),
+        'smoothed_corr': _corr(decode.smooth(chip).ravel(), decode.smooth(reference).ravel()),
         'step_corr_lag0': lag_corr[0],
         'best_lag': int(best), 'step_corr_best_lag': lag_corr[best],
         'rmse_speck_same_rows': rmse(chip_pred[warmup:], target[warmup:]),
@@ -204,7 +219,8 @@ def main(args):
     chip_rows = {s: r['chip_vs_quantized'] for s, r in report['sessions'].items() if 'chip_vs_quantized' in r}
     if chip_rows:
         cols = [('spike_ratio', 'spk ratio'), ('steps_identical', 'same steps'),
-                ('feature_rate_corr', 'feat corr'), ('step_corr_lag0', 'corr lag0'),
+                ('feature_rate_corr', 'feat corr'), ('smoothed_corr', 'EMA corr'),
+                ('step_corr_lag0', 'corr lag0'),
                 ('best_lag', 'best lag'), ('step_corr_best_lag', 'corr best'),
                 ('rmse_speck_same_rows', 'speck'), ('rmse_redecoded', 'redecoded'),
                 ('rmse_lag_corrected', 'lag-fixed')]
