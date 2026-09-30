@@ -9,6 +9,14 @@ Saved as {figures_dir}/{session}_{name}.png:
                       so small errors are not smoothed away)
     rolling_rmse, cumulative_loss, rmse_bar, error_boxplot, scatter_r2,
     error_vs_speed
+
+and as {figures_dir}/{session}_{velocity,position}_crosshairs.gif: real-time
+decoding as a moving crosshair per decoder, one panel each beside the ground
+truth, plus an overlay of all of them drawn semi-transparent so agreement
+shows as overlap. Every GIF_STRIDE-th sample is shown, for at most
+GIF_MAX_FRAMES frames (GIF_STRIDE x more of the session than consecutive
+frames would cover; the writer holds every frame in memory). Position is
+integrated from the full-resolution velocity before subsampling.
 """
 
 import os
@@ -17,11 +25,20 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import to_rgb
+from PIL import Image, ImageDraw, ImageFont
 
 COLORS = {'lstm': 'darkorange', 'qrnn': 'seagreen', 'kf': 'purple', 'wf': 'goldenrod',
-          'snn': 'royalblue'}
-STYLES = {'lstm': '--', 'qrnn': '--', 'kf': '-.', 'wf': '-.', 'snn': ':'}
+          'snn': 'royalblue', 'speck': 'crimson'}
+STYLES = {'lstm': '--', 'qrnn': '--', 'kf': '-.', 'wf': '-.', 'snn': ':', 'speck': ':'}
 STEP_S = 0.004
+
+GIF_IMG_SIZE = 32        # square canvas, in pixels
+GIF_STRIDE = 16          # show every 16th sample (64 ms)
+GIF_MAX_FRAMES = 1000
+GIF_FPS = 10
+GIF_PADDING = 0.25       # canvas = ground-truth range +/- 25%; decoders outside it sit on the edge
+OVERLAY_ALPHA = 0.6
 
 
 def reconstruct_path(anchor, velocities, step_time=STEP_S):
@@ -67,6 +84,84 @@ def segment_grid_figure(y_common, pred_common, session, segment_samples=260, n_s
     return fig
 
 
+def _label(name):
+    return 'SNN (Speck)' if name == 'speck' else name.upper()
+
+
+def _cross_mask(xy, size):
+    """(size, size) mask of a 5-pixel plus centred on integer pixel xy."""
+    mask = np.zeros((size, size))
+    for dx, dy in ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)):
+        x, y = xy[0] + dx, xy[1] + dy
+        if 0 <= x < size and 0 <= y < size:
+            mask[y, x] = 1.0
+    return mask
+
+
+def _font(size):
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:                      # Pillow < 10.1
+        return ImageFont.load_default()
+
+
+def save_crosshair_gif(y_true, pred, title, path, size=GIF_IMG_SIZE, stride=GIF_STRIDE,
+                       max_frames=GIF_MAX_FRAMES, alpha=OVERLAY_ALPHA, scale=4, n_cols=4):
+    """Animated grid: ground truth, one panel per decoder, and an overlay.
+
+    y_true (n, 2) and pred {name: (n, 2)} share one space (velocity or
+    position). Each trace is a crosshair in its decoder's colour (ground
+    truth white) on a size x size canvas spanning the ground truth's range,
+    drawn scale x larger; the overlay composites every crosshair at opacity
+    alpha, ground truth first."""
+    idx = np.arange(0, len(y_true), stride)[:max_frames]
+    lo, hi = y_true.min(axis=0), y_true.max(axis=0)
+    pad = GIF_PADDING * np.maximum(hi - lo, 1e-9)
+    lo, hi = lo - pad, hi + pad
+
+    def to_pixels(series):
+        return np.round(np.clip((series[idx] - lo) / (hi - lo), 0, 1) * (size - 1)).astype(int)
+
+    traces = [('Ground truth', to_pixels(y_true), np.ones(3))] + [
+        (_label(n), to_pixels(y), np.array(to_rgb(COLORS.get(n, 'gray')))) for n, y in pred.items()]
+    labels = [t[0] for t in traces] + ['Overlay']
+    title_colors = [t[2] for t in traces] + [np.ones(3)]
+    n_rows = int(np.ceil(len(labels) / n_cols))
+    side, gap, label_h, header_h = size * scale, 10, 18, 26
+    width = n_cols * side + (n_cols + 1) * gap
+    height = header_h + n_rows * (label_h + side + gap)
+    origins = [(gap + (k % n_cols) * (side + gap), header_h + (k // n_cols) * (label_h + side + gap) + label_h)
+               for k in range(len(labels))]
+
+    background = Image.new('RGB', (width, height))
+    draw = ImageDraw.Draw(background)
+    font = _font(12)
+    for (x, y), label, rgb in zip(origins, labels, title_colors):
+        draw.text((x, y - label_h + 2), label, fill=tuple(int(255 * c) for c in rgb), font=font)
+        draw.rectangle([x - 1, y - 1, x + side, y + side], outline=(90, 90, 90))
+    background = np.asarray(background)
+
+    clock_font, frames = _font(14), []
+    for frame in range(len(idx)):
+        canvas = background.copy()
+        overlay = np.zeros((size, size, 3))
+        panels = []
+        for _, pixels, rgb in traces:
+            mask = _cross_mask(pixels[frame], size)[..., None]
+            panels.append(mask * rgb)
+            overlay = overlay * (1 - alpha * mask) + rgb * alpha * mask
+        for (x, y), panel in zip(origins, panels + [overlay]):
+            big = np.repeat(np.repeat(panel[::-1], scale, axis=0), scale, axis=1)   # y up
+            canvas[y:y + side, x:x + side] = (255 * big).astype(np.uint8)
+        image = Image.fromarray(canvas)
+        ImageDraw.Draw(image).text((gap, 5), f"{title}    t = {idx[frame] * STEP_S:6.1f} s",
+                                   fill=(255, 255, 255), font=clock_font)
+        frames.append(image.convert('P', palette=Image.ADAPTIVE, colors=64))
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=int(1000 / GIF_FPS), loop=0)
+    print(f"  Saved {path} ({len(frames)} frames, every {stride}th sample, "
+          f"{idx[-1] * STEP_S:.0f} s of {len(y_true) * STEP_S:.0f} s)")
+
+
 def _save(fig, figures_dir, session, name):
     if fig is None:
         return
@@ -86,6 +181,11 @@ def save_session_figures(result, session, figures_dir, roll_window=20, speed_bin
     per_sample_rmse = {name: np.sqrt(e.mean(axis=1)) for name, e in sq_err.items()}
     xlabel = f"Test sample (from test row {result['start_raw']})"
     style = lambda name: dict(color=COLORS.get(name, 'gray'), linestyle=STYLES.get(name, '-'))
+
+    gif = os.path.join(figures_dir, f"{session}_{{}}_crosshairs.gif")
+    save_crosshair_gif(y_true, pred, f'{session}: decoded velocity', gif.format('velocity'))
+    positions = {name: reconstruct_path(y_pos[0], y)[:n] for name, y in pred.items()}
+    save_crosshair_gif(y_pos, positions, f'{session}: integrated position', gif.format('position'))
 
     _save(segment_grid_figure(y_pos, pred, session, segment_samples, n_segments), figures_dir,
           session, 'trajectory_grid')

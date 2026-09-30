@@ -19,6 +19,10 @@ The file has three sections, each computed only where missing (or with
                and its method, and parameter count per decoder (profiling.py;
                'speck' copied from its chip measurement)
 
+The full-data predictions are also saved next to --output as
+<session>_arrays.npz, so --figures_dir can redraw the per-session figures
+(session_figures.py) without evaluating again, e.g. without the chip.
+
 A session file made on the cluster can therefore be copied to the
 Speck-connected machine and completed there with --decoders ...,speck: its
 durations and cluster profile are kept, and the laptop adds its own profile.
@@ -78,6 +82,17 @@ def _json_ready(result):
     return {k: v for k, v in result.items() if k != 'arrays'}
 
 
+def save_arrays(arrays, path):
+    np.savez_compressed(path, y_true=arrays['y_true'], y_pos=arrays['y_pos'],
+                        **{f"pred_{name}": y for name, y in arrays['pred'].items()})
+
+
+def load_arrays(path):
+    with np.load(path) as f:
+        return {'y_true': f['y_true'], 'y_pos': f['y_pos'],
+                'pred': {k[len('pred_'):]: f[k] for k in f.files if k.startswith('pred_')}}
+
+
 def _load_results(path):
     with open(path, 'r') as f:
         results = json.load(f)
@@ -87,6 +102,12 @@ def _load_results(path):
             p.setdefault('energy_method', old.get('energy_method'))
         results.setdefault('profiles', {})['cluster'] = {'decoders': old.get('decoders', {})}
     return results
+
+
+def draw_figures(full, session, figures_dir):
+    from session_figures import save_session_figures
+    print(f"\n--- Figures -> {figures_dir} ---")
+    save_session_figures(full, session, figures_dir)
 
 
 def main(args):
@@ -118,7 +139,10 @@ def main(args):
     evaluated = results['full']['decoders'] if 'full' in results else []
     new_decoders = [d for d in available_decoders(args, decoders, None, args.snn_checkpoint_path)
                     if d not in evaluated]
-    todo_full = 'full' not in results or new_decoders or args.figures_dir
+    # The full-data predictions, kept so figures can be redrawn without re-evaluating.
+    arrays_path = os.path.splitext(args.output)[0] + '_arrays.npz'
+    todo_full = ('full' not in results or new_decoders
+                 or (args.figures_dir and not os.path.exists(arrays_path)))
     # A duration recorded as None had no trained models; retry it only if some have appeared.
     durations = [float(d) for d in args.train_durations.split(',') if d.strip()]
     todo_durations = [d for d in durations if f"{d:g}min" not in results['durations']
@@ -127,6 +151,8 @@ def main(args):
     todo_profile = not args.skip_profile and (todo_full or any(
         d not in profiled() for d in evaluated if d in decoders))
     if not (todo_full or todo_durations or todo_profile):
+        if args.figures_dir:
+            draw_figures(dict(results['full'], arrays=load_arrays(arrays_path)), session, args.figures_dir)
         print(f"[skip] {session}: {args.output} is complete")
         return
 
@@ -140,9 +166,10 @@ def main(args):
             raise FileNotFoundError(f"No trained decoders found for {session}")
         results['full'] = _json_ready(full)
         save()
-        if args.figures_dir:
-            from session_figures import save_session_figures
-            save_session_figures(full, session, args.figures_dir)
+        save_arrays(full['arrays'], arrays_path)
+    if args.figures_dir:
+        draw_figures(full if todo_full else dict(results['full'], arrays=load_arrays(arrays_path)),
+                     session, args.figures_dir)
 
     for minutes in todo_durations:
         tag = f"{minutes:g}min"
@@ -185,7 +212,7 @@ def build_parser():
                     help="Session's SNN dataset directory (with test/*.pkl)")
     io.add_argument('--output', required=True, help='Session results JSON')
     io.add_argument('--figures_dir', default=None,
-                    help='Also save per-session diagnostic figures here (session_figures.py)')
+                    help='Also save per-session figures and crosshair GIFs here (session_figures.py)')
     io.add_argument('--overwrite', action='store_true', help='Recompute every section')
 
     ev = parser.add_argument_group('evaluation')
