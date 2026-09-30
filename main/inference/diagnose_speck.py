@@ -2,28 +2,31 @@
 Where does the Speck decoder lose accuracy relative to the PyTorch SNN?
 
 For every session, the SNN test trials (same dropped first window as
-test_all_decoders.py) are decoded by four versions of the same network:
+test_all_decoders.py) are decoded by the same checkpoint in software:
 
-    float       the flattened PyTorch network, one timestep per call (= 'snn')
-    discretized the network as quantized for the chip (8-bit weights,
-                integer thresholds), still one timestep per call
-    specksim    the quantized network in samna's event-driven Speck simulator:
-                each input event updates the membranes on its own, as on chip
-    speck       the chip itself, from the session's test_all_decoders.py results
+    pytorch     the network as trained, one timestep per call; this is the
+                'snn' decoder of test_all_decoders.py
+    quantized   the network as deployed to the chip (8-bit weights, integer
+                thresholds), still one timestep per call
+    specksim    the quantized network in samna's event-driven Speck simulator,
+                where each input event updates the membranes on its own
 
-float -> discretized is the cost of quantization; discretized -> specksim
-is the cost of event-driven processing (within a timestep, a neuron can
-spike and reset before later, possibly inhibitory, events arrive);
-specksim -> speck is what the physical chip adds (timing, wait time,
-power-on state). RMSE here is against the SNN dataset's own velocity,
-so float/discretized/specksim differ slightly from the aligned values in
-the session files; the 'speck' and 'snn' columns are copied from those.
+and compared with the chip's own predictions ('speck') from that session's
+test_all_decoders.py results. pytorch -> quantized is the cost of
+quantization; quantized -> speck is what the chip itself adds.
+
+Every column is scored on the rows and targets of the session results
+(<session>_arrays.npz), after checking that the 'snn' predictions stored
+there are the ones this checkpoint produces; results made with a different
+checkpoint are reported and left out of the snn/speck columns. Without the
+.npz, versions are scored against the SNN dataset's velocity instead.
 
 Writes {results_dir}/speck_diagnosis.json.
 
 Usage (no devkit needed; specksim needs samna):
     python diagnose_speck.py --experiment bmi --subject indy --data_root ../../data \
-        [--snn_checkpoint_root .../snn_checkpoints/bmi/indy/full_cohort_finetuned_medium]
+        --snn_checkpoint_root ../../data/snn_checkpoints/bmi/indy/full_cohort_finetuned_medium \
+        --results_dir ../../data/results/test_all_decoders_finetuned/bmi/indy
 """
 
 import argparse
@@ -39,20 +42,23 @@ from decoder_eval import (BASE_NPERSEG, _load_pickle, load_snn_model, snn_test_f
                           unscale_velocity)
 import speck  # noqa: E402
 
-VERSIONS = ('float', 'discretized', 'specksim')
+VERSIONS = ('pytorch', 'quantized', 'specksim')
+COLUMNS = VERSIONS + ('snn', 'speck')
+MATCH_TOL = 1e-3
 
 
-def diagnose_session(checkpoint_path, snn_dataset_path, experiment, use_specksim=True):
+def decode_versions(checkpoint_path, snn_dataset_path, experiment, use_specksim=True):
+    """({version: (n, 2) velocity}, (n, 2) SNN dataset velocity, {version:
+    output spikes}) over the test trials, first window dropped."""
     model, checkpoint, scale = load_snn_model(checkpoint_path, experiment)
     speck.check_deployable(model, checkpoint)
     snn_seq = speck.flatten_snn(model)
     snn_seq.eval()
-    disc_seq = speck.discretized_sequential(speck.discretize(snn_seq, model.layers[0].in_features))
-    n_outputs = 2 * model.n_bins
-    runners = {'float': lambda x: speck.run_float(snn_seq, x),
-               'discretized': lambda x: speck.run_discretized(disc_seq, x)}
+    quant_seq = speck.discretized_sequential(speck.discretize(snn_seq, model.layers[0].in_features))
+    runners = {'pytorch': lambda x: speck.run_float(snn_seq, x),
+               'quantized': lambda x: speck.run_discretized(quant_seq, x)}
     if use_specksim:
-        runners['specksim'] = lambda x: speck.run_specksim(disc_seq, x, n_outputs)
+        runners['specksim'] = lambda x: speck.run_specksim(quant_seq, x, 2 * model.n_bins)
 
     files = snn_test_files(snn_dataset_path)
     preds, spikes, targets = {v: [] for v in runners}, {v: 0.0 for v in runners}, []
@@ -66,13 +72,51 @@ def diagnose_session(checkpoint_path, snn_dataset_path, experiment, use_specksim
             counts = run(trial['input_spikes'])
             spikes[version] += counts[keep].sum()
             preds[version].append(unscale_velocity(speck.decode_spike_counts(model, counts), scale)[keep])
-    y = np.concatenate(targets)
-    out = {}
-    for version in runners:
-        p = np.concatenate(preds[version])
-        out[version] = {'rmse': float(np.sqrt(((p - y) ** 2).mean())),
-                        'output_spikes_per_step': float(spikes[version] / len(y))}
-    return out
+    return {v: np.concatenate(p) for v, p in preds.items()}, np.concatenate(targets), spikes
+
+
+def find_offset(pred, reference, tol=MATCH_TOL):
+    """Offset k with pred[k:k + len(reference)] == reference (within tol), or None."""
+    n, probe = len(reference), min(20, len(reference))
+    for k in range(len(pred) - n + 1):
+        if np.abs(pred[k:k + probe] - reference[:probe]).max() < tol and \
+                np.abs(pred[k:k + n] - reference).max() < tol:
+            return k
+    return None
+
+
+def rmse(pred, target):
+    return float(np.sqrt(((pred - target) ** 2).mean()))
+
+
+def diagnose_session(session, checkpoint, snn_dataset_path, results_dir, experiment, use_specksim):
+    preds, target, spikes = decode_versions(checkpoint, snn_dataset_path, experiment, use_specksim)
+    arrays_path = os.path.join(results_dir, 'sessions', f'{session}_arrays.npz')
+    row, note = {}, None
+    if os.path.isfile(arrays_path):
+        with np.load(arrays_path) as f:
+            saved = {k: f[k] for k in f.files}
+        offset = find_offset(preds['pytorch'], saved['pred_snn']) if 'pred_snn' in saved else None
+        if offset is None:
+            note = 'results made with a different checkpoint; snn/speck left out, scored on the SNN dataset'
+        else:
+            n = len(saved['y_true'])
+            target = saved['y_true']
+            preds = {v: p[offset:offset + n] for v, p in preds.items()}
+            for name in ('snn', 'speck'):
+                if f'pred_{name}' in saved:
+                    row[name] = {'rmse': rmse(saved[f'pred_{name}'], target)}
+    else:
+        note = f'no {os.path.basename(arrays_path)}; scored on the SNN dataset, snn/speck left out'
+    for version, p in preds.items():
+        row[version] = {'rmse': rmse(p, target), 'output_spikes_per_step': float(spikes[version] / len(p))}
+    if 'speck' in row:
+        results_path = os.path.join(results_dir, 'sessions', f'{session}.json')
+        with open(results_path, 'r') as f:
+            chip = json.load(f)['full']['metrics'].get('speck', {}).get('chip') or {}
+        if 'output_spikes_per_step' in chip:
+            row['speck']['output_spikes_per_step'] = chip['output_spikes_per_step']
+    return row, note
 
 
 def main(args):
@@ -90,36 +134,26 @@ def main(args):
         use_specksim = False
 
     sessions = args.sessions or sorted(os.listdir(root))
-    report = {'snn_checkpoint_root': root, 'sessions': {}}
-    header = f"{'session':<20s}" + ''.join(f"{v:>13s}" for v in VERSIONS + ('snn*', 'speck*'))
-    print(f"RMSE per version (* = from the session results)\n{header}")
+    report = {'snn_checkpoint_root': root, 'results_dir': results_dir, 'sessions': {}}
+    print(f"Checkpoints: {root}\nResults:     {results_dir}\n")
+    print(f"RMSE\n{'session':<20s}" + ''.join(f"{c:>11s}" for c in COLUMNS))
     for session in sessions:
         checkpoint = os.path.join(root, session, args.snn_checkpoint_subdir, 'best_model_weights.pth')
         if not os.path.isfile(checkpoint):
             continue
-        row = diagnose_session(checkpoint, os.path.join(dataset_root, session), args.experiment, use_specksim)
-        results_path = os.path.join(results_dir, 'sessions', f'{session}.json')
-        if os.path.isfile(results_path):
-            with open(results_path, 'r') as f:
-                metrics = json.load(f).get('full', {}).get('metrics', {})
-            for name in ('snn', 'speck'):
-                if name in metrics:
-                    row[name + '_results'] = {'rmse': metrics[name]['rmse']}
-            chip = metrics.get('speck', {}).get('chip') or {}
-            if 'output_spikes_per_step' in chip:
-                row['speck_results']['output_spikes_per_step'] = chip['output_spikes_per_step']
-        report['sessions'][session] = row
-        cells = [row.get(k, {}).get('rmse') for k in VERSIONS + ('snn_results', 'speck_results')]
-        print(f"{session:<20s}" + ''.join(f"{c:13.2f}" if c is not None else f"{'-':>13s}" for c in cells))
+        row, note = diagnose_session(session, checkpoint, os.path.join(dataset_root, session),
+                                     results_dir, args.experiment, use_specksim)
+        report['sessions'][session] = dict(row, note=note) if note else row
+        print(f"{session:<20s}" + ''.join(f"{row[c]['rmse']:11.2f}" if c in row else f"{'-':>11s}"
+                                          for c in COLUMNS) + (f"   ({note})" if note else ''))
 
-    keys = VERSIONS + ('snn_results', 'speck_results')
-    rows = report['sessions'].values()
-    report['mean'] = {k: {m: float(np.mean([r[k][m] for r in rows if m in r.get(k, {})]))
-                          for m in ('rmse', 'output_spikes_per_step')
-                          if any(m in r.get(k, {}) for r in rows)} for k in keys}
-    print(f"{'mean':<20s}" + ''.join(f"{report['mean'][k].get('rmse', np.nan):13.2f}" for k in keys))
-    print(f"{'out spikes/step':<20s}" + ''.join(
-        f"{report['mean'][k].get('output_spikes_per_step', np.nan):13.2f}" for k in keys))
+    rows = list(report['sessions'].values())
+    report['mean'] = {c: {m: float(np.mean([r[c][m] for r in rows if m in r.get(c, {})]))
+                          for m in ('rmse', 'output_spikes_per_step') if any(m in r.get(c, {}) for r in rows)}
+                      for c in COLUMNS}
+    fmt = lambda c, m: f"{report['mean'][c][m]:11.2f}" if m in report['mean'][c] else f"{'-':>11s}"
+    print(f"{'mean':<20s}" + ''.join(fmt(c, 'rmse') for c in COLUMNS))
+    print(f"{'out spikes/step':<20s}" + ''.join(fmt(c, 'output_spikes_per_step') for c in COLUMNS))
     path = args.output or os.path.join(results_dir, 'speck_diagnosis.json')
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w') as f:
@@ -137,7 +171,7 @@ if __name__ == '__main__':
                         help='Default: {data_root}/snn_checkpoints/{experiment}/{subject}/per_session')
     parser.add_argument('--snn_checkpoint_subdir', default='')
     parser.add_argument('--results_dir', default=None,
-                        help='Where the session results are (default: results/test_all_decoders/...)')
+                        help='Session results made with these checkpoints (default: results/test_all_decoders/...)')
     parser.add_argument('--sessions', nargs='*', default=None)
     parser.add_argument('--skip_specksim', action='store_true')
     parser.add_argument('--output', default=None)
