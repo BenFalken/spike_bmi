@@ -27,6 +27,9 @@
 # DATA_ROOT is the same as on the cluster; to extend the cluster results, copy
 # the cluster's sessions/*.json into the laptop's results directory first: their
 # durations and cluster profile are kept, and full-data results gain 'speck'.
+# The laptop needs only the test split of each dataset/.../<session>_binning.h5
+# (inference/export_test_split.py writes those), the full-data model bundles,
+# the SNN checkpoints and snn_datasets/.../<session>/test/.
 #
 # Re-running is safe: finished session sections are skipped, and the report is
 # always rebuilt. Settings below can be overridden from the environment, e.g.
