@@ -22,7 +22,8 @@ The file has three sections, each computed only where missing (or with
 
 The full-data predictions are also saved next to --output as
 <session>_arrays.npz, so --figures_dir can redraw the per-session figures
-(session_figures.py) without evaluating again, e.g. without the chip.
+(session_figures.py) without evaluating again, e.g. without the chip;
+--figure_decoders limits them to some of the decoders.
 
 A session file made on the cluster can therefore be copied to the
 Speck-connected machine and completed there with --decoders ...,speck: its
@@ -122,10 +123,11 @@ def _load_results(path):
     return results
 
 
-def draw_figures(full, session, figures_dir):
+def draw_figures(full, session, args):
     from session_figures import save_session_figures
-    print(f"\n--- Figures -> {figures_dir} ---")
-    save_session_figures(full, session, figures_dir)
+    print(f"\n--- Figures -> {args.figures_dir} ---")
+    decoders = [d.strip() for d in args.figure_decoders.split(',') if d.strip()] or None
+    save_session_figures(full, session, args.figures_dir, decoders=decoders)
 
 
 def main(args):
@@ -176,7 +178,7 @@ def main(args):
         d not in profiled() for d in evaluated if d in decoders))
     if not (todo_full or todo_durations or todo_profile):
         if args.figures_dir:
-            draw_figures(dict(results['full'], arrays=load_arrays(arrays_path)), session, args.figures_dir)
+            draw_figures(dict(results['full'], arrays=load_arrays(arrays_path)), session, args)
         print(f"[skip] {session}: {args.output} is complete")
         return
 
@@ -194,7 +196,7 @@ def main(args):
         save_arrays(full['arrays'], arrays_path)
     if args.figures_dir:
         draw_figures(full if todo_full else dict(results['full'], arrays=load_arrays(arrays_path)),
-                     session, args.figures_dir)
+                     session, args)
 
     for minutes in todo_durations:
         tag = f"{minutes:g}min"
@@ -240,6 +242,9 @@ def build_parser():
     io.add_argument('--output', required=True, help='Session results JSON')
     io.add_argument('--figures_dir', default=None,
                     help='Also save per-session figures and crosshair GIFs here (session_figures.py)')
+    io.add_argument('--figure_decoders', default='',
+                    help='Comma-separated decoders to draw in those figures, in panel order, '
+                         'e.g. snn,speck (default: every evaluated decoder)')
     io.add_argument('--overwrite', action='store_true', help='Recompute every section')
 
     ev = parser.add_argument_group('evaluation')

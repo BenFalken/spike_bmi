@@ -6,10 +6,14 @@ Report figures across the sessions of one subject (called by make_report.py).
                         and the Speck-connected laptop)
     energy figure       energy per sample, with proxy estimates and real
                         (RAPL / chip) measurements in separate panels
-    4x2 figure          a/b RMSE and CC boxplots with Wilcoxon significance
-                        against the best decoder, c/d pairwise p-value matrices,
+    4x2 figure          a/b RMSE and CC boxplots over sessions (box = quartiles,
+                        whiskers = 1.5 IQR, white dot = mean) with Wilcoxon
+                        significance against the best decoder, c/d pairwise
+                        matrices: % of sessions the row decoder wins, median
+                        paired difference and significance,
                         e/f accuracy vs. training duration, g/h accuracy vs.
-                        days since the first session
+                        days since the first session. Wilcoxon p-values are
+                        Holm-corrected within each panel.
 
 'speck' (the SNN run on the chip) shares the SNN's colour and is told apart
 by hatching (dashed in line plots).
@@ -190,16 +194,41 @@ def _boxplot(ax, values, decoders, sig, ylabel):
     ax.set_ylabel(ylabel)
 
 
-def _pvalue_matrix(ax, values, decoders):
+def _holm(pvalues):
+    """Holm-Bonferroni adjusted p-values, in the input order."""
+    p = np.asarray(pvalues, dtype=float)
+    order = np.argsort(p)
+    adjusted = np.minimum(1, np.maximum.accumulate(p[order] * (len(p) - np.arange(len(p)))))
+    out = np.empty_like(p)
+    out[order] = adjusted
+    return out
+
+
+def _pairwise_matrix(ax, values, decoders, higher_is_better):
+    """Cell (row, col): how often and by how much the row decoder beats the
+    column decoder over the paired sessions. Colour = percentage of sessions
+    in which the row is better (ties count half; 50% = no consistent winner);
+    text = median paired difference row - col in the metric's units, with
+    stars from the two-sided Wilcoxon signed-rank test, Holm-corrected over
+    all pairs. The two triangles mirror each other (100 - % and -diff)."""
     n = len(decoders)
+    sign = 1 if higher_is_better else -1
+    win = np.full((n, n), np.nan)
+    diff = np.full((n, n), np.nan)
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    p_adj = _holm([_wilcoxon_p(values[decoders[i]], values[decoders[j]]) for i, j in pairs])
     pmat = np.full((n, n), np.nan)
+    for (i, j), p in zip(pairs, p_adj):
+        pmat[i, j] = pmat[j, i] = p
     for i, a in enumerate(decoders):
         for j, b in enumerate(decoders):
             if i != j:
-                pmat[i, j] = _wilcoxon_p(values[a], values[b])
-    cmap = plt.cm.YlGn.copy()
+                d = np.asarray(values[a], dtype=float) - np.asarray(values[b], dtype=float)
+                diff[i, j] = np.median(d)
+                win[i, j] = 100 * (np.mean(sign * d > 0) + 0.5 * np.mean(d == 0))
+    cmap = plt.cm.RdBu.copy()
     cmap.set_bad(color='0.85')
-    im = ax.imshow(np.ma.masked_invalid(pmat), cmap=cmap, vmin=0, vmax=1, aspect='equal')
+    im = ax.imshow(np.ma.masked_invalid(win), cmap=cmap, vmin=0, vmax=100, aspect='equal')
     labels = [display_label(d) for d in decoders]
     ax.set_xticks(np.arange(n), labels, rotation=45, ha='left')
     ax.set_yticks(np.arange(n), labels)
@@ -210,10 +239,13 @@ def _pvalue_matrix(ax, values, decoders):
     ax.tick_params(which='both', length=0)
     for i in range(n):
         for j in range(n):
-            if i != j and _stars(pmat[i, j]):
-                ax.text(j, i, _stars(pmat[i, j]), ha='center', va='center', fontsize=9)
+            if i != j:
+                text = f"{diff[i, j]:+.2g}" + (f"\n{_stars(pmat[i, j])}" if _stars(pmat[i, j]) else '\nn.s.')
+                ax.text(j, i, text, ha='center', va='center', fontsize=7.5, linespacing=1.1,
+                        color='white' if abs(win[i, j] - 50) > 35 else 'black')
     cax = make_axes_locatable(ax).append_axes('bottom', size='6%', pad=0.55)
-    ax.figure.colorbar(im, cax=cax, orientation='horizontal').set_label('p value')
+    bar = ax.figure.colorbar(im, cax=cax, orientation='horizontal', ticks=[0, 25, 50, 75, 100])
+    bar.set_label('Sessions where the row decoder is better (%)')
 
 
 def _over_x(ax, x_values, series, decoders, ylabel, xlabel, fmt, clip_decoder=None, clip_margin=1.15):
@@ -271,10 +303,11 @@ def comparison_4x2_figure(combined, durations=None):
 
     fig, axes = plt.subplots(4, 2, figsize=(12, 20))
     for col, (values, ylabel) in enumerate([(rmse, 'Average RMSE'), (cc, 'Average CC')]):
-        sig = {d: '' if d == reference else _stars(_wilcoxon_p(values[d], values[reference]))
-               for d in decoders}
+        others = [d for d in decoders if d != reference]
+        p_adj = _holm([_wilcoxon_p(values[d], values[reference]) for d in others])
+        sig = {reference: '', **{d: _stars(p) for d, p in zip(others, p_adj)}}
         _boxplot(axes[0, col], values, decoders, sig, ylabel)
-        _pvalue_matrix(axes[1, col], values, decoders)
+        _pairwise_matrix(axes[1, col], values, decoders, higher_is_better=(col == 1))
 
     # e/f: accuracy vs. training duration, mean and 95% CI across sessions
     samples = {}   # (decoder, minutes) -> ([rmse], [cc])

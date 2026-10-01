@@ -40,6 +40,7 @@
 #   SNN_CHECKPOINT_ROOT=.../full_cohort_finetuned_medium bash run_inference.sbatch --submit bmi indy
 #   SPECK_CHECKPOINT_ROOT=.../per_session ...   run 'speck' with other checkpoints than 'snn'
 #   FIGURES=1 bash run_inference.sbatch --submit bmi indy     # also per-session diagnostic figures
+#   FIGURE_DECODERS=snn,speck FIGURES=1 ...   only these decoders in them (and the crosshair GIFs)
 #   DATA_ROOT=~/data VENV=~/speck-env bash run_inference.sbatch --local bmi indy
 #   (--local without DATA_ROOT uses the data/ folder next to main/, if there is one)
 #   SPECK_WAIT_TIME=0.005 ...   seconds the chip gets per timestep before its output is read
@@ -148,6 +149,7 @@ if [ "${RUN:-}" = "--submit" ]; then
     EXPORTS+=",TRAIN_DURATIONS=${TRAIN_DURATIONS//,/:},MACHINE=${MACHINE},SNN_CHECKPOINT_ROOT=${SNN_CHECKPOINT_ROOT}"
     EXPORTS+=",SNN_CHECKPOINT_SUBDIR=${SNN_CHECKPOINT_SUBDIR},SPECK_CHECKPOINT_ROOT=${SPECK_CHECKPOINT_ROOT}"
     EXPORTS+=",SPECK_CHECKPOINT_SUBDIR=${SPECK_CHECKPOINT_SUBDIR},RESULTS_DIR=${RESULTS_DIR},FIGURES=${FIGURES:-}"
+    EXPORTS+=",FIGURE_DECODERS=${FIGURE_DECODERS//,/:}"
     ARRAY_ID=$(sbatch --parsable --array=0-$(( ${#SESSION_IDS[@]} - 1 )) \
         --export="${EXPORTS},MODE=session" "$0")
     REPORT_ID=$(sbatch --parsable --dependency=afterany:"${ARRAY_ID%%;*}" --time=0:30:00 \
@@ -161,6 +163,7 @@ fi
 # Commas in exported values would split --export, so lists travel as a:b:c.
 TRAIN_DURATIONS="${TRAIN_DURATIONS//:/,}"
 DECODERS="${DECODERS//:/,}"
+FIGURE_DECODERS="${FIGURE_DECODERS//:/,}"
 
 VENV="${VENV:-$HOME/ann-env}"
 if [ -f "$VENV/bin/activate" ]; then
@@ -179,7 +182,8 @@ run_report() {
 
 run_session() {  # run_session SESSION_ID
     local figure_args=()
-    [ -n "${FIGURES:-}" ] && figure_args=(--figures_dir "${RESULTS_DIR}/figures/$1")
+    [ -n "${FIGURES:-}" ] && figure_args=(--figures_dir "${RESULTS_DIR}/figures/$1"
+                                          --figure_decoders "${FIGURE_DECODERS:-}")
     python3 "$INFERENCE_DIR/test_all_decoders.py" \
         --experiment "$EXPERIMENT" \
         --session "$1" \

@@ -13,7 +13,7 @@ Saved as {figures_dir}/{session}_{name}.png:
 and as {figures_dir}/{session}_{velocity,position}_crosshairs.gif: real-time
 decoding as a moving crosshair per decoder, one panel each beside the ground
 truth, plus an overlay of all of them drawn semi-transparent so agreement
-shows as overlap. Every GIF_STRIDE-th sample is shown, for at most
+shows as overlap, in a grid two panels wide. Every GIF_STRIDE-th sample is shown, for at most
 GIF_MAX_FRAMES frames (GIF_STRIDE x more of the session than consecutive
 frames would cover; the writer holds every frame in memory). Position is
 integrated from the full-resolution velocity before subsampling.
@@ -106,8 +106,9 @@ def _font(size):
 
 
 def save_crosshair_gif(y_true, pred, title, path, size=GIF_IMG_SIZE, stride=GIF_STRIDE,
-                       max_frames=GIF_MAX_FRAMES, alpha=OVERLAY_ALPHA, scale=4, n_cols=4):
-    """Animated grid: ground truth, one panel per decoder, and an overlay.
+                       max_frames=GIF_MAX_FRAMES, alpha=OVERLAY_ALPHA, scale=4, n_cols=2):
+    """Animated grid: ground truth, one panel per decoder, and an overlay,
+    n_cols wide (2, 4 or 6 decoders give 2x2, 3x2 or 4x2 panels).
 
     y_true (n, 2) and pred {name: (n, 2)} share one space (velocity or
     position). Each trace is a crosshair in its decoder's colour (ground
@@ -127,7 +128,7 @@ def save_crosshair_gif(y_true, pred, title, path, size=GIF_IMG_SIZE, stride=GIF_
     labels = [t[0] for t in traces] + ['Overlay']
     title_colors = [t[2] for t in traces] + [np.ones(3)]
     n_rows = int(np.ceil(len(labels) / n_cols))
-    side, gap, label_h, header_h = size * scale, 10, 18, 26
+    side, gap, label_h, header_h = size * scale, 10, 18, 44
     width = n_cols * side + (n_cols + 1) * gap
     height = header_h + n_rows * (label_h + side + gap)
     origins = [(gap + (k % n_cols) * (side + gap), header_h + (k // n_cols) * (label_h + side + gap) + label_h)
@@ -154,8 +155,8 @@ def save_crosshair_gif(y_true, pred, title, path, size=GIF_IMG_SIZE, stride=GIF_
             big = np.repeat(np.repeat(panel[::-1], scale, axis=0), scale, axis=1)   # y up
             canvas[y:y + side, x:x + side] = (255 * big).astype(np.uint8)
         image = Image.fromarray(canvas)
-        ImageDraw.Draw(image).text((gap, 5), f"{title}    t = {idx[frame] * STEP_S:6.1f} s",
-                                   fill=(255, 255, 255), font=clock_font)
+        ImageDraw.Draw(image).text((gap, 5), f"{title}\nt = {idx[frame] * STEP_S:6.1f} s",
+                                   fill=(255, 255, 255), font=clock_font, spacing=3)
         frames.append(image.convert('P', palette=Image.ADAPTIVE, colors=64))
     frames[0].save(path, save_all=True, append_images=frames[1:], duration=int(1000 / GIF_FPS), loop=0)
     print(f"  Saved {path} ({len(frames)} frames, every {stride}th sample, "
@@ -172,10 +173,19 @@ def _save(fig, figures_dir, session, name):
 
 
 def save_session_figures(result, session, figures_dir, roll_window=20, speed_bins=8,
-                         segment_samples=260, n_segments=16):
-    """result: decoder_eval.evaluate_decoders() output for the full-data run."""
+                         segment_samples=260, n_segments=16, decoders=None):
+    """result: decoder_eval.evaluate_decoders() output for the full-data run.
+    decoders: names to draw, in this order (default: every decoder in result)."""
     os.makedirs(figures_dir, exist_ok=True)
     y_true, y_pos, pred = result['arrays']['y_true'], result['arrays']['y_pos'], result['arrays']['pred']
+    if decoders:
+        missing = [d for d in decoders if d not in pred]
+        if missing:
+            print(f"  [figures] {session}: no predictions for {missing}, left out")
+        pred = {d: pred[d] for d in decoders if d in pred}
+        if not pred:
+            print(f"  [skip] figures: none of {decoders} were evaluated for {session}")
+            return
     metrics, names, n = result['metrics'], list(pred), len(y_true)
     sq_err = {name: (y - y_true) ** 2 for name, y in pred.items()}
     per_sample_rmse = {name: np.sqrt(e.mean(axis=1)) for name, e in sq_err.items()}
