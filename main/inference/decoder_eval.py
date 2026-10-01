@@ -308,12 +308,26 @@ def predict_speck_test_set(model, checkpoint, velocity_scale, cfg):
         device.close()
 
 
-def available_decoders(cfg, decoders, duration_tag, snn_checkpoint_path):
+def snn_checkpoints(snn_checkpoint_path, speck_checkpoint_path=None):
+    """{'snn': path, 'speck': path}: 'speck' runs its own checkpoint if given,
+    else the SNN's."""
+    return {'snn': snn_checkpoint_path, 'speck': speck_checkpoint_path or snn_checkpoint_path}
+
+
+def checkpoint_id(path):
+    """A checkpoint's last four path components (checkpoint directory,
+    session, [config,] file), so the same checkpoint is recognised on the
+    cluster and on the laptop."""
+    return None if not path else os.path.join(*os.path.normpath(path).split(os.sep)[-4:])
+
+
+def available_decoders(cfg, decoders, duration_tag, snn_checkpoint_path, speck_checkpoint_path=None):
     """The decoders with a trained model for this duration."""
     bundle_dir = os.path.join(cfg.model_dir, cfg.feature)
-    snn = bool(snn_checkpoint_path and os.path.exists(snn_checkpoint_path))
+    checkpoints = snn_checkpoints(snn_checkpoint_path, speck_checkpoint_path)
     return [d for d in decoders
-            if (d in SNN_DECODERS and snn) or (d in ANN_DECODERS and os.path.exists(
+            if (d in SNN_DECODERS and checkpoints[d] and os.path.exists(checkpoints[d]))
+            or (d in ANN_DECODERS and os.path.exists(
                 os.path.join(bundle_dir, f"{_tag(d, duration_tag)}_config.json")))]
 
 
@@ -373,7 +387,8 @@ def decoder_metrics(y_true, y_pred, n_splits=DEFAULT_CI_N_SPLITS):
 # One evaluation (one training duration)
 # --------------------------------------------------------------------------- #
 
-def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint_path=None):
+def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint_path=None,
+                      speck_checkpoint_path=None):
     """Evaluate every available decoder for one training duration.
 
     data: dict with X_test, y_test_full (6 columns), y_test_vel.
@@ -385,6 +400,9 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
     its 'op_estimate', None for 'speck', which has its measured 'chip'
     timing and power instead), and the aligned arrays under 'arrays'
     (with the chip's output spike counts per step as 'speck_counts').
+    'speck' runs speck_checkpoint_path if given, else snn_checkpoint_path;
+    the checkpoint each SNN decoder ran is recorded under 'checkpoints', and
+    the first scored row of the SNN test predictions under 'snn_row_offset'.
     """
     tag = f"{duration_minutes:g}min" if duration_minutes is not None else None
     label = tag or 'full'
@@ -406,20 +424,27 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
     start = max((offset for _, offset in preds.values()), default=0)
     end = min([n_test] + [offset + len(y) for y, offset in preds.values()])
 
+    checkpoints = snn_checkpoints(snn_checkpoint_path, speck_checkpoint_path)
     snn_names = [d for d in SNN_DECODERS if d in decoders]
-    snn_preds, chip, speck_counts = {}, None, None
-    if snn_names and snn_checkpoint_path and os.path.exists(snn_checkpoint_path):
-        model, checkpoint, scale = load_snn_model(snn_checkpoint_path, cfg.experiment)
-        if 'snn' in snn_names:
-            print(f"  Evaluating SNN ({label}): {snn_checkpoint_path}")
+    found = [d for d in snn_names if checkpoints[d] and os.path.exists(checkpoints[d])]
+    missing += [d for d in snn_names if d not in found]
+    snn_preds, chip, speck_counts, snn_row_offset, loaded = {}, None, None, None, {}
+    for name in found:
+        path = checkpoints[name]
+        if path not in loaded:
+            loaded[path] = load_snn_model(path, cfg.experiment)
+        model, checkpoint, scale = loaded[path]
+        if name == 'snn':
+            print(f"  Evaluating SNN ({label}): {path}")
             snn_preds['snn'], op_estimates['snn'] = predict_snn_test_set(
                 model, scale, cfg.snn_dataset_path, cfg.experiment, cfg.continuous_snn_test_stream)
-        if 'speck' in snn_names:
-            print(f"  Evaluating SNN on Speck ({label}): {snn_checkpoint_path}")
+        else:
+            print(f"  Evaluating SNN on Speck ({label}): {path}")
             snn_preds['speck'], chip, speck_counts = predict_speck_test_set(model, checkpoint, scale, cfg)
             op_estimates['speck'] = None
-        # Both run the same trials, so they share one alignment. Intersect
-        # their rows with the ANN decoders' range.
+    if found:
+        # Both run the same trials (whichever checkpoint), so they share one
+        # alignment. Intersect their rows with the ANN decoders' range.
         snn_start = calibrate_snn_ann_offset(cfg.snn_dataset_path, data['y_test_vel'])
         trim = max(0, start - snn_start)
         snn_start += trim
@@ -427,13 +452,12 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
         if snn_end > snn_start:
             start, end = snn_start, snn_end
             snn_preds = {name: p[trim:trim + end - start] for name, p in snn_preds.items()}
+            snn_row_offset = trim
             if speck_counts is not None:
                 speck_counts = speck_counts[trim:trim + end - start]
         else:
             print(f"  [skip] {', '.join(snn_preds)} ({label}): no overlap with the other decoders' test rows")
             snn_preds = {}
-    else:
-        missing += snn_names
     if missing:
         print(f"  No {label} model for: {', '.join(missing)}")
 
@@ -467,5 +491,7 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
     return {'duration_tag': tag, 'train_duration_minutes': duration_minutes,
             'start_raw': start, 'end_raw': end, 'n_samples': n,
             'decoders': list(aligned), 'metrics': metrics,
+            'checkpoints': {name: checkpoints[name] for name in snn_preds},
+            'snn_row_offset': snn_row_offset,
             'arrays': {'y_true': y_true, 'y_pos': data['y_test_pos'][start:end], 'pred': aligned,
                        'speck_counts': speck_counts if 'speck' in aligned else None}}

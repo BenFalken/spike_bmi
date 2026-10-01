@@ -30,6 +30,12 @@ there are the ones this checkpoint produces; results made with a different
 checkpoint are reported and left out of the snn/speck columns. Without the
 .npz, versions are scored against the SNN dataset's velocity instead.
 
+When the results ran 'speck' with another checkpoint than 'snn'
+(run_inference.sbatch with SPECK_CHECKPOINT_ROOT), pass the Speck checkpoints
+as --snn_checkpoint_root: they must be the ones the results recorded for
+'speck', and the rows come from the recorded offset. The 'snn' column is then
+the other checkpoint's result.
+
 Writes {results_dir}/speck_diagnosis.json.
 
 Usage (no devkit needed):
@@ -47,8 +53,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 import numpy as np  # noqa: E402
 
-from decoder_eval import (BASE_NPERSEG, _load_pickle, load_snn_model, snn_test_files,  # noqa: E402
-                          unscale_velocity)
+from decoder_eval import (BASE_NPERSEG, _load_pickle, checkpoint_id, load_snn_model,  # noqa: E402
+                          snn_test_files, unscale_velocity)
 import speck  # noqa: E402
 
 VERSIONS = ('pytorch', 'quantized')
@@ -181,21 +187,42 @@ def compare_chip_output(chip, reference, decode, target, chip_pred, max_lag=5, w
 def diagnose_session(session, checkpoint, snn_dataset_path, results_dir, experiment, max_lag=5):
     preds, target, counts, decode = decode_versions(checkpoint, snn_dataset_path, experiment)
     arrays_path = os.path.join(results_dir, 'sessions', f'{session}_arrays.npz')
+    results_path = os.path.join(results_dir, 'sessions', f'{session}.json')
+    full = {}
+    if os.path.isfile(results_path):
+        with open(results_path, 'r') as f:
+            full = json.load(f).get('full') or {}
+    # Results recorded with checkpoints say which one each SNN decoder ran.
+    # When 'speck' ran another checkpoint than 'snn', it must be this one, and
+    # the rows come from the recorded offset; otherwise this checkpoint must
+    # reproduce the saved 'snn' predictions.
+    recorded = full.get('checkpoints') or {}
+    decoupled = 'speck' in recorded and checkpoint_id(recorded['speck']) != checkpoint_id(recorded.get('snn'))
     row, note = {}, None
     if os.path.isfile(arrays_path):
         with np.load(arrays_path) as f:
             saved = {k: f[k] for k in f.files}
-        offset = find_offset(preds['pytorch'], saved['pred_snn']) if 'pred_snn' in saved else None
-        if offset is None:
-            note = 'results made with a different checkpoint; snn/speck left out, scored on the SNN dataset'
+        n = len(saved['y_true'])
+        if decoupled:
+            offset = full.get('snn_row_offset')
+            if checkpoint_id(checkpoint) != checkpoint_id(recorded['speck']):
+                offset, note = None, (f"speck ran {checkpoint_id(recorded['speck'])}; "
+                                      "snn/speck left out, scored on the SNN dataset")
+            elif offset is None or offset + n > len(preds['pytorch']):
+                offset, note = None, 'no usable snn_row_offset in the results; snn/speck left out'
         else:
-            n = len(saved['y_true'])
+            offset = find_offset(preds['pytorch'], saved['pred_snn']) if 'pred_snn' in saved else None
+            if offset is None:
+                note = 'results made with a different checkpoint; snn/speck left out, scored on the SNN dataset'
+        if offset is not None:
             target = saved['y_true']
             preds = {v: p[offset:offset + n] for v, p in preds.items()}
             counts = {v: c[offset:offset + n] for v, c in counts.items()}
             for name in ('snn', 'speck'):
                 if f'pred_{name}' in saved:
                     row[name] = {'rmse': rmse(saved[f'pred_{name}'], target)}
+            if decoupled and 'snn' in row:
+                note = f"snn ran {checkpoint_id(recorded.get('snn'))}"
             if 'speck_counts' in saved:
                 row['chip_vs_quantized'] = compare_chip_output(
                     saved['speck_counts'].astype(float), counts['quantized'], decode, target,
@@ -205,9 +232,7 @@ def diagnose_session(session, checkpoint, snn_dataset_path, results_dir, experim
     for version, p in preds.items():
         row[version] = {'rmse': rmse(p, target), 'output_spikes_per_step': float(counts[version].sum() / len(p))}
     if 'speck' in row:
-        results_path = os.path.join(results_dir, 'sessions', f'{session}.json')
-        with open(results_path, 'r') as f:
-            chip = json.load(f)['full']['metrics'].get('speck', {}).get('chip') or {}
+        chip = full.get('metrics', {}).get('speck', {}).get('chip') or {}
         if 'output_spikes_per_step' in chip:
             row['speck']['output_spikes_per_step'] = chip['output_spikes_per_step']
     return row, note

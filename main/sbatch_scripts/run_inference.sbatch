@@ -38,6 +38,7 @@
 # Re-running is safe: finished session sections are skipped, and the report is
 # always rebuilt. Settings below can be overridden from the environment, e.g.
 #   SNN_CHECKPOINT_ROOT=.../full_cohort_finetuned_medium bash run_inference.sbatch --submit bmi indy
+#   SPECK_CHECKPOINT_ROOT=.../per_session ...   run 'speck' with other checkpoints than 'snn'
 #   FIGURES=1 bash run_inference.sbatch --submit bmi indy     # also per-session diagnostic figures
 #   DATA_ROOT=~/data VENV=~/speck-env bash run_inference.sbatch --local bmi indy
 #   (--local without DATA_ROOT uses the data/ folder next to main/, if there is one)
@@ -65,8 +66,8 @@ DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
 # No subject: run this script once per subject of the experiment
 # --------------------------------------------------------------------------
 if [ -z "${SUBJECT:-}" ]; then
-    if [ -n "${SNN_CHECKPOINT_ROOT:-}" ] || [ -n "${RESULTS_DIR:-}" ]; then
-        echo "ERROR: SNN_CHECKPOINT_ROOT and RESULTS_DIR are per subject; name a subject to set them" >&2
+    if [ -n "${SNN_CHECKPOINT_ROOT:-}${SPECK_CHECKPOINT_ROOT:-}${RESULTS_DIR:-}" ]; then
+        echo "ERROR: SNN_CHECKPOINT_ROOT, SPECK_CHECKPOINT_ROOT and RESULTS_DIR are per subject; name a subject to set them" >&2
         exit 1
     fi
     SUBJECTS=()
@@ -106,6 +107,14 @@ MODEL_CACHE_ROOT="${DATA_ROOT}/results/model_cache/${EXPERIMENT}/${SUBJECT}"
 # (SNN_CHECKPOINT_SUBDIR selects one config of a sweep, e.g. wide768_2x)
 SNN_CHECKPOINT_ROOT="${SNN_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/per_session}"
 SNN_CHECKPOINT_SUBDIR="${SNN_CHECKPOINT_SUBDIR:-}"
+# The 'speck' decoder runs the SNN checkpoints unless SPECK_CHECKPOINT_ROOT
+# (and SPECK_CHECKPOINT_SUBDIR) name others, laid out the same way.
+if [ -n "${SPECK_CHECKPOINT_ROOT:-}" ]; then
+    SPECK_CHECKPOINT_SUBDIR="${SPECK_CHECKPOINT_SUBDIR:-}"
+else
+    SPECK_CHECKPOINT_ROOT="$SNN_CHECKPOINT_ROOT"
+    SPECK_CHECKPOINT_SUBDIR="${SPECK_CHECKPOINT_SUBDIR:-$SNN_CHECKPOINT_SUBDIR}"
+fi
 if [ "$EXPERIMENT" = "hkm" ]; then
     SNN_DATASET_ROOT="${DATA_ROOT}/snn_datasets/${EXPERIMENT}/${SUBJECT}/mua"          # whole trials
 else
@@ -115,6 +124,9 @@ RESULTS_DIR="${RESULTS_DIR:-${DATA_ROOT}/results/test_all_decoders/${EXPERIMENT}
 
 snn_checkpoint() {  # snn_checkpoint SESSION_DIR
     echo "$1/${SNN_CHECKPOINT_SUBDIR:+${SNN_CHECKPOINT_SUBDIR}/}best_model_weights.pth"
+}
+speck_checkpoint() {  # speck_checkpoint SESSION
+    echo "${SPECK_CHECKPOINT_ROOT}/$1/${SPECK_CHECKPOINT_SUBDIR:+${SPECK_CHECKPOINT_SUBDIR}/}best_model_weights.pth"
 }
 
 # Sessions = subdirectories of SNN_CHECKPOINT_ROOT holding a checkpoint.
@@ -134,7 +146,8 @@ if [ "${RUN:-}" = "--submit" ]; then
     mkdir -p logs
     EXPORTS="ALL,EXPERIMENT=${EXPERIMENT},SUBJECT=${SUBJECT},DATA_ROOT=${DATA_ROOT},DECODERS=${DECODERS//,/:}"
     EXPORTS+=",TRAIN_DURATIONS=${TRAIN_DURATIONS//,/:},MACHINE=${MACHINE},SNN_CHECKPOINT_ROOT=${SNN_CHECKPOINT_ROOT}"
-    EXPORTS+=",SNN_CHECKPOINT_SUBDIR=${SNN_CHECKPOINT_SUBDIR},RESULTS_DIR=${RESULTS_DIR},FIGURES=${FIGURES:-}"
+    EXPORTS+=",SNN_CHECKPOINT_SUBDIR=${SNN_CHECKPOINT_SUBDIR},SPECK_CHECKPOINT_ROOT=${SPECK_CHECKPOINT_ROOT}"
+    EXPORTS+=",SPECK_CHECKPOINT_SUBDIR=${SPECK_CHECKPOINT_SUBDIR},RESULTS_DIR=${RESULTS_DIR},FIGURES=${FIGURES:-}"
     ARRAY_ID=$(sbatch --parsable --array=0-$(( ${#SESSION_IDS[@]} - 1 )) \
         --export="${EXPORTS},MODE=session" "$0")
     REPORT_ID=$(sbatch --parsable --dependency=afterany:"${ARRAY_ID%%;*}" --time=0:30:00 \
@@ -173,6 +186,7 @@ run_session() {  # run_session SESSION_ID
         --input_filepath "${DATASET_ROOT}/$1_binning.h5" \
         --model_dir "${MODEL_CACHE_ROOT}/$1" \
         --snn_checkpoint_path "$(snn_checkpoint "${SNN_CHECKPOINT_ROOT}/$1")" \
+        --speck_checkpoint_path "$(speck_checkpoint "$1")" \
         --snn_dataset_path "${SNN_DATASET_ROOT}/$1" \
         --output "${RESULTS_DIR}/sessions/$1.json" \
         --feature "$FEATURE" \
@@ -190,6 +204,7 @@ run_session() {  # run_session SESSION_ID
 if [ "${RUN:-}" = "--local" ]; then
     echo "DATA_ROOT=${DATA_ROOT}"
     echo "SNN checkpoints: ${SNN_CHECKPOINT_ROOT}${SNN_CHECKPOINT_SUBDIR:+ (/<session>/${SNN_CHECKPOINT_SUBDIR})}"
+    [[ ",$DECODERS," == *,speck,* ]] && echo "Speck checkpoints: ${SPECK_CHECKPOINT_ROOT}${SPECK_CHECKPOINT_SUBDIR:+ (/<session>/${SPECK_CHECKPOINT_SUBDIR})}"
     echo "Results: ${RESULTS_DIR}"
     FAILED=()
     for i in "${!SESSION_IDS[@]}"; do

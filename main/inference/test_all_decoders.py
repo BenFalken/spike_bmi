@@ -10,7 +10,8 @@ The file has three sections, each computed only where missing (or with
                estimate (op_energy_estimate.py) per decoder; 'speck' instead has
                its measured on-chip latency and power under 'chip'. Re-run
                (for every decoder, as they share one scored range) when a
-               requested decoder with a model is not in it yet.
+               requested decoder with a model is not in it yet, or when the
+               SNN or Speck checkpoint differs from the one recorded there.
     durations  the same, per training duration ("1min", ..., from
                --train_durations, none by default), for every decoder except
                'speck' with a duration-tagged model (null for a duration with
@@ -30,6 +31,11 @@ durations and cluster profile are kept, and the laptop adds its own profile.
 make_report.py combines these files across sessions into
 combined_metrics.json / combined_metrics_durations.json and draws the report
 figures. See decoder_eval.py for how the decoders are loaded and aligned.
+
+'speck' runs --speck_checkpoint_path if given, else --snn_checkpoint_path,
+so the PyTorch SNN and the chip can be scored with different checkpoints
+(e.g. the best PyTorch model against the best one for the chip). Both run the
+same test trials, so they share the same scored rows.
 
 Usage (run_inference.sbatch runs this once per session):
     python test_all_decoders.py --experiment bmi --session indy_20160407_02 \
@@ -63,7 +69,8 @@ import numpy as np  # noqa: E402
 pin_torch_threads()
 
 from decoder_eval import (ALL_DECODERS, DEFAULT_CI_N_SPLITS, available_decoders,  # noqa: E402
-                          duration_checkpoint_path, evaluate_decoders, test_split_start)
+                          checkpoint_id, duration_checkpoint_path, evaluate_decoders,
+                          snn_checkpoints, test_split_start)
 from profiling import profile_decoders  # noqa: E402
 
 
@@ -76,6 +83,14 @@ def load_session_data(args):
     print(f"Chronological split: {n_train} train rows, {len(X) - n_train} test rows")
     return {'X_test': X[n_train:], 'y_test_full': y_task[n_train:],
             'y_test_vel': y_task[n_train:, 2:4], 'y_test_pos': y_task[n_train:, 0:2]}
+
+
+def changed_checkpoints(full, args, decoders):
+    """The SNN decoders in `full` that ran another checkpoint than now
+    (results recorded before checkpoints were stored count as unchanged)."""
+    recorded = full.get('checkpoints') or {}
+    current = snn_checkpoints(args.snn_checkpoint_path, args.speck_checkpoint_path)
+    return [d for d in recorded if d in decoders and checkpoint_id(recorded[d]) != checkpoint_id(current[d])]
 
 
 def _json_ready(result):
@@ -140,11 +155,17 @@ def main(args):
         return results['profiles'].get(args.machine, {}).get('decoders', {})
 
     evaluated = results['full']['decoders'] if 'full' in results else []
-    new_decoders = [d for d in available_decoders(args, decoders, None, args.snn_checkpoint_path)
+    new_decoders = [d for d in available_decoders(args, decoders, None, args.snn_checkpoint_path,
+                                                  args.speck_checkpoint_path)
                     if d not in evaluated]
+    changed = changed_checkpoints(results['full'], args, decoders) if 'full' in results else []
+    if changed:
+        print(f"Re-running the full-data section: new checkpoint for {', '.join(changed)}")
+        for d in changed:      # their profile on this machine was made with the old checkpoint
+            results['profiles'].get(args.machine, {}).get('decoders', {}).pop(d, None)
     # The full-data predictions, kept so figures can be redrawn without re-evaluating.
     arrays_path = os.path.splitext(args.output)[0] + '_arrays.npz'
-    todo_full = ('full' not in results or new_decoders
+    todo_full = ('full' not in results or new_decoders or changed
                  or (args.figures_dir and not os.path.exists(arrays_path)))
     # A duration recorded as None had no trained models; retry it only if some have appeared.
     durations = [float(d) for d in args.train_durations.split(',') if d.strip()]
@@ -164,7 +185,8 @@ def main(args):
 
     if todo_full:
         print("\n--- Full-data models ---")
-        full = evaluate_decoders(data, args, decoders, snn_checkpoint_path=args.snn_checkpoint_path)
+        full = evaluate_decoders(data, args, decoders, snn_checkpoint_path=args.snn_checkpoint_path,
+                                 speck_checkpoint_path=args.speck_checkpoint_path)
         if full is None:
             raise FileNotFoundError(f"No trained decoders found for {session}")
         results['full'] = _json_ready(full)
@@ -211,6 +233,8 @@ def build_parser():
     io.add_argument('--snn_checkpoint_path', default=None,
                     help='Full-data SNN checkpoint. Duration-tagged SNNs are looked up under a '
                          'sibling duration_sweep/<session>/<N>min/ directory.')
+    io.add_argument('--speck_checkpoint_path', default=None,
+                    help="Checkpoint for the 'speck' decoder (default: --snn_checkpoint_path)")
     io.add_argument('--snn_dataset_path', default=None,
                     help="Session's SNN dataset directory (with test/*.pkl)")
     io.add_argument('--output', required=True, help='Session results JSON')
@@ -256,7 +280,7 @@ def build_parser():
 
 if __name__ == '__main__':
     args = build_parser().parse_args()
-    if ({'snn', 'speck'} & set(args.decoders.split(',')) and args.snn_checkpoint_path
-            and not args.snn_dataset_path):
+    if ({'snn', 'speck'} & set(args.decoders.split(','))
+            and (args.snn_checkpoint_path or args.speck_checkpoint_path) and not args.snn_dataset_path):
         raise SystemExit("--snn_dataset_path is required to evaluate the SNN")
     main(args)

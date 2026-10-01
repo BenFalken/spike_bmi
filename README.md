@@ -56,7 +56,10 @@ it. Data live under one root (`BMI_DATA_ROOT` / `DATA_ROOT`), laid out as
 4. **Speck.** On the devkit-connected laptop, `bash sbatch_scripts/run_inference.sbatch --local bmi indy`
    runs the same evaluation in series with `speck` added. Copy the cluster's
    `sessions/*.json` in first to extend them. `inference/export_test_split.py` writes the
-   test-only data the laptop needs.
+   test-only data the laptop needs. `speck` runs the SNN checkpoints unless
+   `SPECK_CHECKPOINT_ROOT` (and `SPECK_CHECKPOINT_SUBDIR`) name others. The PyTorch SNN and
+   the chip can then be scored with different checkpoints on the same test rows; a changed
+   checkpoint re-runs the full-data section.
 5. **Speck diagnosis** (no devkit needed, from `main/inference`):
    - `diagnose_speck.py` scores each session's checkpoint as trained (`pytorch`) and as
      quantized for the chip, next to the saved `snn` and `speck` results. It also compares
