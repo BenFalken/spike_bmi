@@ -19,7 +19,10 @@ exactly matching steps, per-feature rates, the agreement of the EMA-smoothed
 spike trains the decoder reads, the delay at which the two agree
 best (spikes read after --speck_wait_time land in later steps), and the RMSE
 once that delay is removed. The chip's counts are also re-decoded on the
-host, which must reproduce the 'speck' RMSE.
+host, which must reproduce the 'speck' RMSE. Last, a linear readout is
+re-fitted to each network's output spikes (5-fold blocked cross-validation
+over the scored rows): 'refit spk' estimates what calibrating the readout on the
+chip could recover, next to 'refit qnt' for the quantized network.
 
 Every column is scored on the rows and targets of the session results
 (<session>_arrays.npz), after checking that the 'snn' predictions stored
@@ -112,11 +115,43 @@ def _corr(a, b):
     return float(np.corrcoef(a, b)[0, 1]) if a.std() > 0 and b.std() > 0 else float('nan')
 
 
+def refit_rmse(counts, target, smooth, warmup, folds=5, ridge=1e-3):
+    """RMSE of a linear readout re-fitted to these output spike counts, by
+    blocked cross-validation on the scored rows (fit on all but one contiguous
+    block, score that block, for each of `folds` blocks). The features are what decode_output reads,
+    the EMA-smoothed counts, as each axis's share per bin plus its log total;
+    so a readout fitted on the chip's spikes can absorb a consistent
+    distortion of how the chip spreads spikes over the bins."""
+    acc = smooth(counts)[warmup:]
+    target = target[warmup:]
+    n = acc.shape[1] // 2
+    features = []
+    for axis in (acc[:, :n], acc[:, n:2 * n]):
+        total = axis.sum(axis=1, keepdims=True)
+        features += [np.divide(axis, total, out=np.zeros_like(axis), where=total > 0), np.log1p(total)]
+    features = np.hstack(features)
+    blocks = np.array_split(np.arange(len(features)), folds)
+    errors = []
+    for score in blocks:
+        fit = np.setdiff1d(np.arange(len(features)), score)
+        mean, std = features[fit].mean(axis=0), features[fit].std(axis=0)
+        std[std < 1e-6] = np.inf                # a bin never used in the fitting half is ignored
+        design = lambda rows: np.hstack([(features[rows] - mean) / std, np.ones((len(features[rows]), 1))])
+        a = design(fit)
+        reg = ridge * len(a) * np.eye(a.shape[1])
+        reg[-1, -1] = 0                         # the intercept is not penalised
+        weights = np.linalg.solve(a.T @ a + reg, a.T @ target[fit])
+        errors.append(design(score) @ weights - target[score])
+    return float(np.sqrt((np.concatenate(errors) ** 2).mean()))
+
+
 def compare_chip_output(chip, reference, decode, target, chip_pred, max_lag=5, warmup=200):
     """The chip's output spike counts against the quantized network's on the
     same steps: spike totals, how often a step matches exactly, per-feature
     rate agreement, the delay (in steps) at which the two correlate best,
-    and the RMSE of the chip's spikes decoded after removing that delay.
+    the RMSE of the chip's spikes decoded after removing that delay, and
+    the RMSE of a readout re-fitted (cross-validated) to the chip's spikes and,
+    for comparison, to the quantized network's.
 
     The chip's spikes are also re-decoded without any shift; that RMSE must
     equal the chip's own ('speck_same_rows'), or the host-side decode
@@ -138,6 +173,8 @@ def compare_chip_output(chip, reference, decode, target, chip_pred, max_lag=5, w
         'rmse_speck_same_rows': rmse(chip_pred[warmup:], target[warmup:]),
         'rmse_redecoded': rmse(decode(chip)[warmup:], target[warmup:]),
         'rmse_lag_corrected': rmse(decode(shifted)[warmup:], target[warmup:]),
+        'rmse_refit_quantized': refit_rmse(reference, target, decode.smooth, warmup),
+        'rmse_refit_speck': refit_rmse(chip, target, decode.smooth, warmup),
     }
 
 
@@ -213,9 +250,11 @@ def main(args):
                 ('step_corr_lag0', 'corr lag0'),
                 ('best_lag', 'best lag'), ('step_corr_best_lag', 'corr best'),
                 ('rmse_speck_same_rows', 'speck'), ('rmse_redecoded', 'redecoded'),
-                ('rmse_lag_corrected', 'lag-fixed')]
+                ('rmse_lag_corrected', 'lag-fixed'), ('rmse_refit_quantized', 'refit qnt'),
+                ('rmse_refit_speck', 'refit spk')]
         print(f"\nChip output vs. quantized network, same steps; RMSEs after a 200-step warm-up "
-              f"(redecoded must equal speck)\n"
+              f"(redecoded must equal speck; refit: readout re-fitted to that network's spikes, "
+              f"5-fold cross-validated)\n"
               f"{'session':<20s}" + ''.join(f"{label:>11s}" for _, label in cols))
         for session, c in chip_rows.items():
             print(f"{session:<20s}" + ''.join(f"{c[k]:11d}" if k == 'best_lag' else f"{c[k]:11.2f}"
