@@ -114,6 +114,11 @@ LIF neurons nor a synaptic stage (τ_syn) can be deployed to it.
   better than about 47 in any run. The chip's output carries less information than the
   quantized network's, and no readout recovers it.
 - **Soft reset:** on the chip it is worse than hard reset, although it is better in PyTorch.
+- **Binarized input:** per-session models retrained with each input channel clipped to at
+  most one spike per 4 ms bin reach Speck 45.67 on 30 sessions, with the same chip penalty
+  (about 2 RMSE) and spike ratio (about 1.9×). Few bins held more than one spike, so the
+  inputs barely changed, and capping events per channel leaves each neuron summing events from
+  many channels per timestep.
 
 **How the chip differs from training** (`probe_speck.py`, single neuron on a Speck2f devkit)
 - **Training model:** each timestep's input is summed, then the neuron fires ⌊v/θ⌋ spikes
@@ -142,13 +147,18 @@ The chip adds more error the more a model relies on stored state:
 A model that carries charge forward also carries the chip's within-timestep errors forward,
 and they compound across layers. The training changes that improve the PyTorch decoder act
 through exactly the per-timestep dynamics the chip does not reproduce, so they do not survive
-deployment. Speck lands at 46–48 whichever model is deployed.
+deployment. Speck lands at 45.8–48 whichever model is deployed.
 
-**Implication.** Matching the chip does not require a memoryless network: memory across
-timesteps, in the membrane and in the host-side EMA readout, is preserved on the chip. What
-has to change is the timestep. With bins short enough that each neuron receives about one
-input event per timestep, summing a timestep's input and updating per event give the same
-result. Finer input binning is the next experiment.
+**Conclusion.** The per-session, hard-reset checkpoints are the best case for Speck.
+- **Speck:** 45.8 RMSE.
+- **Same network in PyTorch:** 43.4, so within 2 RMSE.
+- **Best PyTorch SNN:** the fine-tuned model at 40.5, about 5 better.
+
+The remaining gap comes from the chip updating per event while training sums each timestep.
+It does not come from quantization, decoding, delay or the readout. Two directions could close it and were not pursued:
+- **Time bins short enough** that each neuron receives about one event per timestep, so that
+  per-timestep training matches per-event updates.
+- **Training through an event-by-event model** of the chip's neurons.
 
 ## Requirements
 
