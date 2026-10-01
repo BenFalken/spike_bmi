@@ -36,29 +36,57 @@
 # the SNN checkpoints and snn_datasets/.../<session>/test/.
 #
 # Re-running is safe: finished session sections are skipped, and the report is
-# always rebuilt. Settings below can be overridden from the environment, e.g.
+# always rebuilt. Settings below can be given as NAME=value after the subject,
+#   bash run_inference.sbatch --local bmi indy SNN_CHECKPOINT_ROOT=.../per_session FIGURES=1
+# or in the environment: before the command on the same line, or exported
+# (a plain NAME=value on a line of its own is not seen by this script), e.g.
 #   SNN_CHECKPOINT_ROOT=.../full_cohort_finetuned_medium bash run_inference.sbatch --submit bmi indy
 #   SPECK_CHECKPOINT_ROOT=.../per_session ...   run 'speck' with other checkpoints than 'snn'
 #   FIGURES=1 bash run_inference.sbatch --submit bmi indy     # also per-session diagnostic figures
 #   FIGURE_DECODERS=snn,speck FIGURES=1 ...   only these decoders in them (and the crosshair GIFs)
 #   DATA_ROOT=~/data VENV=~/speck-env bash run_inference.sbatch --local bmi indy
-#   (--local without DATA_ROOT uses the data/ folder next to main/, if there is one)
+#   (--local and --report without DATA_ROOT use the data/ folder next to main/, if there is one)
 #   SPECK_WAIT_TIME=0.005 ...   seconds the chip gets per timestep before its output is read
-#   Only rebuild the report:  MODE=report EXPERIMENT=bmi SUBJECT=indy bash run_inference.sbatch
+#   Only rebuild the report:  bash run_inference.sbatch --report bmi indy
 
 set -eo pipefail
 
+# Settings this script reads from the environment (see the examples above).
+SETTINGS="DATA_ROOT VENV DECODERS TRAIN_DURATIONS MACHINE SNN_CHECKPOINT_ROOT SNN_CHECKPOINT_SUBDIR
+          SPECK_CHECKPOINT_ROOT SPECK_CHECKPOINT_SUBDIR RESULTS_DIR FIGURES FIGURE_DECODERS
+          SPECK_WAIT_TIME ENERGY_METER_NUM_THREADS"
+
 case "${1:-}" in
-    --submit|--local) RUN="$1"; EXPERIMENT="${2:-}"; SUBJECT="${3:-}" ;;
+    --submit|--local|--report)
+        [ "$1" = "--report" ] && MODE=report || RUN="$1"
+        shift
+        POSITIONAL=()
+        for arg in "$@"; do
+            if [[ "$arg" == *=* ]]; then          # NAME=value: same as setting it in the environment
+                name="${arg%%=*}"; value="${arg#*=}"
+                if [[ " $(echo $SETTINGS) " != *" $name "* ]]; then
+                    echo "ERROR: unknown setting '$name' (known: $(echo $SETTINGS))" >&2
+                    exit 1
+                fi
+                [[ "$value" == "~/"* ]] && value="$HOME/${value#\~/}"
+                export "$name=$value"
+            else
+                POSITIONAL+=("$arg")
+            fi
+        done
+        EXPERIMENT="${POSITIONAL[0]:-}"; SUBJECT="${POSITIONAL[1]:-}" ;;
 esac
 if [ -z "${EXPERIMENT:-}" ] || { [ -z "${SUBJECT:-}" ] && [ -z "${RUN:-}" ]; }; then
-    echo "Usage: bash $0 --submit|--local <experiment> [<subject>]" >&2
+    echo "Usage: bash $0 --submit|--local <experiment> [<subject>] [NAME=value ...]" >&2
+    echo "       bash $0 --report <experiment> <subject> [NAME=value ...]" >&2
     exit 1
 fi
-# Data root: $DATA_ROOT if exported; for --local, else the data/ folder next to
-# main/ (repo/main/../data) when it exists; else the cluster scratch directory.
+# Data root: $DATA_ROOT if set; outside Slurm (--local, --report), else the
+# data/ folder next to main/ (repo/main/../data) when it exists; else the
+# cluster scratch directory.
 LOCAL_DATA_ROOT="$(cd "$(dirname "$0")/../.." && pwd)/data"
-if [ -z "${DATA_ROOT:-}" ] && [ "${RUN:-}" = "--local" ] && [ -d "$LOCAL_DATA_ROOT" ]; then
+if [ -z "${DATA_ROOT:-}" ] && [ "${RUN:-}" != "--submit" ] && [ -z "${SLURM_JOB_ID:-}" ] \
+        && [ -d "$LOCAL_DATA_ROOT" ]; then
     DATA_ROOT="$LOCAL_DATA_ROOT"
 fi
 DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
@@ -123,6 +151,16 @@ else
 fi
 RESULTS_DIR="${RESULTS_DIR:-${DATA_ROOT}/results/test_all_decoders/${EXPERIMENT}/${SUBJECT}}"
 
+show_settings() {
+    echo "DATA_ROOT=${DATA_ROOT}"
+    if [ "${MODE:-}" != "report" ]; then
+        echo "SNN checkpoints: ${SNN_CHECKPOINT_ROOT}${SNN_CHECKPOINT_SUBDIR:+ (/<session>/${SNN_CHECKPOINT_SUBDIR})}"
+        [[ ",$DECODERS," == *,speck,* ]] && echo "Speck checkpoints: ${SPECK_CHECKPOINT_ROOT}${SPECK_CHECKPOINT_SUBDIR:+ (/<session>/${SPECK_CHECKPOINT_SUBDIR})}"
+        echo "Decoders: ${DECODERS}${FIGURES:+; figures for ${FIGURE_DECODERS:-every decoder}}"
+    fi
+    echo "Results: ${RESULTS_DIR}"
+}
+
 snn_checkpoint() {  # snn_checkpoint SESSION_DIR
     echo "$1/${SNN_CHECKPOINT_SUBDIR:+${SNN_CHECKPOINT_SUBDIR}/}best_model_weights.pth"
 }
@@ -144,6 +182,7 @@ if [ -n "${RUN:-}" ] && [ "${#SESSION_IDS[@]}" -eq 0 ]; then
     exit 1
 fi
 if [ "${RUN:-}" = "--submit" ]; then
+    show_settings
     mkdir -p logs
     EXPORTS="ALL,EXPERIMENT=${EXPERIMENT},SUBJECT=${SUBJECT},DATA_ROOT=${DATA_ROOT},DECODERS=${DECODERS//,/:}"
     EXPORTS+=",TRAIN_DURATIONS=${TRAIN_DURATIONS//,/:},MACHINE=${MACHINE},SNN_CHECKPOINT_ROOT=${SNN_CHECKPOINT_ROOT}"
@@ -156,7 +195,6 @@ if [ "${RUN:-}" = "--submit" ]; then
         -J INFERENCE_REPORT -o logs/INFERENCE_REPORT_%j.out -e logs/INFERENCE_REPORT_%j.out \
         --export="${EXPORTS},MODE=report" "$0")
     echo "Submitted ${#SESSION_IDS[@]} session task(s) as job $ARRAY_ID and the report as job $REPORT_ID"
-    echo "Results: $RESULTS_DIR"
     exit 0
 fi
 
@@ -206,10 +244,7 @@ run_session() {  # run_session SESSION_ID
 # LOCAL: every session in series, then the report
 # --------------------------------------------------------------------------
 if [ "${RUN:-}" = "--local" ]; then
-    echo "DATA_ROOT=${DATA_ROOT}"
-    echo "SNN checkpoints: ${SNN_CHECKPOINT_ROOT}${SNN_CHECKPOINT_SUBDIR:+ (/<session>/${SNN_CHECKPOINT_SUBDIR})}"
-    [[ ",$DECODERS," == *,speck,* ]] && echo "Speck checkpoints: ${SPECK_CHECKPOINT_ROOT}${SPECK_CHECKPOINT_SUBDIR:+ (/<session>/${SPECK_CHECKPOINT_SUBDIR})}"
-    echo "Results: ${RESULTS_DIR}"
+    show_settings
     FAILED=()
     for i in "${!SESSION_IDS[@]}"; do
         echo "=== Session ${SESSION_IDS[$i]} ($(( i + 1 ))/${#SESSION_IDS[@]}), host $(hostname) ==="
@@ -224,6 +259,7 @@ fi
 # REPORT
 # --------------------------------------------------------------------------
 if [ "${MODE:-}" = "report" ]; then
+    [ -z "${SLURM_JOB_ID:-}" ] && show_settings
     run_report
     exit 0
 fi
