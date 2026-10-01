@@ -134,13 +134,14 @@ def compare_chip_output(chip, reference, decode, target, chip_pred, max_lag=5, w
         'smoothed_corr': _corr(decode.smooth(chip).ravel(), decode.smooth(reference).ravel()),
         'step_corr_lag0': lag_corr[0],
         'best_lag': int(best), 'step_corr_best_lag': lag_corr[best],
+        'step_corr_by_lag': {int(lag): c for lag, c in lag_corr.items()},
         'rmse_speck_same_rows': rmse(chip_pred[warmup:], target[warmup:]),
         'rmse_redecoded': rmse(decode(chip)[warmup:], target[warmup:]),
         'rmse_lag_corrected': rmse(decode(shifted)[warmup:], target[warmup:]),
     }
 
 
-def diagnose_session(session, checkpoint, snn_dataset_path, results_dir, experiment):
+def diagnose_session(session, checkpoint, snn_dataset_path, results_dir, experiment, max_lag=5):
     preds, target, counts, decode = decode_versions(checkpoint, snn_dataset_path, experiment)
     arrays_path = os.path.join(results_dir, 'sessions', f'{session}_arrays.npz')
     row, note = {}, None
@@ -161,7 +162,7 @@ def diagnose_session(session, checkpoint, snn_dataset_path, results_dir, experim
             if 'speck_counts' in saved:
                 row['chip_vs_quantized'] = compare_chip_output(
                     saved['speck_counts'].astype(float), counts['quantized'], decode, target,
-                    saved['pred_speck'])
+                    saved['pred_speck'], max_lag=max_lag)
     else:
         note = f'no {os.path.basename(arrays_path)}; scored on the SNN dataset, snn/speck left out'
     for version, p in preds.items():
@@ -192,7 +193,7 @@ def main(args):
         if not os.path.isfile(checkpoint):
             continue
         row, note = diagnose_session(session, checkpoint, os.path.join(dataset_root, session),
-                                     results_dir, args.experiment)
+                                     results_dir, args.experiment, args.max_lag)
         report['sessions'][session] = dict(row, note=note) if note else row
         print(f"{session:<20s}" + ''.join(f"{row[c]['rmse']:11.2f}" if c in row else f"{'-':>11s}"
                                           for c in COLUMNS) + (f"   ({note})" if note else ''))
@@ -241,5 +242,7 @@ if __name__ == '__main__':
     parser.add_argument('--results_dir', default=None,
                         help='Session results made with these checkpoints (default: results/test_all_decoders/...)')
     parser.add_argument('--sessions', nargs='*', default=None)
+    parser.add_argument('--max_lag', type=int, default=50,
+                        help='Largest chip output delay (in steps) searched for the best-lag correlation')
     parser.add_argument('--output', default=None)
     main(parser.parse_args())
