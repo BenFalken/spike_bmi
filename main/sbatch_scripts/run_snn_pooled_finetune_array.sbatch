@@ -18,7 +18,7 @@
 #   sbatch --export=ALL,EXPERIMENT=bmi,SUBJECT=indy --array=0 run_snn_pooled_finetune_array.sbatch
 #   sbatch --export=ALL,EXPERIMENT=bmi,SUBJECT=indy --array=1-$((N-1)) run_snn_pooled_finetune_array.sbatch
 #
-# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/full_cohort_finetuned_medium[_tau_syn_<T>]/<session>/
+# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/full_cohort_finetuned_medium[_tau_syn_<T>][_soft]/<session>/
 # Re-submitting skips finished sessions and resumes interrupted ones.
 
 set -eo pipefail

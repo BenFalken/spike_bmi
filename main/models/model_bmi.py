@@ -86,7 +86,7 @@ from sinabs.activation import (
 )
 from spikingjelly.activation_based import functional, neuron, surrogate
 
-from .init_utils import apply_weight_norm, initialize_snn_model
+from .init_utils import initialize_snn_model
 
 
 # ---------------------------------------------------------------------------

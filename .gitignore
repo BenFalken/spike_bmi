@@ -1,2 +1,6 @@
 __pycache__/
 *.py[cod]
+
+# Slurm job logs
+*.out
+*.err

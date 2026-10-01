@@ -22,7 +22,7 @@
 #   sbatch --export=ALL,EXPERIMENT=bmi,SUBJECT=indy,TAU_SYN=8.0 run_snn_pooled_pretrain.sbatch
 #   sbatch --export=ALL,EXPERIMENT=bmi,SUBJECT=indy,RESET_TYPE=soft run_snn_pooled_pretrain.sbatch
 #
-# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/full_cohort_pretrained_medium[_tau_syn_<T>]/
+# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/full_cohort_pretrained_medium[_tau_syn_<T>][_soft]/
 # Re-submitting skips a finished run and resumes an interrupted one.
 
 set -eo pipefail

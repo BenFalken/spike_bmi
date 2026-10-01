@@ -6,11 +6,9 @@ the speck_diagnosis.json each diagnose_speck.py run writes.
     a  mean RMSE as the network goes from PyTorch to quantized to the chip
     b  per session, the RMSE the chip adds to the quantized network
     c  per session, PyTorch RMSE against Speck RMSE
-    d  mean RMSE of the chip with its trained readout, and of readouts
-       re-fitted to the chip's and to the quantized network's spikes
 
 Only sessions with chip results (snn/speck scored on the same checkpoint)
-are used; panels b and d also need the chip's output spike counts.
+are used.
 
 Usage (no devkit needed):
     python compare_speck_runs.py \
@@ -41,8 +39,7 @@ def load_run(path):
     rows = [r for r in sessions.values() if 'speck' in r]
     out = {name: np.array([r[name]['rmse'] for r in rows]) for name, _ in STAGES}
     chip = [r['chip_vs_quantized'] for r in rows if 'chip_vs_quantized' in r]
-    for key in ('spike_ratio', 'rmse_speck_same_rows', 'rmse_refit_quantized', 'rmse_refit_speck'):
-        out[key] = np.array([c[key] for c in chip if key in c])
+    out['spike_ratio'] = np.array([c['spike_ratio'] for c in chip])
     out['gap'] = out['speck'] - out['quantized']
     return out
 
@@ -123,29 +120,6 @@ def scatter_panel(ax, runs):
     _style(ax, 'c  Per session: PyTorch vs. Speck', xlabel='PyTorch RMSE', ylabel='Speck RMSE')
 
 
-def refit_panel(ax, runs):
-    measures = [('rmse_speck_same_rows', 'Speck, trained readout', 'X'),
-                ('rmse_refit_speck', 'Speck, re-fitted readout', 'o'),
-                ('rmse_refit_quantized', 'Quantized, re-fitted readout', 'D')]
-    offsets = np.linspace(-0.22, 0.22, len(measures))
-    for i, ((label, run), color) in enumerate(zip(runs.items(), COLORS)):
-        if not len(run['rmse_refit_speck']):
-            continue
-        means = [run[k].mean() for k, _, _ in measures]
-        for off, mean, (_, _, marker) in zip(offsets, means, measures):
-            ax.scatter(i + off, mean, marker=marker, s=60, color=color, edgecolors='white', linewidths=1,
-                       zorder=2)
-            ax.annotate(f"{mean:.1f}", (i + off, mean), xytext=(0, 8), textcoords='offset points',
-                        ha='center', color=INK, fontsize=8)
-    for _, name, marker in measures:          # shape legend, in neutral ink
-        ax.scatter([], [], marker=marker, s=50, color=MUTED, label=name)
-    ax.legend(frameon=False, fontsize=8, loc='lower left', labelcolor=INK)
-    ax.set_xticks(range(len(runs)), list(runs))
-    ax.set_xlim(-0.6, len(runs) - 0.4)
-    ax.margins(y=0.25)
-    _style(ax, 'd  Readout re-fit (5-fold CV, after 200-step warm-up)', ylabel='Mean RMSE')
-
-
 def main(args):
     runs = {}
     for spec in args.run:
@@ -155,18 +129,17 @@ def main(args):
         raise SystemExit(f"at most {len(COLORS)} runs per figure")
 
     print(f"{'run':<20s}{'sessions':>9s}" + ''.join(f"{name:>11s}" for _, name in STAGES)
-          + f"{'chip adds':>11s}{'spk ratio':>11s}{'refit spk':>11s}{'refit qnt':>11s}")
+          + f"{'chip adds':>11s}{'spk ratio':>11s}")
     for label, run in runs.items():
         fmt = lambda k: f"{run[k].mean():11.2f}" if len(run[k]) else f"{'-':>11s}"
         print(f"{label:<20s}{len(run['speck']):9d}" + ''.join(fmt(s) for s, _ in STAGES)
-              + fmt('gap') + fmt('spike_ratio') + fmt('rmse_refit_speck') + fmt('rmse_refit_quantized'))
+              + fmt('gap') + fmt('spike_ratio'))
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    stage_panel(axes[0, 0], runs)
-    gap_panel(axes[0, 1], runs, np.random.default_rng(0))
-    scatter_panel(axes[1, 0], runs)
-    refit_panel(axes[1, 1], runs)
-    fig.tight_layout(h_pad=3, w_pad=3)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.8))
+    stage_panel(axes[0], runs)
+    gap_panel(axes[1], runs, np.random.default_rng(0))
+    scatter_panel(axes[2], runs)
+    fig.tight_layout(w_pad=3)
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     fig.savefig(args.output, dpi=args.dpi, facecolor='white')
     print(f"Saved {args.output}")
