@@ -48,6 +48,9 @@
 #   (--local and --report without DATA_ROOT use the data/ folder next to main/, if there is one)
 #   SPECK_WAIT_TIME=0.005 ...   seconds the chip gets per timestep before its output is read
 #   Only rebuild the report:  bash run_inference.sbatch --report bmi indy
+#   Only redraw the per-session figures and crosshair GIFs from the saved
+#   predictions (no evaluation, no chip, any checkpoints):
+#       bash run_inference.sbatch --figures bmi indy FIGURE_DECODERS=snn,speck
 
 set -eo pipefail
 
@@ -57,8 +60,12 @@ SETTINGS="DATA_ROOT VENV DECODERS TRAIN_DURATIONS MACHINE SNN_CHECKPOINT_ROOT SN
           SPECK_WAIT_TIME ENERGY_METER_NUM_THREADS"
 
 case "${1:-}" in
-    --submit|--local|--report)
-        [ "$1" = "--report" ] && MODE=report || RUN="$1"
+    --submit|--local|--report|--figures)
+        case "$1" in
+            --report) MODE=report ;;
+            --figures) MODE=figures ;;
+            *) RUN="$1" ;;
+        esac
         shift
         POSITIONAL=()
         for arg in "$@"; do
@@ -78,7 +85,7 @@ case "${1:-}" in
 esac
 if [ -z "${EXPERIMENT:-}" ] || { [ -z "${SUBJECT:-}" ] && [ -z "${RUN:-}" ]; }; then
     echo "Usage: bash $0 --submit|--local <experiment> [<subject>] [NAME=value ...]" >&2
-    echo "       bash $0 --report <experiment> <subject> [NAME=value ...]" >&2
+    echo "       bash $0 --report|--figures <experiment> <subject> [NAME=value ...]" >&2
     exit 1
 fi
 # Data root: $DATA_ROOT if set; outside Slurm (--local, --report), else the
@@ -153,7 +160,9 @@ RESULTS_DIR="${RESULTS_DIR:-${DATA_ROOT}/results/test_all_decoders/${EXPERIMENT}
 
 show_settings() {
     echo "DATA_ROOT=${DATA_ROOT}"
-    if [ "${MODE:-}" != "report" ]; then
+    if [ "${MODE:-}" = "figures" ]; then
+        echo "Figures (from saved predictions) for: ${FIGURE_DECODERS:-every decoder}"
+    elif [ "${MODE:-}" != "report" ]; then
         echo "SNN checkpoints: ${SNN_CHECKPOINT_ROOT}${SNN_CHECKPOINT_SUBDIR:+ (/<session>/${SNN_CHECKPOINT_SUBDIR})}"
         [[ ",$DECODERS," == *,speck,* ]] && echo "Speck checkpoints: ${SPECK_CHECKPOINT_ROOT}${SPECK_CHECKPOINT_SUBDIR:+ (/<session>/${SPECK_CHECKPOINT_SUBDIR})}"
         echo "Decoders: ${DECODERS}${FIGURES:+; figures for ${FIGURE_DECODERS:-every decoder}}"
@@ -252,6 +261,32 @@ if [ "${RUN:-}" = "--local" ]; then
     done
     [ "${#FAILED[@]}" -gt 0 ] && echo "Failed sessions (see above): ${FAILED[*]}"
     run_report
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# FIGURES: redraw every session's figures from its saved predictions
+# --------------------------------------------------------------------------
+if [ "${MODE:-}" = "figures" ]; then
+    show_settings
+    shopt -s nullglob
+    ARRAYS=("${RESULTS_DIR}"/sessions/*_arrays.npz)
+    if [ "${#ARRAYS[@]}" -eq 0 ]; then
+        echo "ERROR: no saved predictions (sessions/<session>_arrays.npz) under ${RESULTS_DIR}" >&2
+        exit 1
+    fi
+    FAILED=()
+    for arrays in "${ARRAYS[@]}"; do
+        session="$(basename "$arrays" _arrays.npz)"
+        python3 "$INFERENCE_DIR/test_all_decoders.py" --figures_only \
+            --experiment "$EXPERIMENT" --session "$session" \
+            --input_filepath "${DATASET_ROOT}/${session}_binning.h5" \
+            --model_dir "${MODEL_CACHE_ROOT}/${session}" \
+            --output "${RESULTS_DIR}/sessions/${session}.json" \
+            --figures_dir "${RESULTS_DIR}/figures/${session}" \
+            --figure_decoders "${FIGURE_DECODERS:-}" || FAILED+=("$session")
+    done
+    [ "${#FAILED[@]}" -gt 0 ] && { echo "Failed sessions (see above): ${FAILED[*]}"; exit 1; }
     exit 0
 fi
 

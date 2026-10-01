@@ -23,7 +23,8 @@ The file has three sections, each computed only where missing (or with
 The full-data predictions are also saved next to --output as
 <session>_arrays.npz, so --figures_dir can redraw the per-session figures
 (session_figures.py) without evaluating again, e.g. without the chip;
---figure_decoders limits them to some of the decoders.
+--figure_decoders limits them to some of the decoders, and --figures_only
+does nothing else.
 
 A session file made on the cluster can therefore be copied to the
 Speck-connected machine and completed there with --decoders ...,speck: its
@@ -130,6 +131,21 @@ def draw_figures(full, session, args):
     save_session_figures(full, session, args.figures_dir, decoders=decoders)
 
 
+def redraw_figures(args, session):
+    """--figures_only: draw the figures from the saved predictions, never evaluating."""
+    arrays_path = os.path.splitext(args.output)[0] + '_arrays.npz'
+    missing = [p for p in (args.output, arrays_path) if not os.path.exists(p)]
+    if missing or not args.figures_dir:
+        raise FileNotFoundError(f"--figures_only needs --figures_dir and saved results; missing: "
+                                f"{missing or ['--figures_dir']}")
+    full = _load_results(args.output).get('full')
+    if not full:
+        raise FileNotFoundError(f"{args.output} has no full-data results to draw")
+    print(f"=== {session}: figures from {arrays_path} "
+          f"(checkpoints {full.get('checkpoints') or 'not recorded'}) ===")
+    draw_figures(dict(full, arrays=load_arrays(arrays_path)), session, args)
+
+
 def main(args):
     decoders = [d.strip() for d in args.decoders.split(',') if d.strip()]
     unknown = set(decoders) - set(ALL_DECODERS)
@@ -137,6 +153,10 @@ def main(args):
         raise ValueError(f"Unknown decoder(s) {sorted(unknown)}; choose from {ALL_DECODERS}")
     duration_decoders = [d for d in decoders if d != 'speck']
     session = args.session or os.path.basename(args.input_filepath).replace('_binning.h5', '')
+
+    if args.figures_only:
+        redraw_figures(args, session)
+        return
 
     results = {}
     if os.path.exists(args.output) and not args.overwrite:
@@ -162,7 +182,11 @@ def main(args):
                     if d not in evaluated]
     changed = changed_checkpoints(results['full'], args, decoders) if 'full' in results else []
     if changed:
-        print(f"Re-running the full-data section: new checkpoint for {', '.join(changed)}")
+        current = snn_checkpoints(args.snn_checkpoint_path, args.speck_checkpoint_path)
+        print(f"Re-running the full-data section (every decoder): new checkpoint for {', '.join(changed)}")
+        for d in changed:
+            print(f"  {d}: results were made with {checkpoint_id(results['full']['checkpoints'][d])},"
+                  f" now {checkpoint_id(current[d])}")
         for d in changed:      # their profile on this machine was made with the old checkpoint
             results['profiles'].get(args.machine, {}).get('decoders', {}).pop(d, None)
     # The full-data predictions, kept so figures can be redrawn without re-evaluating.
@@ -245,6 +269,9 @@ def build_parser():
     io.add_argument('--figure_decoders', default='',
                     help='Comma-separated decoders to draw in those figures, in panel order, '
                          'e.g. snn,speck (default: every evaluated decoder)')
+    io.add_argument('--figures_only', action='store_true',
+                    help='Only redraw the --figures_dir figures from the saved <session>_arrays.npz '
+                         '(no evaluation, no profiling, no chip); fails if they are missing')
     io.add_argument('--overwrite', action='store_true', help='Recompute every section')
 
     ev = parser.add_argument_group('evaluation')
