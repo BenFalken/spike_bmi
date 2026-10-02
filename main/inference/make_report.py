@@ -8,6 +8,11 @@ Writes  {results_dir}/combined_metrics.json            {session: {decoder: metri
         {results_dir}/efficiency_summary.json          {machine: {decoder: means across sessions}}
         {results_dir}/decoder_efficiency.png, decoder_energy.png, decoder_comparison_4x2.png
 
+Training-duration results the session files lack (e.g. sessions evaluated on
+the Speck laptop, where durations are not run) are kept from the existing
+combined_metrics_durations.json, or from --durations_json (e.g. the cluster's
+copy), so a report never discards them; a session file's own durations win.
+
 Usage:
     python make_report.py --results_dir $BMI_DATA_ROOT/results/test_all_decoders/bmi/indy
 """
@@ -93,6 +98,22 @@ def efficiency_records(sessions):
     return records
 
 
+def merge_durations(from_sessions, path):
+    """from_sessions overlaid, per session and duration, on the {session:
+    {"Nmin": {decoder: metrics}}} file at path (if any)."""
+    if not path or not os.path.exists(path):
+        if path:
+            print(f"[durations] {path} not found; using the session files only")
+        return from_sessions
+    with open(path, 'r') as f:
+        saved = json.load(f)
+    merged = {s: dict(saved.get(s) or {}, **from_sessions.get(s, {})) for s in set(saved) | set(from_sessions)}
+    merged = {s: merged[s] for s in sorted(merged) if merged[s]}
+    kept = sum(len(d) for d in merged.values()) - sum(len(d) for d in from_sessions.values())
+    print(f"[durations] {kept} session-duration result(s) kept from {path}")
+    return merged
+
+
 def _write_json(obj, path):
     with open(path, 'w') as f:
         json.dump(obj, f, indent=2)
@@ -114,8 +135,10 @@ def main(args):
     durations = {s: {tag: r['metrics'] for tag, r in c.get('durations', {}).items() if r}
                  for s, c in sessions.items()}
     durations = {s: d for s, d in durations.items() if d}
+    durations_path = os.path.join(results_dir, 'combined_metrics_durations.json')
+    durations = merge_durations(durations, args.durations_json or durations_path)
     _write_json(combined, os.path.join(results_dir, 'combined_metrics.json'))
-    _write_json(durations, os.path.join(results_dir, 'combined_metrics_durations.json'))
+    _write_json(durations, durations_path)
 
     records = efficiency_records(sessions)
     summary = {}
@@ -137,7 +160,10 @@ def main(args):
         if fig is not None:
             _save_figure(fig, os.path.join(results_dir, 'decoder_energy.png'))
 
-    _save_figure(comparison_4x2_figure(combined, durations),
+    outside = sorted(set(durations) - set(sessions))
+    if outside:
+        print(f"[durations] kept in the file but left out of the figure (not in sessions/): {outside}")
+    _save_figure(comparison_4x2_figure(combined, {s: d for s, d in durations.items() if s in sessions}),
                  os.path.join(results_dir, 'decoder_comparison_4x2.png'))
 
 
@@ -146,6 +172,9 @@ if __name__ == '__main__':
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--results_dir', required=True,
                         help='Subject results directory containing sessions/')
+    parser.add_argument('--durations_json', default=None,
+                        help='combined_metrics_durations.json to take training-duration results from '
+                             'where the session files have none (default: the one in --results_dir)')
     parser.add_argument('--error_bars', action='store_true',
                         help='Draw 95%% CI error bars on the efficiency figure')
     main(parser.parse_args())

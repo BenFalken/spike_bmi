@@ -48,6 +48,8 @@
 #   (--local and --report without DATA_ROOT use the data/ folder next to main/, if there is one)
 #   SPECK_WAIT_TIME=0.005 ...   seconds the chip gets per timestep before its output is read
 #   Only rebuild the report:  bash run_inference.sbatch --report bmi indy
+#   (training-duration results missing from sessions/*.json are kept from the
+#   existing combined_metrics_durations.json, or taken from DURATIONS_JSON=...)
 #   Only redraw the per-session figures and crosshair GIFs from the saved
 #   predictions (no evaluation, no chip, any checkpoints):
 #       bash run_inference.sbatch --figures bmi indy FIGURE_DECODERS=snn,speck
@@ -57,7 +59,7 @@ set -eo pipefail
 # Settings this script reads from the environment (see the examples above).
 SETTINGS="DATA_ROOT VENV DECODERS TRAIN_DURATIONS MACHINE SNN_CHECKPOINT_ROOT SNN_CHECKPOINT_SUBDIR
           SPECK_CHECKPOINT_ROOT SPECK_CHECKPOINT_SUBDIR RESULTS_DIR FIGURES FIGURE_DECODERS
-          SPECK_WAIT_TIME ENERGY_METER_NUM_THREADS"
+          SPECK_WAIT_TIME ENERGY_METER_NUM_THREADS DURATIONS_JSON"
 
 case "${1:-}" in
     --submit|--local|--report|--figures)
@@ -197,7 +199,7 @@ if [ "${RUN:-}" = "--submit" ]; then
     EXPORTS+=",TRAIN_DURATIONS=${TRAIN_DURATIONS//,/:},MACHINE=${MACHINE},SNN_CHECKPOINT_ROOT=${SNN_CHECKPOINT_ROOT}"
     EXPORTS+=",SNN_CHECKPOINT_SUBDIR=${SNN_CHECKPOINT_SUBDIR},SPECK_CHECKPOINT_ROOT=${SPECK_CHECKPOINT_ROOT}"
     EXPORTS+=",SPECK_CHECKPOINT_SUBDIR=${SPECK_CHECKPOINT_SUBDIR},RESULTS_DIR=${RESULTS_DIR},FIGURES=${FIGURES:-}"
-    EXPORTS+=",FIGURE_DECODERS=${FIGURE_DECODERS//,/:}"
+    EXPORTS+=",FIGURE_DECODERS=${FIGURE_DECODERS//,/:},DURATIONS_JSON=${DURATIONS_JSON:-}"
     ARRAY_ID=$(sbatch --parsable --array=0-$(( ${#SESSION_IDS[@]} - 1 )) \
         --export="${EXPORTS},MODE=session" "$0")
     REPORT_ID=$(sbatch --parsable --dependency=afterany:"${ARRAY_ID%%;*}" --time=0:30:00 \
@@ -224,7 +226,8 @@ export MKL_NUM_THREADS=$OMP_NUM_THREADS
 INFERENCE_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}/../inference"
 
 run_report() {
-    python3 "$INFERENCE_DIR/make_report.py" --results_dir "$RESULTS_DIR"
+    python3 "$INFERENCE_DIR/make_report.py" --results_dir "$RESULTS_DIR" \
+        ${DURATIONS_JSON:+--durations_json "$DURATIONS_JSON"}
 }
 
 run_session() {  # run_session SESSION_ID
