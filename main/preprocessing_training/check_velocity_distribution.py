@@ -146,8 +146,8 @@ def main(args):
     hi_spread = np.ptp([r[1] for r in session_ranges.values()])
     print(f"  vx [0.5,99.5]pct lower bound varies by {lo_spread:.1f} across sessions")
     print(f"  vx [0.5,99.5]pct upper bound varies by {hi_spread:.1f} across sessions")
-    print(f"  (large spread here -> per-session bounds would use each session's dynamic "
-          f"range more fully; small spread -> global bounds cost little and add consistency)")
+    print("  (large spread here -> per-session bounds would use each session's dynamic "
+          "range more fully; small spread -> global bounds cost little and add consistency)")
 
     # --- Recommended scaling bounds (combined, both axes pooled together
     # so vx/vy share one scale -- change if the plot shows they shouldn't) ---

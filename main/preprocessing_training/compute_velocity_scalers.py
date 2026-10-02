@@ -49,7 +49,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from check_velocity_distribution import load_session_velocities, compute_scaling_bounds, summarize
+from check_velocity_distribution import load_session_velocities, compute_scaling_bounds
 
 
 def find_session_dirs(subject_dir):

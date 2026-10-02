@@ -33,7 +33,7 @@ across calls (reset_state=False, with a separate detach_states() to
 truncate BPTT) for a "continuous, never-reset stream" training mode;
 that mode was tried, found substantially worse in real comparative
 results, and removed along with the machinery that only existed to
-support it -- see train_bmi.py's own module docstring for the comparison.
+support it -- see train_snn.py's own module docstring for the comparison.
 (model_hkm.py, a separate fork of this file for HKM's own variable-
 length-trial evaluation needs, reintroduces an explicit, optional
 reset_state argument for a different, inference-time-only reason -- see
@@ -86,7 +86,7 @@ from sinabs.activation import (
 )
 from spikingjelly.activation_based import functional, neuron, surrogate
 
-from .init_utils import apply_weight_norm, initialize_snn_model
+from .init_utils import initialize_snn_model
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +444,7 @@ class SNN_Speck(nn.Module):
         # individual samples in a batch produce zero spikes in a given
         # axis at a given timestep (no accumulated population-vector
         # signal to decode). Computed as the exact algebraic inverse of
-        # train_bmi.py's unscale_velocity(): v = lo + (hi-lo)*(scaled-
+        # train_snn.py's unscale_velocity(): v = lo + (hi-lo)*(scaled-
         # margin)/(1-2*margin), solved for scaled at v=0. MUST be built
         # from the SAME velocity_lo/hi/margin the dataloader's forward
         # scaling and unscale_velocity() use, or "no spikes" stops
@@ -603,7 +603,7 @@ class SNN_Speck(nn.Module):
                     # potential combined with an aggressive learning rate)
                     # this has been observed to go negative, which would
                     # otherwise silently corrupt the spike-sparsity loss
-                    # term downstream (see train_bmi.py's
+                    # term downstream (see train_snn.py's
                     # spike_sparsity_lambda) into something that no longer
                     # means "average spikes per neuron per timestep" at
                     # all. --min-vmem should still be set (as it already
@@ -688,7 +688,7 @@ def create_model(
     """Factory function to create an SNN_Speck model.
 
     velocity_lo/hi/margin MUST match whatever the dataloader's forward
-    scaling and train_bmi.py's unscale_velocity() actually use -- see
+    scaling and train_snn.py's unscale_velocity() actually use -- see
     SNN_Speck.__init__()'s neutral_scaled_pred, computed from these three
     values as the exact inverse of unscale_velocity() at physical v=0.
 
@@ -746,14 +746,8 @@ def load_model_weights(model: SNN_Speck, state_dict: dict, neuron_type: str,
     correctly excluding sinabs' lazily-shaped STATE buffers (not learned
     parameters) rather than letting load_state_dict fail on them.
 
-    Extracted here, as a single shared function, after this exact
-    exclusion logic needed updating twice already in two separate,
-    independently-maintained call sites (test_all_decoders.py's and
-    snn_inference_utils.py's own load_snn_model()) -- a third,
-    independent copy (for train_bmi.py's --init-weights-from) would mean
-    a fourth future change needs to be made in three places instead of
-    one. Both of those callers should be migrated to call this function
-    too, rather than keep their own inline copies.
+    Shared by every checkpoint loader (inference's load_snn_model() and
+    train_snn.py's --init-weights-from).
 
     v_mem/i_syn are lazily shaped for EVERY neuron type (sinabs only
     gives them their real shape the first time forward() actually runs
@@ -771,20 +765,7 @@ def load_model_weights(model: SNN_Speck, state_dict: dict, neuron_type: str,
     architecture mismatch (a missing Linear.weight, an unexpected key)
     rather than silently loading a partially-wrong model.
     """
-    # BUG FIX: '.tau_syn' added to this list. Every caller of this function now builds its
-    # model with tau_syn=None (see load_snn_model()'s own tau_syn fix in this same file and
-    # in test_all_decoders.py -- this project's checkpoints are trained by
-    # train_bmi_no_tau_syn.py, which builds ITS OWN model with tau_syn=None regardless of the
-    # --tau-syn value recorded in train_args, and the chip cannot realize tau_syn as hardware
-    # dynamics regardless). A checkpoint whose state_dict happens to carry '.tau_syn' entries
-    # (this project's own checkpoints currently do not, per every checkpoint_provenance
-    # recorded during this project's own debugging -- n_tau_syn_keys_in_state_dict has been 0
-    # in every real session checked) would otherwise raise here as an "unexpected key", purely
-    # because the tau_syn=None model never constructs a tau_syn Parameter to receive it --
-    # not a real architecture mismatch. Filtered out for the same reason v_mem/i_syn are: a
-    # value this function's caller has already decided not to use, not something
-    # load_state_dict should ever see.
-    exclude_suffixes = ['.v_mem', '.neuron.v', '.i_syn', '.tau_syn']
+    exclude_suffixes = ['.v_mem', '.neuron.v', '.i_syn']
     filtered_state_dict = {k: v for k, v in state_dict.items()
                             if not any(k.endswith(suffix) for suffix in exclude_suffixes)}
     missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)

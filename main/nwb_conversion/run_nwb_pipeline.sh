@@ -44,7 +44,7 @@
 # disposable per-trial files (raw + ANN-windowed), matching this
 # project's own dataset/{experiment}/{subject}/mua/ and
 # snn_datasets/{experiment}/{subject}/mua/ conventions used everywhere
-# else (test_all_decoders.py, train_bmi.py, etc).
+# else (test_all_decoders.py, train_snn.py, etc).
 #
 # EXPERIMENT is hardcoded to "hkm" here specifically -- this script only
 # ever converts NWB data, which is always the hkm experiment (bmi's own
