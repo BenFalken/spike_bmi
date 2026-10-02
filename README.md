@@ -216,22 +216,6 @@ The chip adds more error the more a model relies on stored state:
 | fine-tuned | fewer spikes, longer-lived sub-threshold charge | 4.4 |
 | soft reset | every spike's remainder is kept | 8.2 |
 
-A model that carries charge forward also carries the chip's within-timestep errors forward,
-and they compound across layers. The training changes that improve the PyTorch decoder act
-through exactly the per-timestep dynamics the chip does not reproduce, so they do not survive
-deployment. Speck lands at 45.8–48 whichever model is deployed.
-
-**Conclusion.** The per-session, hard-reset checkpoints are the best case for Speck.
-- **Speck:** 45.8 RMSE.
-- **Same network in PyTorch:** 43.4, so within 2 RMSE.
-- **Best PyTorch SNN:** the fine-tuned model at 40.5, about 5 better.
-
-The remaining gap comes from the chip updating per event while training sums each timestep.
-It does not come from quantization, decoding, delay or the readout. Two directions could close it and were not pursued:
-- **Time bins short enough** that each neuron receives about one event per timestep, so that
-  per-timestep training matches per-event updates.
-- **Training through an event-by-event model** of the chip's neurons.
-
 ## Requirements
 
 Python 3.11 with numpy, scipy, scikit-learn, h5py, matplotlib, Pillow, PyTorch, sinabs
