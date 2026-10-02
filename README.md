@@ -53,6 +53,16 @@ it. Data live under one root (`BMI_DATA_ROOT` / `DATA_ROOT`), laid out as
    evaluates every decoder on every session (`inference/test_all_decoders.py`), then builds
    `combined_metrics*.json` and the efficiency, energy and 4x2 comparison figures
    (`inference/make_report.py`).
+   - **Overriding settings:** put them after the subject, e.g.
+     `... --local bmi indy SNN_CHECKPOINT_ROOT=... FIGURES=1`. A `NAME=value` typed on a
+     shell line of its own is not seen by the script. The script prints the paths it uses.
+   - **Rebuild only the report:** `--report bmi indy`. Training-duration results that the
+     session files lack are kept from the existing `combined_metrics_durations.json` (or taken
+     from `DURATIONS_JSON=...`), so cluster durations survive a laptop report.
+   - **Redraw only the per-session figures and crosshair GIFs:**
+     `--figures bmi indy FIGURE_DECODERS=snn,speck`. This draws from the saved predictions,
+     with no evaluation and no chip. The GIF grid is two panels wide (ground truth, one panel
+     per decoder, overlay).
 4. **Speck.** On the devkit-connected laptop, `bash sbatch_scripts/run_inference.sbatch --local bmi indy`
    runs the same evaluation in series with `speck` added. Copy the cluster's
    `sessions/*.json` in first to extend them. `inference/export_test_split.py` writes the
@@ -73,23 +83,82 @@ it. Data live under one root (`BMI_DATA_ROOT` / `DATA_ROOT`), laid out as
 
 ## Findings
 
-### Decoders (indy, 36 sessions, fine-tuned SNN with hard reset, Speck-connected laptop)
+### Decoders (indy, 36 sessions)
 
-| decoder | RMSE | latency / sample | parameters | energy / sample |
+- **PyTorch SNN:** `full_cohort_finetuned_optimal` checkpoints (pretrained on all sessions,
+  fine-tuned per session).
+- **Speck:** per-session hard-reset checkpoints, the best case for the chip (see below).
+- **Where it ran:** everything on the Speck-connected laptop. Training durations come from
+  the cluster.
+
+![Decoder comparison, indy](docs/decoder_comparison_4x2_indy.jpg)
+
+| decoder | RMSE | CC | latency / sample | energy / sample |
 |---|---|---|---|---|
-| KF | 60.52 | 0.010 ms | 9,864 | 434 µJ (RAPL) |
-| WF | 48.03 | 0.050 ms | 2,882 | 1,872 µJ (RAPL) |
-| LSTM | 39.48 | 34.8 ms | 238,002 | 1.19 J (RAPL) |
-| QRNN | **37.62** | 35.2 ms | 232,402 | 1.20 J (RAPL) |
-| SNN (PyTorch, CPU) | 39.96 | 0.41 ms | 61,959 | 14,826 µJ (RAPL) |
-| SNN on Speck2f | 45.36 | 1.27 ms | 61,952 | **2.66 µJ** (chip power monitor) |
+| KF | 60.5 | 0.69 | 0.010 ms | ≈ 500 µJ (RAPL) |
+| WF | 48.0 | 0.72 | 0.05 ms | ≈ 2,000 µJ (RAPL) |
+| LSTM | 39.5 | 0.82 | ≈ 35 ms | ≈ 1.2 J (RAPL) |
+| QRNN | 37.6 | 0.83 | ≈ 35 ms | ≈ 1.2 J (RAPL) |
+| SNN (PyTorch, CPU) | **36.0** | **0.84** | ≈ 0.65 ms | ≈ 24,000 µJ (RAPL) |
+| SNN on Speck2f | 45.1 | 0.75 | ≈ 1.3 ms | **2.7 µJ** (chip power monitor) |
 
-- **Accuracy.** In PyTorch the SNN is as accurate as the LSTM and within 2.5 RMSE of the QRNN.
-- **Energy.** On Speck it uses about 5,000× less energy per sample than the SNN on the laptop
-  CPU, and about 450,000× less than the recurrent networks.
-- **Cost.** About 5 RMSE of accuracy.
-- **Measurement caveat.** RAPL measures the whole CPU package, while the chip's power monitor
-  measures only the chip, so the energy ratios compare deployments, not arithmetic.
+These are means across sessions, rounded. The exact values are in
+`results/test_all_decoders/bmi/indy/` (`combined_metrics.json`, `efficiency_summary.json`).
+
+**How to read the 4x2 figure**
+- **a/b:** one point per session. The box spans the quartiles, the line is the median, the
+  white dot is the mean, and the whiskers reach 1.5 × the box height.
+- **Stars in a/b:** a paired Wilcoxon signed-rank test against the best decoder, corrected
+  for multiple comparisons (Holm).
+- **c/d, colour:** how often the row decoder beats the column decoder across sessions.
+- **c/d, text:** the median paired difference (row − column), with Holm-corrected stars.
+
+**Takeaways**
+- **Accuracy.** The fine-tuned SNN is the most accurate decoder on both RMSE and CC.
+  - It beats QRNN by a median 1.5 RMSE and 0.011 CC per session (RMSE p < 0.001, CC p < 0.01).
+  - It beats LSTM by 3.4 RMSE and 0.025 CC.
+  - The margins over the recurrent networks are small but consistent: the SNN wins in
+    most sessions.
+- **Speck.** The chip is 8.5 RMSE (0.08 CC) behind the fine-tuned SNN, but it still
+  beats both classical decoders in paired comparisons.
+  - Against WF: 2.6 RMSE better, 0.037 CC better.
+  - Against KF: 16 RMSE better.
+  - About 2 RMSE of the gap is the chip's own penalty: the same per-session checkpoints
+    score about 43.4 in PyTorch.
+  - The rest is the choice of model. The fine-tuned checkpoints lose more on the chip than
+    they gain (see below).
+- **Energy.** Speck needs about 2.7 µJ per sample.
+  - That is about 9,000× less than the SNN on the laptop CPU.
+  - It is about 450,000× less than LSTM/QRNN.
+  - It is about 180× less than even the Kalman filter.
+  - RAPL measures the whole CPU package and the chip monitor only the chip, so these ratios
+    compare deployments, not arithmetic.
+- **Latency.** Speck takes about 1.3 ms per 4 ms bin, so it keeps up in real time. The SNN
+  on CPU takes about 0.65 ms, LSTM/QRNN about 35 ms (slower than the 4 ms bins they decode).
+- **Training data (e/f; KF, WF, LSTM, QRNN only).**
+  - Every decoder improves with more training data, most steeply in the first 2–3 minutes.
+  - LSTM and QRNN trained on 2 minutes already match WF trained on 10.
+  - Their CC levels off after about 5–7 minutes.
+  - KF and WF CC falls after 7 minutes, and the CIs widen there. Probably fewer sessions
+    have that much training data; this was not checked.
+- **Over time (g/h).** No decoder degrades across about 300 days after implantation, and
+  the ranking stays the same from session to session.
+  - The day-19 session is poor for every decoder (CC about 0.2), and day 84 dips too.
+  - Since all decoders dip together, those sessions point to the recordings, not the
+    decoders.
+
+| accuracy vs. latency (marker area ~ parameter count) | energy per sample |
+|---|---|
+| ![Accuracy vs. latency](docs/decoder_efficiency_indy.png) | ![Energy per sample](docs/decoder_energy_indy.png) |
+
+**Bottom line.**
+- **Off-chip:** the pretrained and fine-tuned SNN is the most accurate decoder tested. It
+  is also 50× faster than the recurrent networks and uses 50× less energy than them on the
+  same CPU.
+- **On Speck:** the SNN decodes in real time at a few µJ per sample. It beats the
+  classical decoders, at a cost of about 9 RMSE relative to the best PyTorch SNN.
+- **What limits Speck:** the chip's per-event dynamics (below), not quantization or the
+  readout.
 
 ### Where Speck loses accuracy
 
