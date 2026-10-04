@@ -237,6 +237,23 @@ def run_epoch(model, loader, criterion, device, scale, loss_eps, optimizer=None,
     return metrics["loss"], metrics
 
 
+def n_trials_for_minutes(dataset, minutes, first_trial_timesteps):
+    """Number of leading training trials that make up `minutes` of data.
+
+    Fixed-length trials (bmi) use the first trial's length; whole-trial
+    datasets (hkm) have variable lengths, so their actual lengths are summed
+    and the first trial reaching the target is included."""
+    target_timesteps = minutes * 60000.0 / STEP_MS
+    if dataset.experiment != "hkm":
+        return int(round(target_timesteps / first_trial_timesteps))
+    total = 0
+    for i in range(len(dataset)):
+        total += dataset.trial_length(i)
+        if total >= target_timesteps:
+            return i + 1
+    return len(dataset)
+
+
 def build_loaders(args, experiment, subject):
     """Train/test loaders. The test loader never drops trials; it batches
     whole test trials only when they all have the same length."""
@@ -245,9 +262,9 @@ def build_loaders(args, experiment, subject):
         shuffle_train=True, experiment=experiment, subject=subject)
 
     trial_timesteps = train_loader.dataset[0][1].shape[0]
-    print(f"Train trial length: {trial_timesteps} timesteps ({trial_timesteps * STEP_MS:.0f} ms)")
+    print(f"First train trial length: {trial_timesteps} timesteps ({trial_timesteps * STEP_MS:.0f} ms)")
     if args.train_data_min is not None:
-        n_trials = int(round(args.train_data_min * 60000.0 / (trial_timesteps * STEP_MS)))
+        n_trials = n_trials_for_minutes(train_loader.dataset, args.train_data_min, trial_timesteps)
         subset = Subset(train_loader.dataset, range(min(n_trials, len(train_loader.dataset))))
         train_loader = DataLoader(subset, batch_size=train_loader.batch_size, shuffle=False,
                                   num_workers=train_loader.num_workers,

@@ -49,6 +49,12 @@ it. Data live under one root (`BMI_DATA_ROOT` / `DATA_ROOT`), laid out as
      pretrain the "medium" network (256 → 128) on all sessions of a subject, then
      fine-tune it per session. `RESET_TYPE=hard|soft` and `TAU_SYN` select the variant
      (`snn_medium_config.sh`).
+   - `run_snn_hkm_array.sbatch`: the HKM version. It trains a series of models on every
+     session of every HKM subject from the whole-trial datasets
+     (`snn_datasets/hkm/<subject>/mua/<session>`, written by `nwb_conversion/`). Trials have
+     different lengths, so it uses `--batch-size 1`: one trial per step. HKM entries in
+     `velocity_scalers.json` are required first (`compute_velocity_scalers.py --experiments bmi hkm`).
+     Run `--plan` first, then submit the printed command.
 3. **Inference and report.** `bash sbatch_scripts/run_inference.sbatch --submit bmi indy`
    evaluates every decoder on every session (`inference/test_all_decoders.py`), then builds
    `combined_metrics*.json` and the efficiency, energy and 4x2 comparison figures

@@ -97,6 +97,11 @@ class CustomDataset(Dataset):
     def __len__(self) -> int:
         return len(self.files)
 
+    def trial_length(self, idx: int) -> int:
+        """Timesteps in trial idx, without scaling its velocity."""
+        with open(os.path.join(self.split_dir, self.files[idx]), 'rb') as f:
+            return pkl.load(f)['input_spikes'].shape[1]
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with open(os.path.join(self.split_dir, self.files[idx]), 'rb') as f:
             data = pkl.load(f)
@@ -115,6 +120,10 @@ def _natural_key(name: str):
 
 def collate_fn(batch: list) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     labels, spikes, velocity = zip(*batch)
+    lengths = {s.shape[0] for s in spikes}
+    if len(lengths) > 1:
+        raise ValueError(f"Cannot batch trials of different lengths ({sorted(lengths)[:5]}...). "
+                         f"Whole-trial datasets (hkm) need --batch-size 1.")
     return torch.stack(labels), torch.stack(spikes), torch.stack(velocity)
 
 
