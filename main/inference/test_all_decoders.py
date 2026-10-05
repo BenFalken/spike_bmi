@@ -203,9 +203,7 @@ def main(args):
     if not (todo_full or todo_durations or todo_profile):
         if args.figures_dir:
             draw_figures(dict(results['full'], arrays=load_arrays(arrays_path)), session, args)
-        no_model = [d for d in decoders if d not in evaluated]
-        print(f"[skip] {session}: {args.output} is complete"
-              + (f" (no model for: {', '.join(no_model)})" if no_model else ""))
+        print(f"[skip] {session}: {args.output} is complete")
         return
 
     print(f"=== {session} ===")

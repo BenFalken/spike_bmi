@@ -199,20 +199,6 @@ if [ -n "${RUN:-}" ] && [ "${#SESSION_IDS[@]}" -eq 0 ]; then
     echo "ERROR: no $(snn_checkpoint '<session>') under $SNN_CHECKPOINT_ROOT" >&2
     exit 1
 fi
-# 'speck' is dropped from a session without its checkpoint, so say which ones.
-if [ -n "${RUN:-}" ] && [[ ",$DECODERS," == *,speck,* ]]; then
-    NO_SPECK=()
-    for s in "${SESSION_IDS[@]}"; do
-        [ -f "$(speck_checkpoint "$s")" ] || NO_SPECK+=("$s")
-    done
-    if [ "${#NO_SPECK[@]}" -eq "${#SESSION_IDS[@]}" ]; then
-        echo "ERROR: 'speck' requested but no session has $(speck_checkpoint '<session>')" >&2
-        echo "       (set SPECK_CHECKPOINT_ROOT / SPECK_CHECKPOINT_SUBDIR, or leave speck out of DECODERS)" >&2
-        exit 1
-    elif [ "${#NO_SPECK[@]}" -gt 0 ]; then
-        echo "WARNING: no $(speck_checkpoint '<session>') for ${#NO_SPECK[@]} session(s), run without 'speck': ${NO_SPECK[*]}" >&2
-    fi
-fi
 if [ "${RUN:-}" = "--submit" ]; then
     show_settings
     mkdir -p logs
