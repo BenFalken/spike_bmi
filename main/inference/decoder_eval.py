@@ -440,9 +440,14 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
                 model, scale, cfg.snn_dataset_path, cfg.experiment, cfg.continuous_snn_test_stream)
         else:
             print(f"  Evaluating SNN on Speck ({label}): {path}")
-            snn_preds['speck'], chip, speck_counts = predict_speck_test_set(model, checkpoint, scale, cfg)
+            try:
+                snn_preds['speck'], chip, speck_counts = predict_speck_test_set(model, checkpoint, scale, cfg)
+            except Exception as e:   # e.g. no devkit: keep the other decoders' results
+                print(f"  [skip] speck ({label}): {type(e).__name__}: {e}")
+                missing.append('speck')
+                continue
             op_estimates['speck'] = None
-    if found:
+    if snn_preds:
         # Both run the same trials (whichever checkpoint), so they share one
         # alignment. Intersect their rows with the ANN decoders' range.
         snn_start = calibrate_snn_ann_offset(cfg.snn_dataset_path, data['y_test_vel'])

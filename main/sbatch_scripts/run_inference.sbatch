@@ -90,6 +90,13 @@ if [ -z "${EXPERIMENT:-}" ] || { [ -z "${SUBJECT:-}" ] && [ -z "${RUN:-}" ]; }; 
     echo "       bash $0 --report|--figures <experiment> <subject> [NAME=value ...]" >&2
     exit 1
 fi
+# Without a mode flag the script is one Slurm array task (MODE=session, set by
+# --submit); outside Slurm that would quietly run only the first session.
+if [ -z "${RUN:-}" ] && [ -z "${MODE:-}" ] && [ -z "${SLURM_JOB_ID:-}" ]; then
+    echo "ERROR: no mode given. To run every session here: bash $0 --local ${EXPERIMENT} ${SUBJECT:-} [NAME=value ...]" >&2
+    echo "       (or --submit for Slurm, --report / --figures for the report or figures only)" >&2
+    exit 1
+fi
 # Data root: $DATA_ROOT if set; outside Slurm (--local, --report), else the
 # data/ folder next to main/ (repo/main/../data) when it exists; else the
 # cluster scratch directory.
