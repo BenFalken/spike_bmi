@@ -74,6 +74,36 @@ def average_cc(entry):
 # Efficiency and energy
 # --------------------------------------------------------------------------- #
 
+def _label_markers(ax, records, sizes, height=24, width=70):
+    """Name (bold) over latency, right of each marker; labels that would
+    overlap a neighbour's (within `width` points across) are pushed apart
+    vertically, with a thin leader line to their marker."""
+    ax.get_xlim(), ax.get_ylim()                        # settle autoscaling so transData is final
+    points_per_px = 72 / ax.figure.dpi
+    anchors = [ax.transData.transform((r['latency_s'] * 1000, r['rmse'])) * points_per_px for r in records]
+    radii = [np.sqrt(size / np.pi) for size in sizes]
+    label_y = [a[1] for a in anchors]
+    for _ in range(50):                                 # settle overlaps, lowest label first
+        moved = False
+        order = np.argsort(label_y)
+        for k, i in enumerate(order):
+            for j in order[k + 1:]:
+                gap = label_y[j] - label_y[i]
+                if abs((anchors[i][0] + radii[i]) - (anchors[j][0] + radii[j])) < width and gap < height:
+                    shift = (height - gap) / 2
+                    label_y[i], label_y[j] = label_y[i] - shift, label_y[j] + shift
+                    moved = True
+        if not moved:
+            break
+    for rec, anchor, radius, ly in zip(records, anchors, radii, label_y):
+        x, y, dy = rec['latency_s'] * 1000, rec['rmse'], ly - anchor[1]
+        leader = dict(arrowstyle='-', color='0.5', lw=0.6, shrinkA=0, shrinkB=radius) if abs(dy) > 2 else None
+        ax.annotate(display_label(rec['name']), (x, y), textcoords='offset points', xytext=(radius + 4, dy + 1),
+                    ha='left', va='bottom', fontsize=9, fontweight='bold', arrowprops=leader)
+        ax.annotate(format_si(rec['latency_s'], 's'), (x, y), textcoords='offset points',
+                    xytext=(radius + 4, dy - 1), ha='left', va='top', fontsize=8)
+
+
 def efficiency_panel(ax, records, colors=EFFICIENCY_COLORS, error_bars=False):
     """RMSE vs. latency (log x); records have name, rmse, latency_s,
     param_count, and (for error_bars) rmse_lo/hi, latency_lo/hi."""
@@ -84,11 +114,6 @@ def efficiency_panel(ax, records, colors=EFFICIENCY_COLORS, error_bars=False):
         x, y = rec['latency_s'] * 1000, rec['rmse']
         ax.scatter(x, y, s=size, color=colors.get(rec['name'], 'gray'), edgecolor='black',
                    linewidth=0.8, alpha=0.85, zorder=3, hatch=HATCHES.get(rec['name']))
-        radius = np.sqrt(size / np.pi)                   # marker radius in points
-        ax.annotate(display_label(rec['name']), (x, y), textcoords='offset points', xytext=(0, radius + 4),
-                    ha='center', va='bottom', fontsize=9, fontweight='bold')
-        ax.annotate(format_si(rec['latency_s'], 's'), (x, y), textcoords='offset points',
-                    xytext=(0, -radius - 4), ha='center', va='top', fontsize=8)
         if error_bars:
             xerr = [[max(0, x - rec['latency_lo'] * 1000)], [max(0, rec['latency_hi'] * 1000 - x)]]
             yerr = [[max(0, y - rec['rmse_lo'])], [max(0, rec['rmse_hi'] - y)]]
@@ -98,7 +123,8 @@ def efficiency_panel(ax, records, colors=EFFICIENCY_COLORS, error_bars=False):
     ax.set_xlabel('Per-sample inference latency (ms, log scale)')
     ax.set_ylabel('Mean RMSE (across sessions)')
     ax.grid(True, which='both', linestyle=':', alpha=0.4)
-    ax.margins(y=0.18)
+    ax.margins(x=0.12, y=0.18)                         # room for the labels right of the markers
+    _label_markers(ax, records, sizes)
     handles = [ax.scatter([], [], s=60 + 900 * np.sqrt(f), color='gray', edgecolor='black', alpha=0.6,
                           label=f'{int(f * max_params):,} params') for f in (0.1, 0.5, 1.0)]
     ax.legend(handles=handles, title='Parameter count (rough scale)', loc='upper center',
