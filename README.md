@@ -76,6 +76,11 @@ it. Data live under one root (`BMI_DATA_ROOT` / `DATA_ROOT`), laid out as
      the chip's output spikes with the quantized network's step by step: spike ratio,
      agreement, delay, re-decoding and a cross-validated readout re-fit. It writes
      `speck_diagnosis.json`.
+   - It also draws the layer-activity figure, `speck_layer_activity_<session>.png`, and the
+     same data animated as `speck_layer_activity_<session>.gif` (see
+     [How the figures were made](#how-the-figures-were-made)). With
+     `--speck_devkit speck2fdevkit:0` the Speck half is recorded on the chip; without it,
+     the quantized network is emulated on the host.
    - `probe_speck.py` (with the devkit) measures how a single chip neuron integrates and
      fires.
    - `compare_speck_runs.py` draws the figure below from up to three
@@ -85,25 +90,28 @@ it. Data live under one root (`BMI_DATA_ROOT` / `DATA_ROOT`), laid out as
 
 ### Decoders (indy, 36 sessions)
 
-- **PyTorch SNN:** `full_cohort_finetuned_optimal` checkpoints (pretrained on all sessions,
-  fine-tuned per session).
+- **PyTorch SNN:** `loso_finetuned_optimal` checkpoints (pretrained, then fine-tuned per
+  session).
 - **Speck:** per-session hard-reset checkpoints, the best case for the chip (see below).
 - **Where it ran:** everything on the Speck-connected laptop. Training durations come from
   the cluster.
 
 ![Decoder comparison, indy](docs/decoder_comparison_4x2_indy.jpg)
 
-| decoder | RMSE | CC | latency / sample | energy / sample |
-|---|---|---|---|---|
-| KF | 60.5 | 0.69 | 0.010 ms | ≈ 500 µJ (RAPL) |
-| WF | 48.0 | 0.72 | 0.05 ms | ≈ 2,000 µJ (RAPL) |
-| LSTM | 39.5 | 0.82 | ≈ 35 ms | ≈ 1.2 J (RAPL) |
-| QRNN | 37.6 | 0.83 | ≈ 35 ms | ≈ 1.2 J (RAPL) |
-| SNN (PyTorch, CPU) | **36.0** | **0.84** | ≈ 0.65 ms | ≈ 24,000 µJ (RAPL) |
-| SNN on Speck2f | 45.1 | 0.75 | ≈ 1.3 ms | **2.7 µJ** (chip power monitor) |
+| decoder | RMSE | CC | latency / sample | energy / sample | mean power |
+|---|---|---|---|---|---|
+| KF | 60.5 | 0.69 | 10.4 µs | 490 µJ (RAPL) | 45.9 W |
+| WF | 48.2 | 0.72 | 50.9 µs | 2.19 mJ (RAPL) | 42.9 W |
+| LSTM | 39.5 | 0.82 | 35.2 ms | 1.23 J (RAPL) | 34.7 W |
+| QRNN | 37.6 | 0.83 | 35.7 ms | 1.24 J (RAPL) | 34.8 W |
+| SNN (PyTorch, CPU) | **36.2** | **0.85** | 634 µs | 24 mJ (RAPL) | 37.8 W |
+| SNN on Speck2f | 45.3 | 0.75 | 1.27 ms | **2.73 µJ** (chip power monitor) | **2.15 mW** |
 
-These are means across sessions, rounded. The exact values are in
+These are means across sessions; RMSE and CC are rounded. The exact values are in
 `results/test_all_decoders/bmi/indy/` (`combined_metrics.json`, `efficiency_summary.json`).
+Energy per sample = mean power × latency per sample (see
+[How the figures were made](#how-the-figures-were-made)): the CPU decoders all draw
+35–46 W, so their energy differs mainly through their latency.
 
 **How to read the 4x2 figure**
 - **a/b:** one point per session. The box spans the quartiles, the line is the median, the
@@ -112,29 +120,34 @@ These are means across sessions, rounded. The exact values are in
   for multiple comparisons (Holm).
 - **c/d, colour:** how often the row decoder beats the column decoder across sessions.
 - **c/d, text:** the median paired difference (row − column), with Holm-corrected stars.
+- **e/f** are empty in this version: the laptop run did not carry over the cluster's
+  training-duration results. The training-data takeaways below are from the earlier report;
+  `run_inference.sbatch --report bmi indy DURATIONS_JSON=<cluster combined_metrics_durations.json>`
+  restores the panels.
 
 **Takeaways**
 - **Accuracy.** The fine-tuned SNN is the most accurate decoder on both RMSE and CC.
-  - It beats QRNN by a median 1.5 RMSE and 0.011 CC per session (RMSE p < 0.001, CC p < 0.01).
-  - It beats LSTM by 3.4 RMSE and 0.025 CC.
+  - It beats QRNN by a median 1.2 RMSE and 0.008 CC per session (RMSE p < 0.001, CC p < 0.01).
+  - It beats LSTM by 3.1 RMSE and 0.021 CC.
   - The margins over the recurrent networks are small but consistent: the SNN wins in
     most sessions.
-- **Speck.** The chip is 8.5 RMSE (0.08 CC) behind the fine-tuned SNN, but it still
-  beats both classical decoders in paired comparisons.
-  - Against WF: 2.6 RMSE better, 0.037 CC better.
-  - Against KF: 16 RMSE better.
+- **Speck.** The chip is a median 9.2 RMSE (0.08 CC) behind the fine-tuned SNN, but it
+  still beats both classical decoders in paired comparisons.
+  - Against WF: 2.5 RMSE better, 0.034 CC better.
+  - Against KF: 15 RMSE better, 0.067 CC better.
   - About 2 RMSE of the gap is the chip's own penalty: the same per-session checkpoints
     score about 43.4 in PyTorch.
   - The rest is the choice of model. The fine-tuned checkpoints lose more on the chip than
     they gain (see below).
-- **Energy.** Speck needs about 2.7 µJ per sample.
+- **Energy.** Speck needs 2.73 µJ per sample, at a mean chip power of 2.15 mW.
   - That is about 9,000× less than the SNN on the laptop CPU.
   - It is about 450,000× less than LSTM/QRNN.
   - It is about 180× less than even the Kalman filter.
   - RAPL measures the whole CPU package and the chip monitor only the chip, so these ratios
     compare deployments, not arithmetic.
-- **Latency.** Speck takes about 1.3 ms per 4 ms bin, so it keeps up in real time. The SNN
-  on CPU takes about 0.65 ms, LSTM/QRNN about 35 ms (slower than the 4 ms bins they decode).
+- **Latency.** Speck takes 1.27 ms per 4 ms bin, so it keeps up in real time; about 1 ms of
+  that is the fixed wait before its output is read (`--speck_wait_time`). The SNN on CPU
+  takes 0.63 ms, LSTM/QRNN about 35 ms (slower than the 4 ms bins they decode).
 - **Training data (e/f; KF, WF, LSTM, QRNN only).**
   - Every decoder improves with more training data, most steeply in the first 2–3 minutes.
   - LSTM and QRNN trained on 2 minutes already match WF trained on 10.
@@ -153,8 +166,8 @@ These are means across sessions, rounded. The exact values are in
 
 **Bottom line.**
 - **Off-chip:** the pretrained and fine-tuned SNN is the most accurate decoder tested. It
-  is also 50× faster than the recurrent networks and uses 50× less energy than them on the
-  same CPU.
+  is also about 55× faster than the recurrent networks and uses about 50× less energy than
+  them on the same CPU.
 - **On Speck:** the SNN decodes in real time at a few µJ per sample. It beats the
   classical decoders, at a cost of about 9 RMSE relative to the best PyTorch SNN.
 - **What limits Speck:** the chip's per-event dynamics (below), not quantization or the
@@ -215,6 +228,112 @@ The chip adds more error the more a model relies on stored state:
 | per-session | each spike wipes the membrane | 1.9 |
 | fine-tuned | fewer spikes, longer-lived sub-threshold charge | 4.4 |
 | soft reset | every spike's remainder is kept | 8.2 |
+
+### Spike density through the layers
+
+One test trial (3 s) of one session, through the per-session Speck checkpoint (96 inputs →
+256 → 128 → 64 → 36 outputs), in PyTorch (top) and recorded on the chip with every layer
+monitored (bottom). Colour is spike density, the mean over a layer's neurons of spikes per
+timestep, in 20 ms bins; each layer's mean over the trial is printed on the right.
+`speck_layer_activity_<session>.gif` animates the same data, the layers drawn left to right.
+
+![Spike density by layer, PyTorch vs. Speck](docs/speck_layer_activity_indy.png)
+
+| layer | PyTorch | Speck | Speck / PyTorch |
+|---|---|---|---|
+| input (96) | 0.054 | 0.054 | 1.0× |
+| hidden 1 (256) | 0.035 | 0.041 | 1.2× |
+| hidden 2 (128) | 0.056 | 0.078 | 1.4× |
+| hidden 3 (64) | 0.087 | 0.146 | 1.7× |
+| output (36) | 0.232 | 0.459 | 2.0× |
+
+- **The chip's excess activity builds up layer by layer.** With identical input, the first
+  hidden layer fires 1.2× as much as in PyTorch and the output 2×. That matches the
+  output-spike ratio in the table above (1.9× for the per-session run). It fits the per-event
+  dynamics described there: each layer adds a little extra firing, and the next layer
+  amplifies it.
+- **The chip's spikes arrive in bursts.** In the chip rows, every hidden and output layer
+  is silent together for one or two 20 ms bins at a time, while the input keeps arriving.
+  This was not investigated further. Because all layers drop out together, it most likely
+  reflects how the monitored events reach the host (they are counted in the timestep in
+  which they are read), not the network itself. Monitoring every layer streams all of their
+  spikes to the host, which the normal decoding run does not do.
+
+## How the figures were made
+
+Every decoder is scored on the same rows of each session's chronological test split (the
+last 10% of the session), with velocity in mm/s. The report figures are drawn by
+`inference/make_report.py` from the per-session results of `inference/test_all_decoders.py`;
+the layer-activity figure by `inference/diagnose_speck.py`.
+
+**Accuracy (4x2 figure, a–d, g–h)**
+- **RMSE:** per velocity axis over all test rows of a session, then averaged over x and y.
+- **CC:** Pearson correlation per axis, averaged over x and y.
+- **Error bars in g/h:** a 95% t-interval over 10 contiguous chunks of the test split.
+- **Statistics:** paired Wilcoxon signed-rank tests across sessions, Holm-corrected within
+  each panel. Only sessions with results for every decoder are used.
+
+**Latency** (`inference/profiling.py`; `inference/speck.py` for Speck)
+- **One prediction per call, never batched,** as a real-time decoder runs: one new 4 ms
+  sample at a time, so per-call framework overhead counts.
+- **CPU decoders:** 50 test samples (`--n_timing_samples`) are predicted one per call. After
+  untimed warm-up passes (Keras traces its graph on the first call), latency is the median
+  over 3 timed passes (2 for LSTM, QRNN and SNN) of the pass time divided by the number of
+  samples.
+- **SNN (PyTorch):** fed one timestep per forward call, with state reset only at the start
+  of a test trial.
+- **Speck:** wall time per timestep of the chip loop over the whole test split. Each step
+  writes that step's input spikes to the chip as events, waits `--speck_wait_time` (1 ms),
+  then reads the output layer's spikes. The wait is part of the latency.
+- **Threads:** math libraries are pinned to one thread on the laptop
+  (`ENERGY_METER_NUM_THREADS=1`), so the CPU decoders are timed on one core.
+- **Efficiency figure:** means across sessions, one panel per machine (here, everything ran
+  on the Speck laptop). Marker area grows with the square root of the parameter count.
+
+**Energy and power** (`inference/energy_meter.py`; `inference/speck.py` for Speck)
+- **CPU decoders, RAPL (measured):** a separate, longer block of 10 passes
+  (`--n_energy_repeats`) runs between two reads of the Intel RAPL energy counters of the CPU
+  package domains (`/sys/class/powercap/intel-rapl/intel-rapl:N/energy_uj`, domains named
+  `package-N`; platform domains such as `psys` are excluded). Energy per sample is the
+  difference divided by the number of predictions in the block. Mean power is the same
+  difference divided by the block's wall time.
+- **CPU decoders, proxy (estimated):** where RAPL cannot be read (no Intel CPU, or no read
+  permission), energy is estimated as elapsed time × the process's CPU utilisation × an
+  assumed 65 W TDP. It is only good for comparing workloads with each other, so the energy
+  figure draws proxy estimates in their own "Estimated (proxy, not measured)" panel. All
+  results above are RAPL.
+- **Speck (measured):** the devkit's power monitor samples the chip's supply rails at
+  100 Hz during the decoding loop. Mean power is the sum over rails of each rail's mean
+  sample, after checking the sample count against 100 Hz × loop time. Energy per sample is
+  mean power × loop time ÷ number of timesteps.
+- **What is included:**
+  - RAPL measures the whole CPU package: all cores, the uncore, the idle baseline and
+    anything else running. No idle baseline is subtracted, which is why every CPU decoder
+    draws 35–46 W.
+  - The chip monitor measures only the chip, not the laptop that drives it over USB or runs
+    the host-side readout.
+  - The ratios between them compare deployments, not arithmetic.
+- **Energy figure:** each bar is the mean across sessions, with a 95% CI, labelled with its
+  energy per sample and mean power.
+
+**Spike density** (`diagnose_speck.py`; `speck.run_layers()` and `SpeckDevkit(monitor_all=True)`)
+- **Trial:** one test trial of one session (`--figure_session`, `--figure_trial`; default
+  the first scored trial), first 750 timesteps (3 s; `--figure_start`, `--figure_steps`).
+  Both networks start the trial from rest.
+- **PyTorch:** the checkpoint's Linear/IAF stack is stepped one timestep at a time, and
+  every neuron layer's output spikes are recorded.
+- **Speck:** the same input is fed to the chip with monitoring enabled on every layer, and
+  each layer's spike events are counted per neuron and timestep. Events still in flight
+  after the wait are counted in a later timestep. Without a devkit, the quantized network
+  as deployed (8-bit weights, integer thresholds) is emulated on the host instead.
+- **Density:** a layer's spike counts are averaged over its neurons and over bins of 5
+  timesteps (20 ms; `--figure_bin`), giving spikes per neuron per timestep. It can exceed 1,
+  because a neuron can fire several spikes per timestep.
+- **Colour:** one sequential colour map for both networks, on a square-root scale so that
+  sparse hidden layers stay visible next to the denser output layer.
+- **GIF:** the same densities, colours and scale. Each frame is one bin, and the layers are
+  drawn left to right in the direction spikes travel, with box height following neuron
+  count. 10 frames per second (`--figure_fps`) plays the trial at one-fifth real time.
 
 ## Requirements
 
