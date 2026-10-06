@@ -43,8 +43,12 @@ timestep, averaged over --figure_bin steps). The Speck raster comes from the
 chip with every layer monitored when --speck_devkit is given, otherwise from
 the network as deployed (quantized), emulated on the host.
 
-Writes {results_dir}/speck_diagnosis.json and
-{results_dir}/speck_layer_activity_{session}.png.
+The same densities are also animated as a GIF: per network, the layers
+side by side in the direction spikes travel, each box coloured by the
+current bin's density, one frame per bin.
+
+Writes {results_dir}/speck_diagnosis.json,
+{results_dir}/speck_layer_activity_{session}.png and .gif.
 
 Usage (no devkit needed):
     python diagnose_speck.py --experiment bmi --subject indy --data_root ../../data \
@@ -281,13 +285,13 @@ def layer_activity(checkpoint_path, snn_dataset_path, experiment, trial, start, 
     return spikes.T[window], {k: [l[window] for l in v] for k, v in layers.items()}, trial
 
 
-def layer_activity_figure(inputs, layers, bin_steps=5, title=''):
-    """One stacked raster per network (rows: input, hidden layers, output),
-    on a shared time axis; colour = spikes per neuron per timestep, averaged
-    over bin_steps, on one colour scale for both networks."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+LAYER_CMAP = 'Blues'
+
+
+def layer_densities(inputs, layers, bin_steps):
+    """({network: (n_layers + 1, n_bins) spike density}, row labels, neuron
+    counts, colour norm): each layer's spikes per neuron per timestep,
+    averaged over bin_steps, input first; one norm for every network."""
     from matplotlib.colors import PowerNorm
 
     def density(x):
@@ -297,17 +301,29 @@ def layer_activity_figure(inputs, layers, bin_steps=5, title=''):
     rasters = {name: np.vstack([density(inputs)] + [density(l) for l in layer_list])
                for name, layer_list in layers.items()}
     first = next(iter(layers.values()))
-    labels = [f'input ({inputs.shape[1]})'] + \
-             [f'hidden {i + 1} ({l.shape[1]})' for i, l in enumerate(first[:-1])] + \
-             [f'output ({first[-1].shape[1]})']
+    sizes = [inputs.shape[1]] + [l.shape[1] for l in first]
+    labels = ['input'] + [f'hidden {i + 1}' for i in range(len(first) - 1)] + ['output']
     vmax = max(r.max() for r in rasters.values()) or 1.0
+    return rasters, labels, sizes, PowerNorm(0.5, vmin=0, vmax=vmax)
+
+
+def layer_activity_figure(inputs, layers, bin_steps=5, title=''):
+    """One stacked raster per network (rows: input, hidden layers, output),
+    on a shared time axis; colour = spikes per neuron per timestep, averaged
+    over bin_steps, on one colour scale for both networks."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    rasters, names, sizes, norm = layer_densities(inputs, layers, bin_steps)
+    labels = [f'{name} ({size})' for name, size in zip(names, sizes)]
     n_rows = len(labels)
     duration = rasters[next(iter(rasters))].shape[1] * bin_steps * STEP_S
     fig, axes = plt.subplots(len(rasters), 1, figsize=(12, 1.2 + 0.55 * n_rows * len(rasters)),
                              sharex=True, squeeze=False)
     for ax, (name, raster) in zip(axes[:, 0], rasters.items()):
-        im = ax.imshow(raster, aspect='auto', interpolation='nearest', cmap='Blues',
-                       norm=PowerNorm(0.5, vmin=0, vmax=vmax), extent=(0, duration, n_rows - 0.5, -0.5))
+        im = ax.imshow(raster, aspect='auto', interpolation='nearest', cmap=LAYER_CMAP,
+                       norm=norm, extent=(0, duration, n_rows - 0.5, -0.5))
         ax.set_yticks(np.arange(n_rows), labels, fontsize=8)
         ax.set_yticks(np.arange(n_rows + 1) - 0.5, minor=True)
         ax.grid(which='minor', axis='y', color='white', linewidth=2)
@@ -323,6 +339,64 @@ def layer_activity_figure(inputs, layers, bin_steps=5, title=''):
     bar.set_label('Spike density (spikes / neuron / timestep)')
     fig.suptitle(title or 'Spike density by layer over time', fontsize=11)
     return fig
+
+
+def save_layer_activity_gif(inputs, layers, path, bin_steps=5, title='', fps=10):
+    """The data of layer_activity_figure() as an animation: per network, a
+    row of layers left to right in the direction spikes travel (input,
+    hidden layers, output), each a box whose height follows its neuron
+    count, coloured by its spike density in the current bin (same colours
+    and scale as the figure). One frame per bin, played at fps."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, PillowWriter
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.patches import FancyArrowPatch, Rectangle
+
+    rasters, names, sizes, norm = layer_densities(inputs, layers, bin_steps)
+    cmap = plt.get_cmap(LAYER_CMAP)
+    n_layers, n_frames = len(names), next(iter(rasters.values())).shape[1]
+    heights = 0.25 + 0.75 * np.asarray(sizes) / max(sizes)     # box height ~ neuron count
+    box_w, gap = 0.5, 0.6
+    xs = np.arange(n_layers) * (box_w + gap)
+
+    fig, axes = plt.subplots(len(rasters), 1, figsize=(1.6 + 1.5 * n_layers, 0.9 + 2.1 * len(rasters)),
+                             squeeze=False)
+    boxes, values = {}, {}
+    for ax, name in zip(axes[:, 0], rasters):
+        boxes[name], values[name] = [], []
+        for x, h, label, size in zip(xs, heights, names, sizes):
+            box = Rectangle((x, -h / 2), box_w, h, facecolor=cmap(0.0), edgecolor='black', linewidth=0.8)
+            ax.add_patch(box)
+            boxes[name].append(box)
+            ax.text(x + box_w / 2, -0.55, f'{label}\n({size})', ha='center', va='top', fontsize=8)
+            values[name].append(ax.text(x + box_w / 2, h / 2 + 0.04, '', ha='center', va='bottom', fontsize=7,
+                                        color='0.3'))
+        for x0, x1 in zip(xs[:-1], xs[1:]):
+            ax.add_patch(FancyArrowPatch((x0 + box_w + 0.06, 0), (x1 - 0.06, 0), arrowstyle='-|>',
+                                         mutation_scale=12, color='0.4', linewidth=1.2))
+        ax.set_xlim(xs[0] - 0.2, xs[-1] + box_w + 0.2)
+        ax.set_ylim(-0.8, 0.65)
+        ax.set_aspect('equal')
+        ax.axis('off')
+        ax.set_title(name, fontsize=9, loc='left')
+    bar = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=axes[:, 0], fraction=0.03, pad=0.03)
+    bar.set_label('Spike density (spikes / neuron / timestep)', fontsize=8)
+    clock = fig.suptitle('', fontsize=10)
+
+    def draw(frame):
+        t0 = frame * bin_steps * STEP_S
+        clock.set_text(f"{title or 'Spike density by layer'}\n"
+                       f"t = {t0:5.2f}-{t0 + bin_steps * STEP_S:.2f} s")
+        for name, raster in rasters.items():
+            for box, text, value in zip(boxes[name], values[name], raster[:, frame]):
+                box.set_facecolor(cmap(norm(value)))
+                text.set_text(f'{value:.3f}')
+        return []
+
+    FuncAnimation(fig, draw, frames=n_frames).save(path, writer=PillowWriter(fps=fps), dpi=100)
+    plt.close(fig)
 
 
 def main(args):
@@ -394,6 +468,11 @@ def main(args):
         fig.savefig(path, dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f"Saved {path}")
+        path = os.path.join(results_dir, f'speck_layer_activity_{figure_session}.gif')
+        save_layer_activity_gif(inputs, layers, path, args.figure_bin,
+                                f'Spike density by layer -- {figure_session}, test trial {trial}',
+                                fps=args.figure_fps)
+        print(f"Saved {path}")
 
 
 if __name__ == '__main__':
@@ -418,7 +497,10 @@ if __name__ == '__main__':
     figure.add_argument('--figure_start', type=int, default=0, help='First timestep shown')
     figure.add_argument('--figure_steps', type=int, default=750,
                         help='Timesteps shown (4 ms each); 0 skips the figure')
-    figure.add_argument('--figure_bin', type=int, default=5, help='Timesteps averaged per colour cell')
+    figure.add_argument('--figure_bin', type=int, default=5,
+                        help='Timesteps averaged per colour cell (and per GIF frame)')
+    figure.add_argument('--figure_fps', type=int, default=10,
+                        help='GIF frames per second (default 10: 200 ms of trial per second at --figure_bin 5)')
     figure.add_argument('--speck_devkit', default=None,
                         help="Record the Speck raster on this devkit (e.g. speck2fdevkit:0), every "
                              "layer monitored; default: emulate the quantized network on the host")
