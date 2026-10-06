@@ -280,7 +280,7 @@ def layer_activity(checkpoint_path, snn_dataset_path, experiment, trial, start, 
             device.close()
     else:
         quant_seq = speck.discretized_sequential(speck.discretize(snn_seq, model.layers[0].in_features))
-        layers['Speck SNN (quantized as deployed, emulated on host)'] = speck.run_layers(quant_seq, spikes)
+        layers['Speck SNN (emulated on host)'] = speck.run_layers(quant_seq, spikes)
     window = slice(start, start + steps)
     return spikes.T[window], {k: [l[window] for l in v] for k, v in layers.items()}, trial
 
@@ -328,7 +328,7 @@ def layer_activity_figure(inputs, layers, bin_steps=5, title=''):
         ax.set_yticks(np.arange(n_rows + 1) - 0.5, minor=True)
         ax.grid(which='minor', axis='y', color='white', linewidth=2)
         ax.tick_params(which='minor', length=0)
-        ax.set_title(name, fontsize=10, loc='left')
+        ax.set_title(name, fontsize=10, loc='left', fontweight='bold')
         for row, layer_density in enumerate(raster.mean(axis=1)):
             ax.annotate(f'{layer_density:.3f}', (1.005, row), xycoords=('axes fraction', 'data'),
                         va='center', fontsize=7, color='0.3')
@@ -358,30 +358,32 @@ def save_layer_activity_gif(inputs, layers, path, bin_steps=5, title='', fps=10)
     cmap = plt.get_cmap(LAYER_CMAP)
     n_layers, n_frames = len(names), next(iter(rasters.values())).shape[1]
     heights = 0.25 + 0.75 * np.asarray(sizes) / max(sizes)     # box height ~ neuron count
-    box_w, gap = 0.5, 0.6
+    box_w, gap = 0.5 / 3, 0.6 / 3
     xs = np.arange(n_layers) * (box_w + gap)
+    shorts = ['in'] + [f'h{i}' for i in range(1, n_layers - 1)] + ['out']   # names fit the narrow boxes
 
-    fig, axes = plt.subplots(len(rasters), 1, figsize=(1.6 + 1.5 * n_layers, 0.9 + 2.1 * len(rasters)),
+    fig, axes = plt.subplots(len(rasters), 1, figsize=(2.3 + 0.45 * n_layers, 0.6 + 2.0 * len(rasters)),
                              squeeze=False)
     boxes, values = {}, {}
     for ax, name in zip(axes[:, 0], rasters):
         boxes[name], values[name] = [], []
-        for x, h, label, size in zip(xs, heights, names, sizes):
+        for x, h, short, size in zip(xs, heights, shorts, sizes):
             box = Rectangle((x, -h / 2), box_w, h, facecolor=cmap(0.0), edgecolor='black', linewidth=0.8)
             ax.add_patch(box)
             boxes[name].append(box)
-            ax.text(x + box_w / 2, -0.55, f'{label}\n({size})', ha='center', va='top', fontsize=8)
+            ax.text(x + box_w / 2, -0.55, f'{short}\n{size}', ha='center', va='top', fontsize=7)
             values[name].append(ax.text(x + box_w / 2, h / 2 + 0.04, '', ha='center', va='bottom', fontsize=7,
                                         color='0.3'))
         for x0, x1 in zip(xs[:-1], xs[1:]):
-            ax.add_patch(FancyArrowPatch((x0 + box_w + 0.06, 0), (x1 - 0.06, 0), arrowstyle='-|>',
-                                         mutation_scale=12, color='0.4', linewidth=1.2))
-        ax.set_xlim(xs[0] - 0.2, xs[-1] + box_w + 0.2)
+            ax.add_patch(FancyArrowPatch((x0 + box_w + 0.02, 0), (x1 - 0.02, 0), arrowstyle='-|>',
+                                         mutation_scale=8, color='0.4', linewidth=1.2))
+        ax.set_xlim(xs[0] - 0.1, xs[-1] + box_w + 0.1)
         ax.set_ylim(-0.8, 0.65)
         ax.set_aspect('equal')
         ax.axis('off')
-        ax.set_title(name, fontsize=9, loc='left')
-    bar = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=axes[:, 0], fraction=0.03, pad=0.03)
+        ax.set_title(name, fontsize=9, loc='left', fontweight='bold')
+    fig.subplots_adjust(left=0.02, right=0.68, top=1 - 0.6 / fig.get_figheight(), bottom=0.02, hspace=0.15)
+    bar = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=fig.add_axes([0.7, 0.25, 0.035, 0.5]))
     bar.set_label('Spike density (spikes / neuron / timestep)', fontsize=8)
     clock = fig.suptitle('', fontsize=10)
 
@@ -463,14 +465,14 @@ def main(args):
             args.figure_start, args.figure_steps, args.speck_devkit, args.speck_wait_time,
             args.speck_raster_dt)
         fig = layer_activity_figure(inputs, layers, args.figure_bin,
-                                    f'Spike density by layer -- {figure_session}, test trial {trial}')
+                                    'Spike Density by Layer (Test Session)')
         path = os.path.join(results_dir, f'speck_layer_activity_{figure_session}.png')
         fig.savefig(path, dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f"Saved {path}")
         path = os.path.join(results_dir, f'speck_layer_activity_{figure_session}.gif')
         save_layer_activity_gif(inputs, layers, path, args.figure_bin,
-                                f'Spike density by layer -- {figure_session}, test trial {trial}',
+                                'Spike Density by Layer (Test Session)',
                                 fps=args.figure_fps)
         print(f"Saved {path}")
 
