@@ -21,7 +21,12 @@ updates a neuron after every input event and fires at most once per event
 threshold at every spike rather than once per timestep.
 
 run_discretized() steps the discretized network (8-bit weights, integer
-thresholds) one timestep at a time, like training, for diagnose_speck.py.
+thresholds) one timestep at a time, like training, for diagnose_speck.py;
+run_layers() does the same for either network but returns every neuron
+layer's spikes. A SpeckDevkit opened with monitor_all=True streams every
+layer's spikes from the chip as well (for diagnose_speck.py's layer
+activity figure; the extra traffic makes its latency and power
+unrepresentative).
 
 samna and the dynapcnn backend are imported only when a chip run is
 requested, so machines without a devkit never need them.
@@ -110,6 +115,28 @@ def run_discretized(disc_seq, input_spikes):
         return torch.cat([disc_seq(x[t:t + 1]).reshape(1, -1) for t in range(len(x))]).numpy()
 
 
+def run_layers(seq, input_spikes):
+    """(C, T) input -> [(T, n) spikes of each neuron layer of seq], in order,
+    one timestep per call; seq is the flattened (Linear) or the discretized
+    (Conv2d) network."""
+    import sinabs
+    conv = any(isinstance(m, nn.Conv2d) for m in seq)
+    x = torch.from_numpy(input_spikes.T.astype(np.float32))
+    if conv:
+        x = x[:, :, None, None]
+    sinabs.reset_states(seq)
+    steps = []
+    with torch.no_grad():
+        for t in range(len(x)):
+            out, spikes = x[t:t + 1], []
+            for module in seq:
+                out = module(out)
+                if not isinstance(module, (nn.Linear, nn.Conv2d, nn.Flatten)):
+                    spikes.append(out.reshape(-1).numpy())
+            steps.append(spikes)
+    return [np.stack(layer) for layer in zip(*steps)]
+
+
 def check_deployable(model, checkpoint):
     args = checkpoint['args']
     if args.get('neuron_type') != 'iaf':
@@ -161,13 +188,17 @@ def measure_chip_power(power_events, loop_s, sample_rate_hz=POWER_SAMPLE_RATE_HZ
 class SpeckDevkit:
     """A converted network deployed on a Speck2f devkit."""
 
-    def __init__(self, snn_seq, n_inputs, devkit='speck2fdevkit:0', wait_time=0.001, raster_dt=0.1):
+    def __init__(self, snn_seq, n_inputs, devkit='speck2fdevkit:0', wait_time=0.001, raster_dt=0.1,
+                 monitor_all=False):
         import samna
         import sinabs.backend.dynapcnn.io as sio
         from sinabs.backend.dynapcnn.chip_factory import ChipFactory
 
         self.samna, self.wait_time, self.raster_dt = samna, wait_time, raster_dt
+        self.monitor_all, self.layer_counts = monitor_all, None
         self.network = discretize(snn_seq, n_inputs)
+        self.layer_sizes = [m.out_channels for m in discretized_sequential(self.network)
+                            if isinstance(m, nn.Conv2d)]
         self.param_count = sum(p.numel() for m in self.network.modules() if isinstance(m, nn.Conv2d)
                                for p in (m.weight, m.bias) if p is not None)
 
@@ -190,9 +221,9 @@ class SpeckDevkit:
         self.cores = [ordering[k] for k in sorted(ordering)] if isinstance(ordering, dict) else list(ordering)
         config.dvs_layer.pass_sensor_events = False
         for core in self.cores:
-            # Only the output layer is read; monitoring the hidden layers would
-            # stream all of their spikes to the host as well.
-            config.cnn_layers[core].monitor_enable = core == self.cores[-1]
+            # Normally only the output layer is read; monitoring the hidden
+            # layers streams all of their spikes to the host as well.
+            config.cnn_layers[core].monitor_enable = monitor_all or core == self.cores[-1]
         self.device.get_model().apply_configuration(config)
         self.resets = ['hard' if config.cnn_layers[c].return_to_zero else 'soft' for c in self.cores]
         print(f"  [speck] {devkit}: chip layers {self.cores}, reset {'/'.join(self.resets)}, "
@@ -222,10 +253,12 @@ class SpeckDevkit:
         """Feed one trial (C, T) a timestep at a time. Returns (output spike
         counts (T, n_outputs), loop seconds, mean power in W, input events
         sent). Output spikes still in flight after the wait are counted in
-        a later timestep."""
+        a later timestep. With monitor_all, self.layer_counts is then the
+        list of every layer's spike counts (T, layer size), in order."""
         frames = torch.from_numpy(input_spikes.T.astype(np.float32))[:, None, :, None, None]
         spike_type, last_core = self.samna.speck2f.event.Spike, self.cores[-1]
         counts = np.zeros((len(frames), n_outputs))
+        layer_counts = [np.zeros((len(frames), n)) for n in self.layer_sizes] if self.monitor_all else None
         n_input_events = 0
         self.power_monitor.start_auto_power_measurement(POWER_SAMPLE_RATE_HZ)
         start = time.perf_counter()
@@ -236,13 +269,18 @@ class SpeckDevkit:
                 self.stop_watch.start(reset=True)
                 self.input_source.write(events)
             time.sleep(self.wait_time)
-            features = [ev.feature for ev in self.output_sink.get_events()
-                        if isinstance(ev, spike_type) and ev.layer == last_core]
+            spikes = [ev for ev in self.output_sink.get_events() if isinstance(ev, spike_type)]
+            features = [ev.feature for ev in spikes if ev.layer == last_core]
             counts[t] = np.bincount(features, minlength=n_outputs)[:n_outputs]
+            if layer_counts is not None:
+                for core, layer in zip(self.cores, layer_counts):
+                    features = [ev.feature for ev in spikes if ev.layer == core]
+                    layer[t] = np.bincount(features, minlength=layer.shape[1])[:layer.shape[1]]
         loop_s = time.perf_counter() - start
         self.power_monitor.stop_auto_power_measurement()
         power_events = self.power_sink.get_events()
         power_w, count_ok = measure_chip_power(power_events, loop_s)
+        self.layer_counts = layer_counts
         if not count_ok:
             print(f"  WARNING: {len(power_events)} power samples over {loop_s:.2f} s is not what "
                   f"{POWER_SAMPLE_RATE_HZ} Hz per channel predicts; this trial's power may be unreliable")
@@ -256,14 +294,14 @@ class SpeckDevkit:
 # Test set
 # --------------------------------------------------------------------------- #
 
-def open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt):
+def open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt, monitor_all=False):
     """Check the checkpoint can be deployed, cross-check the flattened
     network on the first test trial, and deploy it."""
     check_deployable(model, checkpoint)
     snn_seq = flatten_snn(model)
     snn_seq.eval()
     cross_check_flattened(model, snn_seq, _load_pickle(snn_test_files(snn_dataset_path)[0])['input_spikes'])
-    return SpeckDevkit(snn_seq, model.layers[0].in_features, devkit, wait_time, raster_dt)
+    return SpeckDevkit(snn_seq, model.layers[0].in_features, devkit, wait_time, raster_dt, monitor_all)
 
 
 def predict_speck_test_set(model, velocity_scale, snn_dataset_path, device, experiment,

@@ -55,6 +55,18 @@ def _profiles(content):
                         for name, p in old.get('decoders', {}).items()}} if old else {}
 
 
+def session_power(profile):
+    """Mean power (W) of one session's decoder: as recorded, or for results
+    made before power was recorded, energy / latency per sample (exact for
+    the chip; for profiled decoders energy and latency come from different
+    timed blocks, so approximate)."""
+    if profile.get('power_w') is not None:
+        return profile['power_w']
+    if profile.get('energy_j') is not None and profile.get('latency_s'):
+        return profile['energy_j'] / profile['latency_s']
+    return None
+
+
 def efficiency_records(sessions):
     """One record per (machine, decoder): means (and CIs) across sessions of
     RMSE, latency, parameter count and energy."""
@@ -66,11 +78,12 @@ def efficiency_records(sessions):
                 if name not in metrics:
                     continue
                 s = samples.setdefault((machine, name), {'rmse': [], 'latency_s': [], 'param_count': [],
-                                                         'energy_j': [], 'methods': {}})
+                                                         'energy_j': [], 'power_w': [], 'methods': {}})
                 s['rmse'].append(metrics[name]['rmse'])
                 s['latency_s'].append(p['latency_s'])
                 s['param_count'].append(p['param_count'])
                 s['energy_j'].append(p['energy_j'])
+                s['power_w'].append(session_power(p))
                 if p.get('energy_method') and p['energy_j'] is not None:
                     s['methods'][p['energy_method']] = s['methods'].get(p['energy_method'], 0) + 1
 
@@ -87,11 +100,13 @@ def efficiency_records(sessions):
         latency, latency_lo, latency_hi = mean_ci(s['latency_s'])
         energies = [e for e in s['energy_j'] if e is not None]
         energy = mean_ci(energies) if energies else (None, None, None)
+        powers = [w for w in s['power_w'] if w is not None]
         records.append({
             'name': name, 'machine': machine, 'rmse': rmse, 'rmse_lo': rmse_lo, 'rmse_hi': rmse_hi,
             'latency_s': latency, 'latency_lo': latency_lo, 'latency_hi': latency_hi,
             'param_count': float(np.mean(s['param_count'])),
             'energy_j': energy[0], 'energy_lo': energy[1], 'energy_hi': energy[2],
+            'power_w': float(np.mean(powers)) if powers else None,
             'energy_method': max(s['methods'], key=s['methods'].get) if energies and s['methods'] else None,
             'n_sessions': len(s['latency_s']), 'n_energy_sessions': len(energies),
         })
@@ -149,6 +164,8 @@ def main(args):
     for r in records:
         energy = (f"{r['energy_j'] * 1e6:.3f} uJ ({r['energy_method']})" if r['energy_j'] is not None
                   else 'n/a')
+        if r['power_w'] is not None:
+            energy += f", {r['power_w'] * 1000:.3f} mW"
         print(f"  {r['machine']:>10s} {r['name']:>5s} | RMSE {r['rmse']:.2f} | "
               f"{r['latency_s'] * 1000:.4f} ms/sample | {r['param_count']:,.0f} params | "
               f"energy {energy} | {r['n_sessions']} sessions")

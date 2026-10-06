@@ -36,12 +36,23 @@ as --snn_checkpoint_root: they must be the ones the results recorded for
 'speck', and the rows come from the recorded offset. The 'snn' column is then
 the other checkpoint's result.
 
-Writes {results_dir}/speck_diagnosis.json.
+Last, a figure follows one test trial through both networks layer by layer
+(input at the top, output at the bottom), one stacked raster per network on
+a shared time axis, coloured by spike density (spikes per neuron per
+timestep, averaged over --figure_bin steps). The Speck raster comes from the
+chip with every layer monitored when --speck_devkit is given, otherwise from
+the network as deployed (quantized), emulated on the host.
+
+Writes {results_dir}/speck_diagnosis.json and
+{results_dir}/speck_layer_activity_{session}.png.
 
 Usage (no devkit needed):
     python diagnose_speck.py --experiment bmi --subject indy --data_root ../../data \
         --snn_checkpoint_root ../../data/snn_checkpoints/bmi/indy/full_cohort_finetuned_medium \
         --results_dir ../../data/results/test_all_decoders_finetuned/bmi/indy
+
+    Add --speck_devkit speck2fdevkit:0 (devkit connected) for the chip's own
+    layer activity in the figure.
 """
 
 import argparse
@@ -53,7 +64,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 import numpy as np  # noqa: E402
 
-from decoder_eval import (BASE_NPERSEG, _load_pickle, checkpoint_id, load_snn_model,  # noqa: E402
+from decoder_eval import (BASE_NPERSEG, STEP_S, _load_pickle, checkpoint_id, load_snn_model,  # noqa: E402
                           snn_test_files, unscale_velocity)
 import speck  # noqa: E402
 
@@ -238,6 +249,82 @@ def diagnose_session(session, checkpoint, snn_dataset_path, results_dir, experim
     return row, note
 
 
+def layer_activity(checkpoint_path, snn_dataset_path, experiment, trial, start, steps,
+                   devkit=None, wait_time=0.001, raster_dt=0.1):
+    """Spikes of every layer over one test trial, for the PyTorch network and
+    for Speck: (input (steps, C), {network label: [(steps, n) per layer]},
+    trial index used). Both networks start the trial from rest and run from
+    its first step; the window [start, start + steps) is returned. Speck is
+    the chip with every layer monitored when devkit is given, otherwise the
+    quantized network as deployed, emulated on the host."""
+    model, checkpoint, _ = load_snn_model(checkpoint_path, experiment)
+    speck.check_deployable(model, checkpoint)
+    snn_seq = speck.flatten_snn(model)
+    snn_seq.eval()
+    files = snn_test_files(snn_dataset_path)
+    trial = min(trial, len(files) - 1)
+    spikes = _load_pickle(files[trial])['input_spikes'][:, :start + steps]
+    layers = {'PyTorch SNN': speck.run_layers(snn_seq, spikes)}
+    if devkit:
+        device = speck.open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt,
+                                  monitor_all=True)
+        try:
+            device.reset()
+            device.run(spikes, 2 * model.n_bins)
+            layers[f'Speck SNN (chip, {devkit})'] = device.layer_counts
+        finally:
+            device.close()
+    else:
+        quant_seq = speck.discretized_sequential(speck.discretize(snn_seq, model.layers[0].in_features))
+        layers['Speck SNN (quantized as deployed, emulated on host)'] = speck.run_layers(quant_seq, spikes)
+    window = slice(start, start + steps)
+    return spikes.T[window], {k: [l[window] for l in v] for k, v in layers.items()}, trial
+
+
+def layer_activity_figure(inputs, layers, bin_steps=5, title=''):
+    """One stacked raster per network (rows: input, hidden layers, output),
+    on a shared time axis; colour = spikes per neuron per timestep, averaged
+    over bin_steps, on one colour scale for both networks."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import PowerNorm
+
+    def density(x):
+        n = len(x) // bin_steps * bin_steps
+        return x[:n].reshape(-1, bin_steps, x.shape[1]).mean(axis=(1, 2))
+
+    rasters = {name: np.vstack([density(inputs)] + [density(l) for l in layer_list])
+               for name, layer_list in layers.items()}
+    first = next(iter(layers.values()))
+    labels = [f'input ({inputs.shape[1]})'] + \
+             [f'hidden {i + 1} ({l.shape[1]})' for i, l in enumerate(first[:-1])] + \
+             [f'output ({first[-1].shape[1]})']
+    vmax = max(r.max() for r in rasters.values()) or 1.0
+    n_rows = len(labels)
+    duration = rasters[next(iter(rasters))].shape[1] * bin_steps * STEP_S
+    fig, axes = plt.subplots(len(rasters), 1, figsize=(12, 1.2 + 0.55 * n_rows * len(rasters)),
+                             sharex=True, squeeze=False)
+    for ax, (name, raster) in zip(axes[:, 0], rasters.items()):
+        im = ax.imshow(raster, aspect='auto', interpolation='nearest', cmap='Blues',
+                       norm=PowerNorm(0.5, vmin=0, vmax=vmax), extent=(0, duration, n_rows - 0.5, -0.5))
+        ax.set_yticks(np.arange(n_rows), labels, fontsize=8)
+        ax.set_yticks(np.arange(n_rows + 1) - 0.5, minor=True)
+        ax.grid(which='minor', axis='y', color='white', linewidth=2)
+        ax.tick_params(which='minor', length=0)
+        ax.set_title(name, fontsize=10, loc='left')
+        for row, layer_density in enumerate(raster.mean(axis=1)):
+            ax.annotate(f'{layer_density:.3f}', (1.005, row), xycoords=('axes fraction', 'data'),
+                        va='center', fontsize=7, color='0.3')
+        ax.annotate('mean', (1.005, -0.5), xycoords=('axes fraction', 'data'), va='bottom',
+                    fontsize=7, color='0.3')
+    axes[-1, 0].set_xlabel(f'Time in trial (s; {bin_steps * STEP_S * 1000:g} ms bins)')
+    bar = fig.colorbar(im, ax=axes[:, 0], fraction=0.025, pad=0.07)
+    bar.set_label('Spike density (spikes / neuron / timestep)')
+    fig.suptitle(title or 'Spike density by layer over time', fontsize=11)
+    return fig
+
+
 def main(args):
     root = args.snn_checkpoint_root or os.path.join(
         args.data_root, 'snn_checkpoints', args.experiment, args.subject, 'per_session')
@@ -293,6 +380,21 @@ def main(args):
         json.dump(report, f, indent=2)
     print(f"Saved {path}")
 
+    figure_session = args.figure_session or next(iter(report['sessions']), None)
+    if args.figure_steps > 0 and figure_session:
+        import matplotlib.pyplot as plt
+        checkpoint = os.path.join(root, figure_session, args.snn_checkpoint_subdir, 'best_model_weights.pth')
+        inputs, layers, trial = layer_activity(
+            checkpoint, os.path.join(dataset_root, figure_session), args.experiment, args.figure_trial,
+            args.figure_start, args.figure_steps, args.speck_devkit, args.speck_wait_time,
+            args.speck_raster_dt)
+        fig = layer_activity_figure(inputs, layers, args.figure_bin,
+                                    f'Spike density by layer -- {figure_session}, test trial {trial}')
+        path = os.path.join(results_dir, f'speck_layer_activity_{figure_session}.png')
+        fig.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Saved {path}")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__,
@@ -309,4 +411,17 @@ if __name__ == '__main__':
     parser.add_argument('--max_lag', type=int, default=50,
                         help='Largest chip output delay (in steps) searched for the best-lag correlation')
     parser.add_argument('--output', default=None)
+    figure = parser.add_argument_group('layer activity figure')
+    figure.add_argument('--figure_session', default=None, help='Default: the first session diagnosed')
+    figure.add_argument('--figure_trial', type=int, default=1,
+                        help='Test trial index (default 1, the first one scored)')
+    figure.add_argument('--figure_start', type=int, default=0, help='First timestep shown')
+    figure.add_argument('--figure_steps', type=int, default=750,
+                        help='Timesteps shown (4 ms each); 0 skips the figure')
+    figure.add_argument('--figure_bin', type=int, default=5, help='Timesteps averaged per colour cell')
+    figure.add_argument('--speck_devkit', default=None,
+                        help="Record the Speck raster on this devkit (e.g. speck2fdevkit:0), every "
+                             "layer monitored; default: emulate the quantized network on the host")
+    figure.add_argument('--speck_wait_time', type=float, default=0.001)
+    figure.add_argument('--speck_raster_dt', type=float, default=0.1)
     main(parser.parse_args())

@@ -238,7 +238,8 @@ def main(args):
         chip = results['full']['metrics'].get('speck', {}).get('chip')
         if 'speck' in todo and chip:
             profile['speck'] = {'latency_s': chip['latency_s'], 'energy_j': chip['energy_j'],
-                                'energy_method': 'chip_power_monitor', 'param_count': chip['param_count']}
+                                'energy_method': 'chip_power_monitor', 'power_w': chip.get('power_w'),
+                                'param_count': chip['param_count']}
         entry = results['profiles'].setdefault(args.machine, {'decoders': {}})
         entry['host'] = platform.node()
         entry['decoders'].update(profile)

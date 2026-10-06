@@ -2,10 +2,12 @@
 Report figures across the sessions of one subject (called by make_report.py).
 
     efficiency figure   RMSE vs. per-sample latency, marker area ~ parameter
-                        count; one panel per profiled machine (e.g. the cluster
-                        and the Speck-connected laptop)
+                        count, each marker labelled with its latency; one
+                        panel per profiled machine (e.g. the cluster and the
+                        Speck-connected laptop)
     energy figure       energy per sample, with proxy estimates and real
-                        (RAPL / chip) measurements in separate panels
+                        (RAPL / chip) measurements in separate panels; each
+                        bar labelled with its energy and mean power
     4x2 figure          a/b RMSE and CC boxplots over sessions (box = quartiles,
                         whiskers = 1.5 IQR, white dot = mean) with Wilcoxon
                         significance against the best decoder, c/d pairwise
@@ -43,6 +45,16 @@ def display_label(name):
     return 'SNN (Speck)' if name == 'speck' else name.upper()
 
 
+def format_si(value, unit, digits=3):
+    """value in base units as e.g. '412 uW', '1.27 mW', '35.2 W' (3 significant digits)."""
+    if value is None:
+        return 'n/a'
+    for scale, prefix in ((1, ''), (1e-3, 'm'), (1e-6, 'u'), (1e-9, 'n')):
+        if abs(value) >= scale:
+            break
+    return f"{value / scale:.{digits}g} {prefix}{unit}"
+
+
 def mean_ci(values, confidence=0.95):
     """(mean, low, high) with a t-distribution confidence interval."""
     values = np.asarray(values, dtype=float)
@@ -72,8 +84,11 @@ def efficiency_panel(ax, records, colors=EFFICIENCY_COLORS, error_bars=False):
         x, y = rec['latency_s'] * 1000, rec['rmse']
         ax.scatter(x, y, s=size, color=colors.get(rec['name'], 'gray'), edgecolor='black',
                    linewidth=0.8, alpha=0.85, zorder=3, hatch=HATCHES.get(rec['name']))
-        ax.annotate(display_label(rec['name']), (x, y), textcoords='offset points', xytext=(0, 12),
-                    ha='center', fontsize=9, fontweight='bold')
+        radius = np.sqrt(size / np.pi)                   # marker radius in points
+        ax.annotate(display_label(rec['name']), (x, y), textcoords='offset points', xytext=(0, radius + 4),
+                    ha='center', va='bottom', fontsize=9, fontweight='bold')
+        ax.annotate(format_si(rec['latency_s'], 's'), (x, y), textcoords='offset points',
+                    xytext=(0, -radius - 4), ha='center', va='top', fontsize=8)
         if error_bars:
             xerr = [[max(0, x - rec['latency_lo'] * 1000)], [max(0, rec['latency_hi'] * 1000 - x)]]
             yerr = [[max(0, y - rec['rmse_lo'])], [max(0, rec['rmse_hi'] - y)]]
@@ -118,7 +133,9 @@ def _energy_panel(ax, records, title):
         method = {'rapl': 'RAPL', 'chip_power_monitor': 'chip',
                   'proxy_psutil': 'proxy'}.get(rec['energy_method'], rec['energy_method'] or 'unknown')
         ax.annotate(f"{display_label(rec['name'])}\n{rec['machine']}, {method}", (i, e), textcoords='offset points',
-                    xytext=(0, 8), ha='center', fontsize=8, fontweight='bold')
+                    xytext=(0, 30), ha='center', fontsize=8, fontweight='bold')
+        ax.annotate(f"{format_si(rec['energy_j'], 'J')}/sample\n{format_si(rec.get('power_w'), 'W')}", (i, e),
+                    textcoords='offset points', xytext=(0, 6), ha='center', fontsize=8)
     ax.set_xticks(np.arange(len(records)), [])
     ax.set_yscale('log')
     ax.set_title(title, fontsize=10)

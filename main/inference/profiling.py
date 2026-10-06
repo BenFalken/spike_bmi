@@ -12,6 +12,7 @@ energy_j: per-sample energy from one separate, longer block of
     n_energy_repeats passes inside an EnergyMeter (RAPL where readable,
     otherwise a CPU-utilization proxy -- see energy_meter.py), since the
     counters need a longer window than one pass of a fast decoder.
+power_w: mean power over that block (its energy / its wall time).
 param_count: model parameters. Not comparable across families: KF's count is
     dominated by its channel x channel noise covariance.
 
@@ -42,7 +43,8 @@ def count_params(name, model):
 def time_per_sample(run_pass, n_samples, energy_meter_cls=None, n_repeats=3, n_warmup=3,
                     n_energy_repeats=10):
     """run_pass() runs n_samples single-sample predictions. Returns
-    (latency_s, energy_j, energy_method), all per sample."""
+    (latency_s, energy_j, energy_method, power_w); latency and energy are
+    per sample, power_w is the mean over the energy block."""
     for _ in range(n_warmup):
         run_pass()
     times = []
@@ -53,7 +55,7 @@ def time_per_sample(run_pass, n_samples, energy_meter_cls=None, n_repeats=3, n_w
     latency_s = float(np.median(times)) / n_samples
 
     if energy_meter_cls is None:
-        return latency_s, None, None
+        return latency_s, None, None, None
     with energy_meter_cls() as meter:
         for _ in range(n_energy_repeats):
             run_pass()
@@ -61,7 +63,8 @@ def time_per_sample(run_pass, n_samples, energy_meter_cls=None, n_repeats=3, n_w
         print(f"    [caution] energy window was only {meter.latency_s * 1000:.2f} ms; "
               f"raise --n_energy_repeats if energy looks noisy")
     energy_j = None if meter.energy_j is None else meter.energy_j / (n_energy_repeats * n_samples)
-    return latency_s, energy_j, meter.energy_method
+    power_w = None if meter.energy_j is None or meter.latency_s <= 0 else meter.energy_j / meter.latency_s
+    return latency_s, energy_j, meter.energy_method, power_w
 
 
 def _ann_single_sample_pass(name, model, scaler, config, X_test, y_init, timing_idx):
@@ -108,7 +111,7 @@ def _snn_single_timestep_pass(model, snn_dataset_path, n_timesteps):
 
 
 def profile_decoders(data, cfg, decoders, snn_checkpoint_path=None, energy_meter_cls=None):
-    """{name: {latency_s, energy_j, energy_method, param_count}} for the
+    """{name: {latency_s, energy_j, energy_method, power_w, param_count}} for the
     full-data model of every available decoder except 'speck'."""
     rng = np.random.default_rng(0)
     X_test = data['X_test']
@@ -138,8 +141,9 @@ def profile_decoders(data, cfg, decoders, snn_checkpoint_path=None, energy_meter
                                                   timing_idx)
             repeats = dict(n_repeats=2, n_warmup=2) if name in ('lstm', 'qrnn') else {}
             timing = time_per_sample(run_pass, n, **repeats, **common)
-        latency_s, energy_j, method = timing
+        latency_s, energy_j, method, power_w = timing
         results[name] = {'latency_s': latency_s, 'energy_j': energy_j, 'energy_method': method,
+                         'power_w': power_w,
                          'param_count': count_params(name, model)}
         energy = f"{energy_j * 1e6:.3f} uJ ({method})" if energy_j is not None else "n/a"
         print(f"  {name.upper():>5s} | {latency_s * 1000:.4f} ms/sample | {energy} | "
