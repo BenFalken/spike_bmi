@@ -8,12 +8,29 @@ in PyTorch ('snn') and, on a machine with a Speck2f devkit, on the chip
 ('speck', full-data model only; see speck.py).
 
 Alignment: the ANN dataset has one row per 4 ms step, and row j predicts the
-velocity at raw sample j + nperseg. SNN test trials are back-to-back 65-sample
-windows (or one long trial), so SNN timestep t of trial i lines up with ANN
-row (i - 1) * nperseg + t; trial 0 (or the first nperseg timesteps of a single
-trial) has no ANN counterpart and is dropped (for 'speck' too). calibrate_snn_ann_offset() checks
-the two test splits start at the same moment and corrects any residual offset.
-Every decoder is then scored over the range of rows they all cover.
+velocity at raw sample j + nperseg (65), so the SNN's first nperseg timesteps
+of a recording have no ANN counterpart.
+  bmi  SNN test trials are back-to-back 65-sample windows (or one long trial)
+       of one continuous recording, so SNN timestep t of trial i lines up with
+       ANN row (i - 1) * nperseg + t; trial 0 (or the first nperseg timesteps
+       of a single trial) is dropped. calibrate_snn_ann_offset() checks the two
+       test splits start at the same moment and corrects any residual offset.
+  hkm  Every SNN test trial is one whole reach, run from rest, and the ANN test
+       rows are the same trials' windows, concatenated (nwb_conversion/). A
+       trial of T timesteps has T - nperseg ANN rows, so its timesteps
+       [nperseg, T) are placed on its own rows, found by trial ID
+       (hkm_test_rows(), which also checks both datasets hold out the same
+       trials with the same ground truth). Trials of <= nperseg timesteps
+       have no ANN rows; they are run, but scored only in the training-loss
+       check.
+Both apply to 'speck' too. Every decoder is then scored over the range of
+rows they all cover.
+
+Training-loss check: where every test trial was its own batch in training
+(hkm, or a single test trial), the SNN's mean per-trial RMSE over all
+timesteps reproduces train_snn.py's test loss, so it is compared with the
+checkpoint's best_loss (they match for a checkpoint selected on this
+session's test split).
 """
 
 import json
@@ -218,6 +235,118 @@ def snn_test_files(snn_dataset_path):
     return [os.path.join(test_dir, f) for f in files]
 
 
+def load_test_trials(snn_dataset_path):
+    """The session's SNN test trials in file order, each a dict with
+    input_spikes (C, T), velocity (T, 2) and trial_id (None in datasets
+    without trial IDs: every bmi dataset, and hkm datasets built before
+    trial IDs were stored)."""
+    trials = []
+    for path in snn_test_files(snn_dataset_path):
+        trial = _load_pickle(path)
+        trials.append({'input_spikes': trial['input_spikes'], 'velocity': trial['velocity'],
+                       'trial_id': trial.get('trial_id')})
+    return trials
+
+
+def hkm_test_rows(trials, row_trial_ids, y_test_vel):
+    """{trial_id: slice of ANN test rows} for an hkm session, after checking
+    that the SNN test trials and the ANN test rows describe the same trials:
+    each trial of T > nperseg timesteps owns T - nperseg consecutive rows,
+    with the same velocity as its timesteps [nperseg, T), and no row belongs
+    to a trial the SNN test set lacks. Raises ValueError otherwise."""
+    rebuild = "rebuild both datasets with nwb_conversion/run_nwb_pipeline.sh"
+    if row_trial_ids is None or any(t['trial_id'] is None for t in trials):
+        raise ValueError(f"hkm evaluation needs the trial IDs of the ANN dataset's rows (trial_id) and "
+                         f"of the SNN test trials; {rebuild}")
+    ids, starts, counts = np.unique(row_trial_ids, return_index=True, return_counts=True)
+    if np.count_nonzero(np.diff(row_trial_ids)) != len(ids) - 1:
+        raise ValueError("The ANN test rows of a trial are not consecutive")
+    rows = {int(i): slice(int(a), int(a + n)) for i, a, n in zip(ids, starts, counts)}
+
+    scored = set()
+    for trial in trials:
+        trial_id, n = int(trial['trial_id']), len(trial['velocity']) - BASE_NPERSEG
+        if n <= 0:
+            continue
+        if trial_id not in rows:
+            raise ValueError(f"SNN test trial {trial_id} has no ANN test rows: the datasets do not hold "
+                             f"out the same trials; {rebuild}")
+        r = rows[trial_id]
+        if r.stop - r.start != n:
+            raise ValueError(f"Trial {trial_id}: {r.stop - r.start} ANN test rows for "
+                             f"{len(trial['velocity'])} SNN timesteps, expected {n}")
+        if not np.allclose(trial['velocity'][BASE_NPERSEG:], y_test_vel[r], rtol=1e-4, atol=1e-3):
+            raise ValueError(f"Trial {trial_id}: the ANN and SNN datasets' velocities differ; {rebuild}")
+        scored.add(trial_id)
+    missing = sorted(set(rows) - scored)
+    if missing:
+        raise ValueError(f"{len(missing)} trial(s) with ANN test rows are not in the SNN test set "
+                         f"(e.g. {missing[:5]}); {rebuild}")
+    return rows
+
+
+def predict_snn_trials(model, velocity_scale, trials, experiment, continuous_stream=False):
+    """Run the SNN over every test trial in turn. Returns (predictions
+    (T, 2) per trial, op counts per trial). Every trial starts from rest,
+    unless continuous_stream (hkm only) carries the state across trials."""
+    continuous = continuous_stream and experiment == 'hkm'
+    preds, ops = [], []
+    for i, trial in enumerate(trials):
+        y_pred, op_counts = predict_snn_trial(model, trial['input_spikes'], velocity_scale, experiment,
+                                              reset_state=(i == 0) or not continuous)
+        preds.append(y_pred)
+        ops.append(op_counts)
+    return preds, ops
+
+
+def scored_trials(n_trials, experiment):
+    """Indices of the test trials whose output is scored (module docstring)."""
+    if experiment == 'hkm' or n_trials == 1:
+        return list(range(n_trials))
+    return list(range(1, n_trials))
+
+
+def align_snn_output(per_trial, experiment, trials=None, test_rows=None, n_rows=None):
+    """Per-trial SNN outputs (predictions or spike counts, (T, k) each, in
+    trial order) -> one array of rows aligned like the ANN test rows' (see
+    the module docstring). bmi: trial 0 or the first nperseg timesteps are
+    dropped and the rest concatenated; the row offset is calibrated later.
+    hkm: an (n_rows, k) array, each trial's timesteps [nperseg, T) on its
+    test_rows (hkm_test_rows()), which cover every row."""
+    if experiment != 'hkm':
+        if len(per_trial) == 1:
+            return per_trial[0][BASE_NPERSEG:]
+        return np.concatenate(per_trial[1:], axis=0)
+    out = np.zeros((n_rows,) + per_trial[0].shape[1:])
+    for y, trial in zip(per_trial, trials):
+        rows = test_rows.get(int(trial['trial_id']))
+        if rows is not None:
+            out[rows] = y[BASE_NPERSEG:]
+    return out
+
+
+def training_loss_check(preds, trials, checkpoint, experiment):
+    """{test_loss, checkpoint_best_loss, relative_difference}: the mean over
+    test trials of each trial's RMSE (both axes, every timestep), which is
+    train_snn.py's test loss when every test trial was its own batch (hkm,
+    or a single test trial); None otherwise."""
+    if experiment != 'hkm' and len(trials) != 1:
+        return None
+    test_loss = float(np.mean([np.sqrt(np.mean((p - t['velocity']) ** 2)) for p, t in zip(preds, trials)]))
+    best = checkpoint.get('best_loss')
+    check = {'test_loss': test_loss, 'checkpoint_best_loss': None if best is None else float(best),
+             'relative_difference': None if not best else abs(test_loss - best) / abs(best)}
+    if best is None:
+        print(f"  Training-loss check: test loss {test_loss:.4f} (checkpoint has no best_loss)")
+    else:
+        verdict = ('matches' if check['relative_difference'] < 0.02 else
+                   'DIFFERS: the checkpoint was selected on another test split (e.g. a pooled '
+                   'pretraining checkpoint), or the model, velocity scaling or test data differ')
+        print(f"  Training-loss check: test loss {test_loss:.4f} vs checkpoint best_loss {best:.4f} "
+              f"({check['relative_difference']:.1%}): {verdict}")
+    return check
+
+
 def _lagged_correlation(a, b, max_lag):
     """Correlation of a[t] with b[t + lag] for lag in [-max_lag, max_lag]."""
     lags = np.arange(-max_lag, max_lag + 1)
@@ -230,8 +359,8 @@ def _lagged_correlation(a, b, max_lag):
 
 
 def calibrate_snn_ann_offset(snn_dataset_path, y_test_vel, max_lag=2000, min_confidence=0.9):
-    """ANN test row that SNN timestep 0 (after the dropped first window)
-    corresponds to, found by matching true velocity on both sides.
+    """bmi only. ANN test row that SNN timestep 0 (after the dropped first
+    window) corresponds to, found by matching true velocity on both sides.
 
     Returns 0 when the two already match, or when no lag correlates above
     min_confidence (with a warning: the two datasets may not be the same
@@ -267,42 +396,15 @@ def calibrate_snn_ann_offset(snn_dataset_path, y_test_vel, max_lag=2000, min_con
     return 0
 
 
-def predict_snn_test_set(model, velocity_scale, snn_dataset_path, experiment,
-                         continuous_stream=False):
-    """Run the SNN over every test trial.
-
-    Returns (pred (n, 2), op_estimate), with the first window dropped (see
-    module docstring). continuous_stream (HKM only) carries state across
-    trials instead of resetting at each one."""
-    files = snn_test_files(snn_dataset_path)
-    if len(files) == 1:
-        y_pred, ops = predict_snn_trial(model, _load_pickle(files[0])['input_spikes'],
-                                        velocity_scale, experiment)
-        # op counts cover the whole call, including the dropped first window
-        return y_pred[BASE_NPERSEG:], finalize_snn_ops(ops['mac'], ops['acc'], ops['elementwise'],
-                                                       n_samples=len(y_pred))
-
-    continuous = continuous_stream and experiment == 'hkm'
-    preds, mac, acc, elementwise, n_samples = [], 0, 0.0, 0, 0
-    for i, path in enumerate(files):
-        y_pred, ops = predict_snn_trial(model, _load_pickle(path)['input_spikes'], velocity_scale,
-                                        experiment, reset_state=(i == 0) or not continuous)
-        if i == 0:
-            continue
-        preds.append(y_pred)
-        mac, acc, elementwise = mac + ops['mac'], acc + ops['acc'], elementwise + ops['elementwise']
-        n_samples += len(y_pred)
-    return np.concatenate(preds, axis=0), finalize_snn_ops(mac, acc, elementwise, n_samples=n_samples)
-
-
-def predict_speck_test_set(model, checkpoint, velocity_scale, cfg):
-    """predict_snn_test_set() on the Speck devkit: returns (pred, chip
-    timing and power, output spike counts), see speck.py."""
+def predict_speck_test_set(model, checkpoint, velocity_scale, trials, cfg):
+    """predict_snn_trials() on the Speck devkit: returns (predictions and
+    output spike counts per trial, None for a trial not run, and the chip's
+    timing and power), see speck.py."""
     import speck
     device = speck.open_speck(model, checkpoint, cfg.snn_dataset_path, cfg.speck_devkit,
                               cfg.speck_wait_time, cfg.speck_raster_dt)
     try:
-        return speck.predict_speck_test_set(model, velocity_scale, cfg.snn_dataset_path, device,
+        return speck.predict_speck_test_set(model, velocity_scale, trials, device,
                                             cfg.experiment, cfg.continuous_snn_test_stream)
     finally:
         device.close()
@@ -391,7 +493,8 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
                       speck_checkpoint_path=None):
     """Evaluate every available decoder for one training duration.
 
-    data: dict with X_test, y_test_full (6 columns), y_test_vel.
+    data: dict with X_test, y_test_full (6 columns), y_test_vel, y_test_pos and
+        test_trial_id (each test row's trial; required for hkm, None for bmi).
     cfg: namespace with model_dir, feature, test_frac, experiment,
         snn_dataset_path, continuous_snn_test_stream, ci_n_splits, verbose,
         and for 'speck' speck_devkit, speck_wait_time, speck_raster_dt.
@@ -403,6 +506,9 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
     'speck' runs speck_checkpoint_path if given, else snn_checkpoint_path;
     the checkpoint each SNN decoder ran is recorded under 'checkpoints', and
     the first scored row of the SNN test predictions under 'snn_row_offset'.
+    'snn' also has its 'training_check' (training_loss_check()) where
+    defined. arrays['trial_starts'] holds the scored rows where a trial
+    starts when the dataset records trials (hkm), else None.
     """
     tag = f"{duration_minutes:g}min" if duration_minutes is not None else None
     label = tag or 'full'
@@ -428,29 +534,46 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
     snn_names = [d for d in SNN_DECODERS if d in decoders]
     found = [d for d in snn_names if checkpoints[d] and os.path.exists(checkpoints[d])]
     missing += [d for d in snn_names if d not in found]
-    snn_preds, chip, speck_counts, snn_row_offset, loaded = {}, None, None, None, {}
+    snn_preds, chip, speck_counts, snn_row_offset, training_check, loaded = {}, None, None, None, None, {}
+    trials = load_test_trials(cfg.snn_dataset_path) if found else []
+    test_rows = (hkm_test_rows(trials, data.get('test_trial_id'), data['y_test_vel'])
+                 if found and cfg.experiment == 'hkm' else None)
+    scored = scored_trials(len(trials), cfg.experiment)
+
+    def align(per_trial):
+        return align_snn_output(per_trial, cfg.experiment, trials, test_rows, n_test)
+
     for name in found:
         path = checkpoints[name]
         if path not in loaded:
             loaded[path] = load_snn_model(path, cfg.experiment)
         model, checkpoint, scale = loaded[path]
         if name == 'snn':
-            print(f"  Evaluating SNN ({label}): {path}")
-            snn_preds['snn'], op_estimates['snn'] = predict_snn_test_set(
-                model, scale, cfg.snn_dataset_path, cfg.experiment, cfg.continuous_snn_test_stream)
+            print(f"  Evaluating SNN ({label}): {path} ({len(trials)} test trials)")
+            per_trial, ops = predict_snn_trials(model, scale, trials, cfg.experiment,
+                                                cfg.continuous_snn_test_stream)
+            training_check = training_loss_check(per_trial, trials, checkpoint, cfg.experiment)
+            snn_preds['snn'] = align(per_trial)
+            # op counts cover the scored trials' whole calls, including their first window
+            op_estimates['snn'] = finalize_snn_ops(
+                *(sum(ops[i][k] for i in scored) for k in ('mac', 'acc', 'elementwise')),
+                n_samples=sum(len(per_trial[i]) for i in scored))
         else:
             print(f"  Evaluating SNN on Speck ({label}): {path}")
             try:
-                snn_preds['speck'], chip, speck_counts = predict_speck_test_set(model, checkpoint, scale, cfg)
+                per_trial, per_trial_counts, chip = predict_speck_test_set(model, checkpoint, scale,
+                                                                           trials, cfg)
             except Exception as e:   # e.g. no devkit: keep the other decoders' results
                 print(f"  [skip] speck ({label}): {type(e).__name__}: {e}")
                 missing.append('speck')
                 continue
+            snn_preds['speck'], speck_counts = align(per_trial), align(per_trial_counts)
             op_estimates['speck'] = None
     if snn_preds:
         # Both run the same trials (whichever checkpoint), so they share one
         # alignment. Intersect their rows with the ANN decoders' range.
-        snn_start = calibrate_snn_ann_offset(cfg.snn_dataset_path, data['y_test_vel'])
+        snn_start = (0 if cfg.experiment == 'hkm'
+                     else calibrate_snn_ann_offset(cfg.snn_dataset_path, data['y_test_vel']))
         trim = max(0, start - snn_start)
         snn_start += trim
         snn_end = min(end, snn_start + min(len(p) for p in snn_preds.values()) - trim)
@@ -482,6 +605,8 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
         if duration_minutes is not None:
             m['train_duration_minutes'] = duration_minutes
         m['op_estimate'] = op_estimates[name]
+        if name == 'snn' and training_check is not None:
+            m['training_check'] = training_check
         if name == 'speck':
             m['chip'] = chip
             energy = f"measured energy/sample {chip['energy_j'] * 1e6:.4f} uJ"
@@ -492,11 +617,16 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
         metrics[name] = m
         print(f"  {name.upper():>5s} | RMSE={m['rmse']:.4f} | CC_x={m['cc_x']:.4f} CC_y={m['cc_y']:.4f} "
               f"| R2_x={m['r2_x']:.4f} R2_y={m['r2_y']:.4f} | {energy}")
-    print(f"  Scored test rows [{start}, {end}) ({n} samples)")
+    row_trials = data.get('test_trial_id')
+    trial_starts = (None if row_trials is None else
+                    np.flatnonzero(np.diff(row_trials[start:end], prepend=row_trials[start] - 1)))
+    print(f"  Scored test rows [{start}, {end}) ({n} samples"
+          + ("" if trial_starts is None else f", {len(trial_starts)} trials") + ")")
     return {'duration_tag': tag, 'train_duration_minutes': duration_minutes,
             'start_raw': start, 'end_raw': end, 'n_samples': n,
             'decoders': list(aligned), 'metrics': metrics,
             'checkpoints': {name: checkpoints[name] for name in snn_preds},
             'snn_row_offset': snn_row_offset,
             'arrays': {'y_true': y_true, 'y_pos': data['y_test_pos'][start:end], 'pred': aligned,
-                       'speck_counts': speck_counts if 'speck' in aligned else None}}
+                       'speck_counts': speck_counts if 'speck' in aligned else None,
+                       'trial_starts': trial_starts}}

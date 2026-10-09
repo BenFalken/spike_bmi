@@ -39,7 +39,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from decoder_eval import BASE_NPERSEG, _load_pickle, snn_test_files, unscale_velocity
+from decoder_eval import _load_pickle, snn_test_files, unscale_velocity
 
 POWER_SAMPLE_RATE_HZ = 100
 RESET_SETTLE_S = 1.0     # after writing zeroed membrane values to a layer
@@ -304,40 +304,37 @@ def open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt
     return SpeckDevkit(snn_seq, model.layers[0].in_features, devkit, wait_time, raster_dt, monitor_all)
 
 
-def predict_speck_test_set(model, velocity_scale, snn_dataset_path, device, experiment,
-                           continuous_stream=False):
-    """The chip counterpart of decoder_eval.predict_snn_test_set(): the same
-    trials, the same dropped first window, so its output aligns the same way.
+def predict_speck_test_set(model, velocity_scale, trials, device, experiment, continuous_stream=False):
+    """The chip counterpart of decoder_eval.predict_snn_trials(): the same
+    test trials (decoder_eval.load_test_trials()), each from a reset chip
+    unless continuous_stream (hkm only) carries the state across trials.
+    With several bmi trials, trial 0 is not run: decoder_eval drops its
+    output anyway (see its module docstring).
 
-    Returns (pred (n, 2), chip, output spike counts (n, 2 * n_bins)) with
-    chip = {latency_s, energy_j (per sample), power_w, param_count,
-    n_timesteps, output_spikes_per_step, input_events_sent,
-    input_spikes, wait_time_s, raster_dt}; input_events_sent should equal
-    input_spikes (the summed input counts)."""
-    files = snn_test_files(snn_dataset_path)
+    Returns (predictions (T, 2) per trial, output spike counts
+    (T, 2 * n_bins) per trial, chip), the lists in trial order with None for
+    a trial not run, and chip = {latency_s, energy_j (per sample), power_w,
+    param_count, n_timesteps, output_spikes_per_step, input_events_sent,
+    input_spikes, wait_time_s, raster_dt} over every trial run;
+    input_events_sent should equal input_spikes (the summed input counts)."""
     continuous = continuous_stream and experiment == 'hkm'
     n_outputs = 2 * model.n_bins
-    preds, kept_counts, loop_s, energy_j, n_timed, n_spikes = [], [], 0.0, 0.0, 0, 0.0
-    n_events, n_input = 0, 0
-    for i, path in enumerate(files):
-        if i == 0 and len(files) > 1 and not continuous:
+    preds, counts_per_trial = [None] * len(trials), [None] * len(trials)
+    loop_s, energy_j, n_timed, n_spikes, n_events, n_input = 0.0, 0.0, 0, 0.0, 0, 0
+    for i, trial in enumerate(trials):
+        if experiment != 'hkm' and i == 0 and len(trials) > 1:
             continue                                  # dropped anyway; skip the chip time
-        if i == 0 or not continuous:
+        if not continuous or i == 0:
             device.reset()
-        spikes = _load_pickle(path)['input_spikes']
+        spikes = trial['input_spikes']
         counts, seconds, power_w, events = device.run(spikes, n_outputs)
         n_events, n_input = n_events + events, n_input + int(np.round(spikes).sum())
-        print(f"  [speck] trial {i + 1}/{len(files)}: {spikes.shape[1]} timesteps, "
+        print(f"  [speck] trial {i + 1}/{len(trials)}: {spikes.shape[1]} timesteps, "
               f"{seconds * 1000 / spikes.shape[1]:.3f} ms/timestep, {power_w * 1000:.3f} mW")
         loop_s, energy_j, n_timed = loop_s + seconds, energy_j + power_w * seconds, n_timed + len(counts)
         n_spikes += counts.sum()
-        y_pred = unscale_velocity(decode_spike_counts(model, counts), velocity_scale)
-        if len(files) == 1:
-            preds.append(y_pred[BASE_NPERSEG:])
-            kept_counts.append(counts[BASE_NPERSEG:])
-        elif i > 0:
-            preds.append(y_pred)
-            kept_counts.append(counts)
+        preds[i] = unscale_velocity(decode_spike_counts(model, counts), velocity_scale)
+        counts_per_trial[i] = counts
     if n_events != n_input:
         print(f"  WARNING: {n_events} input events sent to the chip for {n_input} input spikes")
     chip = {'latency_s': loop_s / n_timed, 'energy_j': energy_j / n_timed,
@@ -346,4 +343,4 @@ def predict_speck_test_set(model, velocity_scale, snn_dataset_path, device, expe
             'output_spikes_per_step': float(n_spikes / n_timed),
             'input_events_sent': int(n_events), 'input_spikes': int(n_input),
             'wait_time_s': device.wait_time, 'raster_dt': device.raster_dt}
-    return np.concatenate(preds, axis=0), chip, np.concatenate(kept_counts, axis=0)
+    return preds, counts_per_trial, chip

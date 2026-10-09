@@ -495,14 +495,19 @@ def process_session(raw_stem=RAW_STEM, feature=FEATURE, overwrite=False):
     print(f"\nDone: {raw_stem} ({feature})")
 
 
-def process_nwb_session(raw_stem, dataset_filepath, feature=FEATURE, overwrite=False, gap_samples=0):
+def process_nwb_session(raw_stem, dataset_filepath, feature=FEATURE, overwrite=False, gap_samples=None):
     """Decoder evaluation for a trial-structured NWB session.
 
     dataset_filepath is the {session}_binning.h5 written by
     nwb_conversion/run_nwb_pipeline.sh. Its rows are concatenated trials, so
-    the train/test boundary is read from its n_train attribute rather than
-    computed. Train and test never share a trial, so no purge gap is needed
-    (gap_samples=0)."""
+    the train/test boundary is read from its n_train attribute (a trial
+    boundary, shared with the SNN dataset) rather than computed.
+
+    gap_samples=None keeps the eval scripts' default purge gap: the final
+    split already falls between trials, but the CV folds split rows at
+    arbitrary points, often inside a trial, where neighbouring rows share
+    most of their window. The gap costs the final model only the last
+    ~140 rows of its last training trial."""
     with h5py.File(dataset_filepath, "r") as f:
         n_train = f.attrs.get("n_train")
     if n_train is None:
@@ -510,7 +515,7 @@ def process_nwb_session(raw_stem, dataset_filepath, feature=FEATURE, overwrite=F
                          f"nwb_conversion/combine_trial_windows_to_ann_h5.py. Use process_session() "
                          f"for continuous sessions.")
     print(f"Train/test boundary from {dataset_filepath}: n_train={int(n_train)}, "
-          f"gap_samples={gap_samples}")
+          f"gap_samples={'default' if gap_samples is None else gap_samples}")
     _evaluate_and_plot(raw_stem, dataset_filepath, feature, overwrite, wf_tap=WF_TAP_HKM,
                        n_train_override=int(n_train), gap_samples=gap_samples)
     print(f"\nDone: {raw_stem} ({feature}) [NWB/trial-structured]")
@@ -526,8 +531,9 @@ if __name__ == "__main__":
     parser.add_argument("--nwb_dataset_filepath", type=str, default=None,
                         help="Run process_nwb_session() on this {session}_binning.h5 instead of "
                              "the full .mat pipeline")
-    parser.add_argument("--gap_samples", type=int, default=0,
-                        help="Purge gap for --nwb_dataset_filepath runs (default 0)")
+    parser.add_argument("--gap_samples", type=int, default=None,
+                        help="Purge gap for --nwb_dataset_filepath runs (default: the eval "
+                             "scripts' default, see bmi/evaluation.py)")
     args = parser.parse_args()
     if args.nwb_dataset_filepath:
         process_nwb_session(args.raw_stem, args.nwb_dataset_filepath, feature=args.feature,

@@ -20,6 +20,11 @@ The file has three sections, each computed only where missing (or with
                and its method, and parameter count per decoder (profiling.py;
                'speck' copied from its chip measurement)
 
+hkm sessions are scored trial by trial: every SNN test trial (one whole
+reach) runs from rest, and its output is placed on that trial's own ANN test
+rows (see decoder_eval.py). This needs the trial IDs that
+nwb_conversion/run_nwb_pipeline.sh stores in both datasets.
+
 The full-data predictions are also saved next to --output as
 <session>_arrays.npz, so --figures_dir can redraw the per-session figures
 (session_figures.py) without evaluating again, e.g. without the chip;
@@ -77,14 +82,20 @@ from profiling import profile_decoders  # noqa: E402
 
 
 def load_session_data(args):
+    """The test rows of the ANN dataset, with each row's trial ID where the
+    dataset records them (hkm: nwb_conversion/combine_trial_windows_to_ann_h5.py)."""
     with h5py.File(args.input_filepath, 'r') as f:
         X = f[f'X_{args.feature}'][()]
         y_task = f['y_task'][()]
+        trial_id = f['trial_id'][()] if 'trial_id' in f else None
         n_train_attr = f.attrs.get('n_train')
     n_train = test_split_start(len(X), args.test_frac, n_train_attr, args.n_train_override)
-    print(f"Chronological split: {n_train} train rows, {len(X) - n_train} test rows")
+    test_trial_id = None if trial_id is None else trial_id[n_train:]
+    print(f"Chronological split: {n_train} train rows, {len(X) - n_train} test rows"
+          + ("" if test_trial_id is None else f" ({len(np.unique(test_trial_id))} trials)"))
     return {'X_test': X[n_train:], 'y_test_full': y_task[n_train:],
-            'y_test_vel': y_task[n_train:, 2:4], 'y_test_pos': y_task[n_train:, 0:2]}
+            'y_test_vel': y_task[n_train:, 2:4], 'y_test_pos': y_task[n_train:, 0:2],
+            'test_trial_id': test_trial_id}
 
 
 def changed_checkpoints(full, args, decoders):
@@ -102,6 +113,8 @@ def _json_ready(result):
 def save_arrays(arrays, path):
     extra = {} if arrays.get('speck_counts') is None else {
         'speck_counts': arrays['speck_counts'].astype(np.uint16)}
+    if arrays.get('trial_starts') is not None:
+        extra['trial_starts'] = arrays['trial_starts']
     np.savez_compressed(path, y_true=arrays['y_true'], y_pos=arrays['y_pos'], **extra,
                         **{f"pred_{name}": y for name, y in arrays['pred'].items()})
 
@@ -110,6 +123,7 @@ def load_arrays(path):
     with np.load(path) as f:
         return {'y_true': f['y_true'], 'y_pos': f['y_pos'],
                 'speck_counts': f['speck_counts'] if 'speck_counts' in f.files else None,
+                'trial_starts': f['trial_starts'] if 'trial_starts' in f.files else None,
                 'pred': {k[len('pred_'):]: f[k] for k in f.files if k.startswith('pred_')}}
 
 
@@ -289,7 +303,8 @@ def build_parser():
     ev.add_argument('--ci_n_splits', type=int, default=DEFAULT_CI_N_SPLITS,
                     help='Contiguous chunks used for the within-session CIs')
     ev.add_argument('--continuous_snn_test_stream', action='store_true',
-                    help='HKM only: carry SNN state across test trials instead of resetting')
+                    help='HKM only: carry SNN state across test trials instead of starting each '
+                         'from rest (as in training)')
     ev.add_argument('--verbose', type=int, default=0)
 
     speck = parser.add_argument_group("the 'speck' decoder (needs samna and a connected devkit)")

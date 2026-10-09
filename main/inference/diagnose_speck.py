@@ -79,8 +79,12 @@ MATCH_TOL = 1e-3
 
 def decode_versions(checkpoint_path, snn_dataset_path, experiment):
     """({version: (n, 2) velocity}, (n, 2) SNN dataset velocity, {version:
-    (n, 2 * n_bins) output spike counts}, decode) over the test trials, first
-    window dropped; decode(counts) -> velocity, as for the chip."""
+    (n, 2 * n_bins) output spike counts}, decode) over the test trials, with
+    the rows test_all_decoders.py scores: bmi drops the first window, hkm
+    keeps timesteps [nperseg, T) of every trial (each trial run from rest),
+    which concatenated are the ANN test rows. decode(counts) -> velocity, as
+    for the chip (for hkm, re-decoding concatenated counts carries the
+    readout's EMA across trials, unlike the chip run)."""
     model, checkpoint, scale = load_snn_model(checkpoint_path, experiment)
     speck.check_deployable(model, checkpoint)
     snn_seq = speck.flatten_snn(model)
@@ -92,10 +96,10 @@ def decode_versions(checkpoint_path, snn_dataset_path, experiment):
     files = snn_test_files(snn_dataset_path)
     preds, counts_kept, targets = {v: [] for v in runners}, {v: [] for v in runners}, []
     for i, path in enumerate(files):
-        if i == 0 and len(files) > 1:
+        if experiment != 'hkm' and i == 0 and len(files) > 1:
             continue                                # dropped, as in test_all_decoders.py
         trial = _load_pickle(path)
-        keep = slice(BASE_NPERSEG, None) if len(files) == 1 else slice(None)
+        keep = slice(BASE_NPERSEG, None) if experiment == 'hkm' or len(files) == 1 else slice(None)
         targets.append(trial['velocity'][keep])
         for version, run in runners.items():
             counts = run(trial['input_spikes'])

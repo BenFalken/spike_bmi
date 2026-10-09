@@ -6,6 +6,10 @@ A dataset directory has train/ and test/ subfolders of trials named 0.pkl,
     input_spikes  (n_units, T)  spike counts per 4 ms bin
     velocity      (T, 2)        hand velocity in physical units
 
+bmi trials of one split share one length. hkm trials are whole reaches of
+different lengths (nwb_conversion/make_snn_dataset_whole_trial.py), so they
+can only be loaded one per batch (--batch-size 1).
+
 Velocity is scaled to [margin, 1 - margin] using per-subject bounds from
 velocity_scalers.json (written by preprocessing_training/
 compute_velocity_scalers.py; override the path with
@@ -97,6 +101,11 @@ class CustomDataset(Dataset):
     def __len__(self) -> int:
         return len(self.files)
 
+    def trial_length(self, idx: int) -> int:
+        """Timesteps of trial idx."""
+        with open(os.path.join(self.split_dir, self.files[idx]), 'rb') as f:
+            return pkl.load(f)['input_spikes'].shape[1]
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with open(os.path.join(self.split_dir, self.files[idx]), 'rb') as f:
             data = pkl.load(f)
@@ -115,6 +124,10 @@ def _natural_key(name: str):
 
 def collate_fn(batch: list) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     labels, spikes, velocity = zip(*batch)
+    lengths = sorted({s.shape[0] for s in spikes})
+    if len(lengths) > 1:
+        raise ValueError(f"Cannot batch trials of different lengths ({lengths[:5]}...); "
+                         f"whole-trial datasets (hkm) need --batch-size 1")
     return torch.stack(labels), torch.stack(spikes), torch.stack(velocity)
 
 

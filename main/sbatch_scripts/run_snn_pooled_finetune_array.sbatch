@@ -10,15 +10,20 @@
 # subject (array task i = session i). Each run starts from the pretrained
 # model's weights (--init-weights-from, fresh optimizer) and uses exactly the
 # network and training settings of pretraining (snn_medium_config.sh). With
-# TAU_SYN and/or RESET_TYPE set, it fine-tunes the matching pretrained model.
+# TAU_SYN and/or RESET_TYPE set, it fine-tunes the matching pretrained model;
+# with LOSO=1, session i starts from the model pretrained without it (see
+# run_snn_pooled_pretrain.sbatch, which also shows how to chain the two).
 #
 # Submit (from this directory), validating one session first:
 #   mkdir -p snn_logs
 #   N=$(find $DATA_ROOT/snn_datasets/bmi/indy/mua_8_group -mindepth 1 -maxdepth 1 -type d | wc -l)
 #   sbatch --export=ALL,EXPERIMENT=bmi,SUBJECT=indy --array=0 run_snn_pooled_finetune_array.sbatch
 #   sbatch --export=ALL,EXPERIMENT=bmi,SUBJECT=indy --array=1-$((N-1)) run_snn_pooled_finetune_array.sbatch
+#   (hkm: the sessions are under snn_datasets/hkm/<subject>/mua; add --time=48:00:00)
 #
-# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/full_cohort_finetuned_medium[_tau_syn_<T>][_soft]/<session>/
+# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/
+#   {full_cohort,loso}_finetuned_medium[_tau_syn_<T>][_soft]/<session>/
+# Evaluate them with run_inference.sbatch SNN_CHECKPOINT_ROOT=<that directory>.
 # Re-submitting skips finished sessions and resumes interrupted ones.
 
 set -eo pipefail
@@ -31,20 +36,9 @@ fi
 DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
 source ./snn_medium_config.sh
 
-PRETRAINED_CHECKPOINT="${PRETRAIN_DIR}/best_model_weights.pth"
-if [ ! -f "$PRETRAINED_CHECKPOINT" ]; then
-    echo "ERROR: $PRETRAINED_CHECKPOINT not found; run run_snn_pooled_pretrain.sbatch" \
-         "for ${EXPERIMENT}/${SUBJECT} (TAU_SYN=${TAU_SYN}, RESET_TYPE=${RESET_TYPE}) first." >&2
-    exit 1
-fi
-
 # --- Resolve session ---
-mapfile -t SESSION_DIRS < <(find "$SNN_DATASET_ROOT" -maxdepth 1 -mindepth 1 -type d | sort)
+session_dirs
 N_SESSIONS=${#SESSION_DIRS[@]}
-if [ "$N_SESSIONS" -eq 0 ]; then
-    echo "ERROR: no session directories under $SNN_DATASET_ROOT" >&2
-    exit 1
-fi
 if [ "$SLURM_ARRAY_TASK_ID" -ge "$N_SESSIONS" ]; then
     echo "Array task $SLURM_ARRAY_TASK_ID has no session ($N_SESSIONS found); exiting."
     exit 0
@@ -53,6 +47,13 @@ SESSION_DIR="${SESSION_DIRS[$SLURM_ARRAY_TASK_ID]}"
 SESSION_ID="$(basename "$SESSION_DIR")"
 if [ ! -d "$SESSION_DIR/train" ] || [ ! -d "$SESSION_DIR/test" ]; then
     echo "ERROR: no train/ or test/ subfolder under $SESSION_DIR" >&2
+    exit 1
+fi
+
+PRETRAINED_CHECKPOINT="$(pretrain_dir "$SESSION_ID")/best_model_weights.pth"
+if [ ! -f "$PRETRAINED_CHECKPOINT" ]; then
+    echo "ERROR: $PRETRAINED_CHECKPOINT not found; run run_snn_pooled_pretrain.sbatch for" \
+         "${EXPERIMENT}/${SUBJECT} (TAU_SYN=${TAU_SYN}, RESET_TYPE=${RESET_TYPE}, LOSO=${LOSO}) first." >&2
     exit 1
 fi
 
@@ -76,7 +77,8 @@ export OPENBLAS_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 echo "Fine-tuning ${EXPERIMENT}/${SUBJECT}/${SESSION_ID} ($((SLURM_ARRAY_TASK_ID + 1))/${N_SESSIONS}):" \
-     "hidden=${HIDDEN_DIMS[*]} thresholds=${THRESHOLDS[*]} tau_syn=${TAU_SYN} reset=${RESET_TYPE} -> ${CHECKPOINT_DIR}"
+     "hidden=${HIDDEN_DIMS[*]} thresholds=${THRESHOLDS[*]} tau_syn=${TAU_SYN} reset=${RESET_TYPE}" \
+     "batch=${BATCH_SIZE} -> ${CHECKPOINT_DIR}"
 mkdir -p "$CHECKPOINT_DIR"
 
 python3 "$TRAIN_SCRIPT" \

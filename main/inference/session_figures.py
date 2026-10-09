@@ -17,6 +17,10 @@ shows as overlap, in a grid two panels wide. Every GIF_STRIDE-th sample is shown
 GIF_MAX_FRAMES frames (GIF_STRIDE x more of the session than consecutive
 frames would cover; the writer holds every frame in memory). Position is
 integrated from the full-resolution velocity before subsampling.
+
+hkm test rows are whole trials, concatenated (arrays['trial_starts']), so
+there the grids show one trial per panel, and integrated position restarts
+from the true position at every trial start.
 """
 
 import os
@@ -46,38 +50,58 @@ def reconstruct_path(anchor, velocities, step_time=STEP_S):
     return np.vstack([anchor, anchor + np.cumsum(np.asarray(velocities) * step_time, axis=0)])
 
 
+def integrate_position(y_pos, velocities, trial_starts=None):
+    """(n, 2) position integrated from velocities (n, 2), starting from the
+    true position y_pos at row 0 and, given trial_starts, again at every
+    trial start."""
+    starts = [0] if trial_starts is None else [int(a) for a in trial_starts]
+    ends = starts[1:] + [len(velocities)]
+    return np.concatenate([reconstruct_path(y_pos[a], velocities[a:b - 1]) for a, b in zip(starts, ends)])
+
+
+def segment_bounds(n, segment_samples, n_segments, trial_starts=None):
+    """[(start, stop)] rows of the grid's panels: the first n_segments
+    trials given trial_starts, else consecutive segment_samples-long segments."""
+    if trial_starts is None:
+        return [(k * segment_samples, (k + 1) * segment_samples)
+                for k in range(min(n_segments, n // segment_samples))]
+    ends = [int(a) for a in trial_starts[1:]] + [n]
+    return [(int(a), b) for a, b in zip(trial_starts, ends) if b - a >= 2][:n_segments]
+
+
 def segment_grid_figure(y_common, pred_common, session, segment_samples=260, n_segments=16,
-                        reconstruct=True):
-    """Grid of the first n_segments segment_samples-long segments.
+                        reconstruct=True, trial_starts=None):
+    """Grid of the first n_segments segment_samples-long segments, or of the
+    first n_segments trials given trial_starts.
 
     reconstruct=True: y_common is position and predictions (velocity) are
     integrated from each segment's true start. False: y_common and the
     predictions are both velocity and are plotted directly."""
-    n_segments = min(n_segments, len(y_common) // segment_samples)
-    if n_segments == 0:
+    bounds = segment_bounds(len(y_common), segment_samples, n_segments, trial_starts)
+    if not bounds:
         print(f"  [skip] segment grid: fewer than {segment_samples} scored samples")
         return None
     space = 'position' if reconstruct else 'velocity'
-    side = int(np.ceil(np.sqrt(n_segments)))
+    unit = 'segment' if trial_starts is None else 'trial'
+    side = int(np.ceil(np.sqrt(len(bounds))))
     fig, axes = plt.subplots(side, side, figsize=(3.2 * side, 3.2 * side))
     axes = np.atleast_1d(axes).flatten()
-    for k, ax in enumerate(axes[:n_segments]):
-        i0, i1 = k * segment_samples, (k + 1) * segment_samples - 1
-        true = y_common[i0:i1 + 1]
+    for k, (ax, (i0, i1)) in enumerate(zip(axes, bounds)):
+        true = y_common[i0:i1]
         ax.plot(true[:, 0], true[:, 1], color='black', linewidth=1.6, label='true', zorder=5)
         for name, y_pred in pred_common.items():
-            path = reconstruct_path(true[0], y_pred[i0:i1]) if reconstruct else y_pred[i0:i1 + 1]
+            path = reconstruct_path(true[0], y_pred[i0:i1 - 1]) if reconstruct else y_pred[i0:i1]
             ax.plot(path[:, 0], path[:, 1], color=COLORS.get(name, 'gray'), linewidth=1.0,
                     alpha=0.85, label=name.upper())
-        ax.scatter(*true[0], marker='s', s=28, color='black', zorder=6, label='segment start')
+        ax.scatter(*true[0], marker='s', s=28, color='black', zorder=6, label=f'{unit} start')
         ax.scatter(*true[-1], marker='o', s=40, facecolor='none', edgecolor='black',
                    linewidth=1.3, zorder=6, label=f'true {space} end')
         ax.set_xticks([]); ax.set_yticks([])
-        ax.set_title(f"segment {k} ({i1 - i0 + 1} samples)", fontsize=8)
-    for ax in axes[n_segments:]:
+        ax.set_title(f"{unit} {k} ({i1 - i0} samples)", fontsize=8)
+    for ax in axes[len(bounds):]:
         ax.axis('off')
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.suptitle(f"{session}: true vs. decoded hand {space} per segment", fontsize=13, y=1.05)
+    fig.suptitle(f"{session}: true vs. decoded hand {space} per {unit}", fontsize=13, y=1.05)
     fig.legend(handles, labels, loc='upper center', ncol=min(len(labels), 8),
                bbox_to_anchor=(0.5, 1.00), frameon=False, fontsize=9)
     fig.tight_layout(rect=[0, 0, 1, 0.93])
@@ -187,20 +211,22 @@ def save_session_figures(result, session, figures_dir, roll_window=20, speed_bin
             print(f"  [skip] figures: none of {decoders} were evaluated for {session}")
             return
     metrics, names, n = result['metrics'], list(pred), len(y_true)
+    trial_starts = result['arrays'].get('trial_starts')
     sq_err = {name: (y - y_true) ** 2 for name, y in pred.items()}
     per_sample_rmse = {name: np.sqrt(e.mean(axis=1)) for name, e in sq_err.items()}
-    xlabel = f"Test sample (from test row {result['start_raw']})"
+    xlabel = f"Test sample (from test row {result['start_raw']}" + (
+        ")" if trial_starts is None else f"; {len(trial_starts)} trials, concatenated)")
     style = lambda name: dict(color=COLORS.get(name, 'gray'), linestyle=STYLES.get(name, '-'))
 
     gif = os.path.join(figures_dir, f"{session}_{{}}_crosshairs.gif")
     save_crosshair_gif(y_true, pred, f'{session}: decoded velocity', gif.format('velocity'))
-    positions = {name: reconstruct_path(y_pos[0], y)[:n] for name, y in pred.items()}
+    positions = {name: integrate_position(y_pos, y, trial_starts) for name, y in pred.items()}
     save_crosshair_gif(y_pos, positions, f'{session}: integrated position', gif.format('position'))
 
-    _save(segment_grid_figure(y_pos, pred, session, segment_samples, n_segments), figures_dir,
-          session, 'trajectory_grid')
-    _save(segment_grid_figure(y_true, pred, session, segment_samples, n_segments, reconstruct=False),
-          figures_dir, session, 'velocity_grid')
+    _save(segment_grid_figure(y_pos, pred, session, segment_samples, n_segments,
+                              trial_starts=trial_starts), figures_dir, session, 'trajectory_grid')
+    _save(segment_grid_figure(y_true, pred, session, segment_samples, n_segments, reconstruct=False,
+                              trial_starts=trial_starts), figures_dir, session, 'velocity_grid')
 
     fig, ax = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
     for a, col, axis in zip(ax, [0, 1], 'xy'):

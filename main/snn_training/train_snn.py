@@ -12,6 +12,10 @@ Every trial is an independent example: the model resets its state at the
 start of each forward pass. The loss is the RMSE between predicted and
 true velocity in physical units.
 
+bmi trials share one length and are batched. hkm trials are whole reaches
+of different lengths (nwb_conversion/make_snn_dataset_whole_trial.py), so
+hkm needs --batch-size 1: one trial per optimizer step.
+
 Synaptic time constant: --tau-syn is off by default (no synaptic-current
 stage). With a value, every spiking layer low-pass filters its input
 current with a time constant (in 4 ms timesteps) initialized to that value
@@ -237,17 +241,34 @@ def run_epoch(model, loader, criterion, device, scale, loss_eps, optimizer=None,
     return metrics["loss"], metrics
 
 
+def n_trials_for_minutes(dataset, minutes):
+    """Number of leading trials whose summed length is closest to `minutes`
+    (at least one). Trials may differ in length (hkm)."""
+    target = minutes * 60000.0 / STEP_MS
+    total = 0
+    for i in range(len(dataset)):
+        length = dataset.trial_length(i)
+        if total + length >= target:
+            return i + 1 if i == 0 or total + length - target < target - total else i
+        total += length
+    return len(dataset)
+
+
 def build_loaders(args, experiment, subject):
     """Train/test loaders. The test loader never drops trials; it batches
     whole test trials only when they all have the same length."""
+    if experiment == "hkm" and args.batch_size != 1:
+        raise ValueError(f"hkm trials differ in length and cannot be batched; use --batch-size 1 "
+                         f"(got {args.batch_size})")
     train_loader, test_loader = create_dataloaders(
         data_path=args.data_path, batch_size=args.batch_size, num_workers=args.num_workers,
         shuffle_train=True, experiment=experiment, subject=subject)
 
     trial_timesteps = train_loader.dataset[0][1].shape[0]
-    print(f"Train trial length: {trial_timesteps} timesteps ({trial_timesteps * STEP_MS:.0f} ms)")
+    print(f"First train trial: {trial_timesteps} timesteps ({trial_timesteps * STEP_MS:.0f} ms)")
     if args.train_data_min is not None:
-        n_trials = int(round(args.train_data_min * 60000.0 / (trial_timesteps * STEP_MS)))
+        n_trials = n_trials_for_minutes(train_loader.dataset, args.train_data_min)
+        print(f"--train-data-min {args.train_data_min:g}: first {n_trials} training trial(s)")
         subset = Subset(train_loader.dataset, range(min(n_trials, len(train_loader.dataset))))
         train_loader = DataLoader(subset, batch_size=train_loader.batch_size, shuffle=False,
                                   num_workers=train_loader.num_workers,

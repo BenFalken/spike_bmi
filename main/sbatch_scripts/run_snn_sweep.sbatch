@@ -7,7 +7,13 @@
 #SBATCH -e snn_logs/SNN_SWEEP_%A_%a.out
 #
 # SNN architecture/hyperparameter sweep: every config in SWEEP_TABLE is
-# trained separately on every session's grouped dataset (mua_8_group).
+# trained separately on every session of an experiment's subjects:
+#   bmi  the grouped datasets (mua_8_group), batches of 20 equal-length trials
+#   hkm  the whole-trial datasets (mua, nwb_conversion/), one trial per batch,
+#        since trials differ in length; an epoch takes about an hour, so hkm
+#        runs fewer epochs, checkpoints every epoch and gets a longer time
+#        limit (set in the printed sbatch command)
+# hkm needs hkm entries in velocity_scalers.json first (compute_velocity_scalers.py).
 #
 # TAU_SYN selects the sweep variant:
 #   TAU_SYN=none (default)  no synaptic-current stage -> <subject>/no_tau_syn_sweep/
@@ -45,7 +51,6 @@
 set -eo pipefail
 
 DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
-DATASET_SUBDIR="mua_8_group"
 CONFIG_YAML="../configs/iaf_hard_reset.yaml"
 TRAIN_SCRIPT="../snn_training/train_snn.py"
 # File prefix train_snn.py uses for an IAF / hard-reset model.
@@ -65,13 +70,20 @@ set_tau_syn() {
 set_tau_syn "${TAU_SYN:-none}"
 
 # ---------------------------------------------------------------------------
-# Training controls (shared by every config)
+# Training controls (shared by every config), per experiment
 # ---------------------------------------------------------------------------
-BATCH_SIZE=20
-EPOCHS=50
-PATIENCE=10
-SCHEDULER_PATIENCE=5
-CHECKPOINT_INTERVAL=10
+# set_experiment EXPERIMENT -> sets DATASET_SUBDIR, the training controls and
+# TIME_LIMIT (the Slurm limit printed in the plan's sbatch command).
+set_experiment() {
+    case "$1" in
+        hkm)
+            DATASET_SUBDIR="mua"; BATCH_SIZE=1; EPOCHS=20; PATIENCE=5; SCHEDULER_PATIENCE=5
+            CHECKPOINT_INTERVAL=1; TIME_LIMIT="24:00:00" ;;
+        *)
+            DATASET_SUBDIR="mua_8_group"; BATCH_SIZE=20; EPOCHS=50; PATIENCE=10; SCHEDULER_PATIENCE=5
+            CHECKPOINT_INTERVAL=10; TIME_LIMIT="" ;;
+    esac
+}
 
 SPIKE_FN="multi"
 NEURON_TYPE="iaf"
@@ -218,7 +230,7 @@ checkpoint_dir() {
 }
 
 # subject is the directory two levels above the session dir:
-#   .../snn_datasets/<exp>/<subject>/mua_8_group/<session>
+#   .../snn_datasets/<exp>/<subject>/<DATASET_SUBDIR>/<session>
 subject_of() {
     basename "$(dirname "$(dirname "$1")")"
 }
@@ -245,6 +257,7 @@ if [ "${1:-}" = "--plan" ]; then
         echo "Usage: [SWEEP_FILTER=regex] bash $0 --plan <experiment> [subject]" >&2
         exit 1
     fi
+    set_experiment "$PLAN_EXPERIMENT"
 
     if [ -n "$PLAN_SUBJECT" ]; then
         glob="${DATA_ROOT}/snn_datasets/${PLAN_EXPERIMENT}/${PLAN_SUBJECT}/${DATASET_SUBDIR}"
@@ -293,7 +306,7 @@ if [ "${1:-}" = "--plan" ]; then
     done
 
     n_pending=$(wc -l < "$manifest")
-    echo "# sweep:             $SWEEP_TAG (TAU_SYN=$TAU_SYN)"
+    echo "# sweep:             $SWEEP_TAG (TAU_SYN=$TAU_SYN), ${PLAN_EXPERIMENT} datasets ${DATASET_SUBDIR}, batch size ${BATCH_SIZE}"
     echo "# sessions:          $n_sessions"
     echo "# configs in table:  ${#SWEEP_TABLE[@]}${SWEEP_FILTER:+  (filter: $SWEEP_FILTER, $n_filtered triples excluded)}"
     echo "# already finished:  $n_done"
@@ -305,7 +318,7 @@ if [ "${1:-}" = "--plan" ]; then
         exit 0
     fi
     echo "# manifest:          $manifest"
-    echo "sbatch --export=ALL,MANIFEST=${manifest} --array=0-$((n_pending - 1)) $0"
+    echo "sbatch ${TIME_LIMIT:+--time=${TIME_LIMIT} }--export=ALL,MANIFEST=${manifest} --array=0-$((n_pending - 1)) $0"
     exit 0
 fi
 
@@ -331,6 +344,7 @@ fi
 # Manifest lines are EXPERIMENT|SESSION_DIR|CONFIG|TAU_SYN; the manifest's
 # TAU_SYN wins over the environment so a task always matches its plan.
 IFS='|' read -r EXPERIMENT SESSION_DIR SWEEP_NAME MANIFEST_TAU_SYN <<< "$LINE"
+set_experiment "$EXPERIMENT"
 set_tau_syn "${MANIFEST_TAU_SYN:-none}"
 find_config "$SWEEP_NAME"
 

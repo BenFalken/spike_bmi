@@ -20,7 +20,7 @@ and correlation), latency per sample, and energy per sample:
 ```
 main/
   preprocessing_training/  raw data -> datasets; trains and evaluates KF, WF, LSTM, QRNN
-  nwb_conversion/          datasets for trial-structured NWB sessions (experiment "hkm")
+  nwb_conversion/          datasets for the trial-structured NWB sessions (experiment "hkm")
   bmi/                     shared decoding code: preprocessing, decoders, CV loop, metrics
   snn_training/            train_snn.py: trains the SNN
   models/                  SNN model definitions (model_bmi.py, model_hkm.py)
@@ -48,7 +48,9 @@ it. Data live under one root (`BMI_DATA_ROOT` / `DATA_ROOT`), laid out as
    - `run_snn_pooled_pretrain.sbatch`, then `run_snn_pooled_finetune_array.sbatch`:
      pretrain the "medium" network (256 → 128) on all sessions of a subject, then
      fine-tune it per session. `RESET_TYPE=hard|soft` and `TAU_SYN` select the variant
-     (`snn_medium_config.sh`).
+     (`snn_medium_config.sh`). With `LOSO=1`, pretraining is an array: session i's model
+     is pretrained on every other session, so its own data never reaches pretraining
+     (`loso_pretrained_medium/<session>/`, then `loso_finetuned_medium/<session>/`).
 3. **Inference and report.** `bash sbatch_scripts/run_inference.sbatch --submit bmi indy`
    evaluates every decoder on every session (`inference/test_all_decoders.py`), then builds
    `combined_metrics*.json` and the efficiency, energy and 4x2 comparison figures
@@ -85,6 +87,53 @@ it. Data live under one root (`BMI_DATA_ROOT` / `DATA_ROOT`), laid out as
      fires.
    - `compare_speck_runs.py` draws the figure below from up to three
      `speck_diagnosis.json` files.
+
+### HKM (Jenkins, Nitschke)
+
+The HKM sessions are NWB files of separate reaches: about 2000–3000 trials per
+session, with most of the recording rest between them. Each reach is therefore
+decoded as its own trial, from rest, never as part of one continuous recording.
+
+1. **Datasets.** `nwb_conversion/run_hkm_nwb_pipeline_array.sbatch` (one task per
+   session; `SUBJECT=` limits it to one subject) runs `run_nwb_pipeline.sh`:
+   - every trial becomes its own raw file, after hand-tracking glitches are removed
+     from the native position samples (`hkm_despike.py`; the Nitschke sessions hold a
+     few hundred position jumps each, which would otherwise become velocity spikes of
+     ~70,000 units/s);
+   - ANN dataset: 256 ms windows at 4 ms steps within each trial, concatenated
+     (`dataset/hkm/<subject>/mua/<session>_binning.h5`). A trial of T samples gives
+     T − 65 rows, and each row records its trial;
+   - SNN dataset: one `.pkl` per whole trial, of its own length
+     (`snn_datasets/hkm/<subject>/mua/<session>/`);
+   - both hold out the same last trials as the test split (`trial_split.py`), and the
+     build fails if any velocity glitch survived.
+
+   Every run rebuilds its session from scratch. Datasets built before this version
+   lack the trial IDs inference needs, so rebuild them, then retrain every decoder.
+2. **KF, WF, LSTM, QRNN.** `sbatch_scripts/run_hkm_subject_pipeline_array.sbatch`
+   trains them on the concatenated windows, with the train/test boundary taken from
+   the dataset (WF uses 8 taps: 192 channels × 15 taps exhausts memory). Set
+   `OVERWRITE=1` on the first run after rebuilding the datasets.
+3. **Velocity scalers.** Add the HKM subjects to `snn_training/velocity_scalers.json`:
+   `python compute_velocity_scalers.py --snn-datasets-root $DATA_ROOT/snn_datasets
+   --experiments hkm --output ../snn_training/velocity_scalers.json` (merged into the
+   file; the bmi entries are kept).
+4. **SNN.** The same scripts as bmi, with `hkm` as the experiment:
+   `bash run_snn_sweep.sbatch --plan hkm [subject]`, or
+   `run_snn_pooled_pretrain.sbatch` / `run_snn_pooled_finetune_array.sbatch` with
+   `EXPERIMENT=hkm` (and `LOSO=1`). Trials differ in length, so HKM trains with batch
+   size 1, one trial per step with the state reset at its start. An epoch takes about
+   an hour per session, so HKM runs fewer epochs (sweep 20, pooled 10), checkpoints
+   every epoch and resumes when re-submitted.
+5. **Inference.** `bash run_inference.sbatch --submit hkm <subject>
+   SNN_CHECKPOINT_ROOT=...` (and `--local` with `speck`). Every SNN test trial runs
+   from rest (the chip is reset before each), and its timesteps 65 … T − 1 are scored
+   on that trial's own ANN rows. Trials of 65 samples or fewer have no ANN rows and
+   are not scored. The other decoders are scored on the same rows. Before scoring,
+   inference checks that the two datasets hold out the same trials with the same
+   velocity, and compares the SNN's mean per-trial RMSE with the loss recorded in its
+   checkpoint (`training_check` in the session results; they match for a checkpoint
+   selected on that session). The per-session figures show one trial per grid panel.
 
 ## Findings
 
@@ -338,5 +387,5 @@ the layer-activity figure by `inference/diagnose_speck.py`.
 ## Requirements
 
 Python 3.11 with numpy, scipy, scikit-learn, h5py, matplotlib, Pillow, PyTorch, sinabs
-(≥ 3) and TensorFlow (LSTM/QRNN). The Speck decoder also needs samna and a Speck2f devkit.
+(≥ 3) and TensorFlow (LSTM/QRNN); pynwb for the HKM conversion. The Speck decoder also needs samna and a Speck2f devkit.
 `diagnose_speck.py` and `compare_speck_runs.py` need sinabs but no devkit.

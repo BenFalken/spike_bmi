@@ -34,11 +34,15 @@ Usage:
         --snn-datasets-root /users/bfalkenb/scratch/bfalkenb/data/snn_datasets \
         --output velocity_scalers.json
 
-    # Narrow to specific experiments/subjects rather than discovering all:
+    # Narrow to specific experiments/subjects rather than discovering all
+    # (merged into the existing file, so the bmi entries are kept):
     python compute_velocity_scalers.py \
         --snn-datasets-root /users/bfalkenb/scratch/bfalkenb/data/snn_datasets \
-        --experiments bmi --subjects indy loco \
+        --experiments hkm --subjects jenkins nitschke \
         --output ../snn_training/velocity_scalers.json
+
+Directories whose name contains "pool" (pretraining pools of symlinks to
+other sessions' files) are skipped.
 """
 
 import argparse
@@ -60,6 +64,8 @@ def find_session_dirs(subject_dir):
     subject root and the session itself."""
     session_dirs = []
     for root, dirnames, _ in os.walk(subject_dir):
+        # Pretraining pools (build_pretraining_pool.py) only link other sessions' files.
+        dirnames[:] = [d for d in dirnames if "pool" not in d]
         for split in ("train", "test"):
             split_dir = os.path.join(root, split)
             if os.path.isdir(split_dir) and any(f.endswith(".pkl") for f in os.listdir(split_dir)):
@@ -158,6 +164,14 @@ def main(args):
                 continue
             mapping[experiment][subject] = result
 
+    if os.path.exists(args.output) and not args.replace:
+        with open(args.output) as f:
+            existing = json.load(f)
+        for experiment, subjects in mapping.items():
+            existing.setdefault(experiment, {}).update(subjects)
+        mapping = existing
+        print(f"\nMerged into the existing {args.output} (--replace to discard its other entries)")
+
     print("\n=== Summary ===")
     for experiment, subjects in mapping.items():
         for subject, bounds in subjects.items():
@@ -184,6 +198,10 @@ if __name__ == "__main__":
     parser.add_argument("--lo-pct", type=float, default=0.5)
     parser.add_argument("--hi-pct", type=float, default=99.5)
     parser.add_argument("--margin", type=float, default=0.05)
-    parser.add_argument("--output", type=str, default="velocity_scalers.json")
+    parser.add_argument("--output", type=str, default="velocity_scalers.json",
+                        help="Written JSON. If it exists, the subjects computed here replace their "
+                             "own entries and every other entry is kept.")
+    parser.add_argument("--replace", action="store_true",
+                        help="Overwrite --output entirely instead of merging into it")
     args = parser.parse_args()
     main(args)

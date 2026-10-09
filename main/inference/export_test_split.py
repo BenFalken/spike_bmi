@@ -3,7 +3,8 @@ Write test-split-only copies of the ANN datasets, for running inference on a
 machine with little disk space (e.g. the Speck-connected laptop).
 
 For every {input_dir}/*_binning.h5 this keeps the rows test_all_decoders.py
-evaluates (the same boundary it computes) of X_{feature} and y_task, and sets
+evaluates (the same boundary it computes) of X_{feature}, y_task and, for
+hkm datasets, trial_id, and sets
 the n_train attribute to 0, so test_all_decoders.py treats the whole copy as
 the test split. The original boundary is kept as the source_n_train attribute.
 
@@ -31,6 +32,8 @@ def export(path, output_path, feature, test_frac):
         with h5py.File(output_path, 'w') as out:
             out.create_dataset(f'X_{feature}', data=X[n_train:], compression='gzip')
             out.create_dataset('y_task', data=f['y_task'][n_train:], compression='gzip')
+            if 'trial_id' in f:      # hkm: each row's trial, for the per-trial SNN alignment
+                out.create_dataset('trial_id', data=f['trial_id'][n_train:], compression='gzip')
             out.attrs.update({k: v for k, v in f.attrs.items() if k != 'n_train'})
             out.attrs.update(n_train=0, source_n_train=n_train, source_test_frac=test_frac)
         return len(X) - n_train, len(X)
