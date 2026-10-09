@@ -134,6 +134,9 @@ decoded as its own trial, from rest, never as part of one continuous recording.
    velocity, and compares the SNN's mean per-trial RMSE with the loss recorded in its
    checkpoint (`training_check` in the session results; they match for a checkpoint
    selected on that session). The per-session figures show one trial per grid panel.
+   - **Transition only:** datasets built before trial IDs were stored can be evaluated with
+     `LEGACY_HKM=1` (`inference/test_all_decoders_legacy_hkm.py`), which matches the SNN
+     test trials to ANN rows by velocity and writes to `results/test_all_decoders_legacy/`.
 
 ## Findings
 

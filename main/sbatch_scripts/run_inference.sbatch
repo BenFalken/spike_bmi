@@ -50,6 +50,10 @@
 #   Only rebuild the report:  bash run_inference.sbatch --report bmi indy
 #   (training-duration results missing from sessions/*.json are kept from the
 #   existing combined_metrics_durations.json, or taken from DURATIONS_JSON=...)
+#   HKM datasets built before trial IDs were stored (transition only):
+#       bash run_inference.sbatch --local hkm jenkins LEGACY_HKM=1 ...
+#   runs inference/test_all_decoders_legacy_hkm.py, which matches SNN test trials to
+#   ANN rows by velocity, and writes to results/test_all_decoders_legacy/ by default.
 #   Only redraw the per-session figures and crosshair GIFs from the saved
 #   predictions (no evaluation, no chip, any checkpoints):
 #       bash run_inference.sbatch --figures bmi indy FIGURE_DECODERS=snn,speck
@@ -59,7 +63,7 @@ set -eo pipefail
 # Settings this script reads from the environment (see the examples above).
 SETTINGS="DATA_ROOT VENV DECODERS TRAIN_DURATIONS MACHINE SNN_CHECKPOINT_ROOT SNN_CHECKPOINT_SUBDIR
           SPECK_CHECKPOINT_ROOT SPECK_CHECKPOINT_SUBDIR RESULTS_DIR FIGURES FIGURE_DECODERS
-          SPECK_WAIT_TIME ENERGY_METER_NUM_THREADS DURATIONS_JSON"
+          SPECK_WAIT_TIME ENERGY_METER_NUM_THREADS DURATIONS_JSON LEGACY_HKM"
 
 case "${1:-}" in
     --submit|--local|--report|--figures)
@@ -165,6 +169,12 @@ if [ "$EXPERIMENT" = "hkm" ]; then
 else
     SNN_DATASET_ROOT="${DATA_ROOT}/snn_datasets/${EXPERIMENT}/${SUBJECT}/mua_8_group"
 fi
+if [ "${LEGACY_HKM:-}" = "1" ]; then
+    EVAL_SCRIPT="test_all_decoders_legacy_hkm.py"
+    RESULTS_DIR="${RESULTS_DIR:-${DATA_ROOT}/results/test_all_decoders_legacy/${EXPERIMENT}/${SUBJECT}}"
+else
+    EVAL_SCRIPT="test_all_decoders.py"
+fi
 RESULTS_DIR="${RESULTS_DIR:-${DATA_ROOT}/results/test_all_decoders/${EXPERIMENT}/${SUBJECT}}"
 
 show_settings() {
@@ -176,6 +186,7 @@ show_settings() {
         [[ ",$DECODERS," == *,speck,* ]] && echo "Speck checkpoints: ${SPECK_CHECKPOINT_ROOT}${SPECK_CHECKPOINT_SUBDIR:+ (/<session>/${SPECK_CHECKPOINT_SUBDIR})}"
         echo "Decoders: ${DECODERS}${FIGURES:+; figures for ${FIGURE_DECODERS:-every decoder}}"
     fi
+    [ "${LEGACY_HKM:-}" = "1" ] && echo "LEGACY_HKM=1: ${EVAL_SCRIPT} (trials matched by velocity)"
     echo "Results: ${RESULTS_DIR}"
 }
 
@@ -206,7 +217,7 @@ if [ "${RUN:-}" = "--submit" ]; then
     EXPORTS+=",TRAIN_DURATIONS=${TRAIN_DURATIONS//,/:},MACHINE=${MACHINE},SNN_CHECKPOINT_ROOT=${SNN_CHECKPOINT_ROOT}"
     EXPORTS+=",SNN_CHECKPOINT_SUBDIR=${SNN_CHECKPOINT_SUBDIR},SPECK_CHECKPOINT_ROOT=${SPECK_CHECKPOINT_ROOT}"
     EXPORTS+=",SPECK_CHECKPOINT_SUBDIR=${SPECK_CHECKPOINT_SUBDIR},RESULTS_DIR=${RESULTS_DIR},FIGURES=${FIGURES:-}"
-    EXPORTS+=",FIGURE_DECODERS=${FIGURE_DECODERS//,/:},DURATIONS_JSON=${DURATIONS_JSON:-}"
+    EXPORTS+=",FIGURE_DECODERS=${FIGURE_DECODERS//,/:},DURATIONS_JSON=${DURATIONS_JSON:-},LEGACY_HKM=${LEGACY_HKM:-}"
     ARRAY_ID=$(sbatch --parsable --array=0-$(( ${#SESSION_IDS[@]} - 1 )) \
         --export="${EXPORTS},MODE=session" "$0")
     REPORT_ID=$(sbatch --parsable --dependency=afterany:"${ARRAY_ID%%;*}" --time=0:30:00 \
@@ -241,7 +252,7 @@ run_session() {  # run_session SESSION_ID
     local figure_args=()
     [ -n "${FIGURES:-}" ] && figure_args=(--figures_dir "${RESULTS_DIR}/figures/$1"
                                           --figure_decoders "${FIGURE_DECODERS:-}")
-    python3 "$INFERENCE_DIR/test_all_decoders.py" \
+    python3 "$INFERENCE_DIR/$EVAL_SCRIPT" \
         --experiment "$EXPERIMENT" \
         --session "$1" \
         --input_filepath "${DATASET_ROOT}/$1_binning.h5" \
