@@ -272,6 +272,10 @@ def layer_activity(checkpoint_path, snn_dataset_path, experiment, trial, start, 
     files = snn_test_files(snn_dataset_path)
     trial = min(trial, len(files) - 1)
     spikes = _load_pickle(files[trial])['input_spikes'][:, :start + steps]
+    # Discretize before running snn_seq: the run leaves its neuron states as
+    # views, which the copied layers could then not reset.
+    quant_seq = None if devkit else speck.discretized_sequential(
+        speck.discretize(snn_seq, model.layers[0].in_features))
     layers = {'PyTorch SNN': speck.run_layers(snn_seq, spikes)}
     if devkit:
         device = speck.open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt,
@@ -283,7 +287,6 @@ def layer_activity(checkpoint_path, snn_dataset_path, experiment, trial, start, 
         finally:
             device.close()
     else:
-        quant_seq = speck.discretized_sequential(speck.discretize(snn_seq, model.layers[0].in_features))
         layers['Speck SNN (emulated on host)'] = speck.run_layers(quant_seq, spikes)
     window = slice(start, start + steps)
     return spikes.T[window], {k: [l[window] for l in v] for k, v in layers.items()}, trial
