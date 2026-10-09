@@ -44,7 +44,7 @@
 # disposable per-trial files (raw + ANN-windowed), matching this
 # project's own dataset/{experiment}/{subject}/mua/ and
 # snn_datasets/{experiment}/{subject}/mua/ conventions used everywhere
-# else (test_all_decoders.py, train_snn.py, etc).
+# else (test_all_decoders.py, train_bmi.py, etc).
 #
 # EXPERIMENT is hardcoded to "hkm" here specifically -- this script only
 # ever converts NWB data, which is always the hkm experiment (bmi's own
@@ -82,6 +82,7 @@ set -eo pipefail
 TEST_FRAC=0.1
 MAX_GAP_MS=20.0
 MIN_SAMPLES=5
+MAX_SPEED=3000   # hand-position glitch limit, units/s (0 disables) -- see hkm_despike.py
 FEATURE=mua
 METHOD=binning
 CLEANUP_INTERMEDIATE=0
@@ -99,6 +100,7 @@ while [ $# -gt 0 ]; do
         --test-frac) TEST_FRAC="$2"; shift 2 ;;
         --max-gap-ms) MAX_GAP_MS="$2"; shift 2 ;;
         --min-samples) MIN_SAMPLES="$2"; shift 2 ;;
+        --max-speed) MAX_SPEED="$2"; shift 2 ;;
         --feature) FEATURE="$2"; shift 2 ;;
         --method) METHOD="$2"; shift 2 ;;
         --cleanup-intermediate) CLEANUP_INTERMEDIATE=1; shift ;;
@@ -111,6 +113,27 @@ if [ -z "$NWB_PATH" ] || [ -z "$OUTPUT_ROOT" ] || [ -z "$DATASET_ROOT" ] || [ -z
          "--snn-dataset-root DIR [options]" >&2
     exit 1
 fi
+
+# --- Run from this script's own directory, so the code that runs is always the code sitting next to
+# this file, never stale copies in whatever directory sbatch was launched from. Paths given on the
+# command line are made absolute FIRST so they keep pointing where the caller meant. ---
+NWB_PATH="$(realpath -m "$NWB_PATH")"
+OUTPUT_ROOT="$(realpath -m "$OUTPUT_ROOT")"
+DATASET_ROOT="$(realpath -m "$DATASET_ROOT")"
+SNN_DATASET_ROOT="$(realpath -m "$SNN_DATASET_ROOT")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+for f in convert_nwb_trials_to_raw_h5.py hkm_despike.py combine_trial_windows_to_ann_h5.py \
+         make_snn_dataset_whole_trial.py run_dense_windowing_for_all_trials.sh find_hkm_velocity_glitches.py; do
+    [ -f "$SCRIPT_DIR/$f" ] || { echo "ERROR: required file $f not found in $SCRIPT_DIR" >&2; exit 1; }
+done
+if [ "$MAX_SPEED" != "0" ] && ! grep -q -- "--max-speed" "$SCRIPT_DIR/convert_nwb_trials_to_raw_h5.py"; then
+    echo "ERROR: $SCRIPT_DIR/convert_nwb_trials_to_raw_h5.py is the OLD converter (no --max-speed). " \
+         "Cleaning would silently not happen -- deploy the patched file." >&2
+    exit 1
+fi
+echo "Pipeline code dir: $SCRIPT_DIR  (max-speed=$MAX_SPEED)"
+md5sum "$SCRIPT_DIR/convert_nwb_trials_to_raw_h5.py" "$SCRIPT_DIR/hkm_despike.py" 2>/dev/null || true
 
 SESSION_ID="$(basename "$NWB_PATH" .nwb)"
 
@@ -146,14 +169,26 @@ echo "================================================================"
 
 echo ""
 echo "--- Stage 1: NWB -> per-trial raw h5 ---"
+# Stage 1 always starts from clean intermediates: leftovers from an earlier (e.g. uncleaned) run
+# would otherwise be picked up by Stages 2-4. They are disposable by design.
+rm -rf "$RAW_DIR" "$ANN_WINDOWED_DIR"
+# FORCE REWRITE: also remove this session's previous FINAL outputs, so nothing from an earlier run can survive
+# (and an early failure leaves no stale-but-plausible data behind).
+SNN_FINAL_DIR="${SNN_OUTPUT_ROOT}/${EXPERIMENT}/${SUBJECT}/mua/${SESSION_ID}"
+rm -f "$ANN_OUTPUT_PATH"
+rm -rf "$SNN_FINAL_DIR/train" "$SNN_FINAL_DIR/test"
+CHECK_DIR="${OUTPUT_ROOT}/glitch_check/${SESSION_ID}"
+mkdir -p "$CHECK_DIR"
 python3 convert_nwb_trials_to_raw_h5.py \
     --nwb-path "$NWB_PATH" \
     --output-dir "$RAW_DIR" \
-    --max-gap-ms "$MAX_GAP_MS" --min-samples "$MIN_SAMPLES"
+    --max-gap-ms "$MAX_GAP_MS" --min-samples "$MIN_SAMPLES" \
+    --max-speed "$MAX_SPEED" --overwrite
+cp -f "$RAW_DIR/${SESSION_ID}_despike_report.json" "$CHECK_DIR/" 2>/dev/null || true  # survives --cleanup-intermediate
 
 echo ""
 echo "--- Stage 2: per-trial raw -> per-trial windowed (ANN) ---"
-./run_dense_windowing_for_all_trials.sh "$RAW_DIR" "$ANN_WINDOWED_DIR" "$METHOD"
+bash ./run_dense_windowing_for_all_trials.sh "$RAW_DIR" "$ANN_WINDOWED_DIR" "$METHOD"
 
 echo ""
 echo "--- Stage 3: combine -> {session}_${METHOD}.h5 (ANN/KF/WF), final destination ---"
@@ -172,6 +207,12 @@ python3 make_snn_dataset_whole_trial.py \
     --experiment "$EXPERIMENT" --subject "$SUBJECT" \
     --feature "$FEATURE" --test_frac "$TEST_FRAC"
 
+echo ""
+echo "--- Check: no velocity glitches left in the final SNN dataset (fails the job if any remain) ---"
+python3 find_hkm_velocity_glitches.py \
+    --data-root "${SNN_OUTPUT_ROOT}/${EXPERIMENT}/${SUBJECT}/mua" --only-session "$SESSION_ID" \
+    --out-dir "$CHECK_DIR" --threshold 3000 --abs-max 3000 --fail-on-glitch
+
 if [ "$CLEANUP_INTERMEDIATE" -eq 1 ]; then
     echo ""
     echo "--- Cleanup: removing intermediate directories ---"
@@ -179,7 +220,6 @@ if [ "$CLEANUP_INTERMEDIATE" -eq 1 ]; then
     echo "Removed: $RAW_DIR, $ANN_WINDOWED_DIR"
 fi
 
-SNN_FINAL_DIR="${SNN_OUTPUT_ROOT}/${EXPERIMENT}/${SUBJECT}/mua/${SESSION_ID}"
 echo ""
 echo "================================================================"
 echo "Done. Final outputs:"

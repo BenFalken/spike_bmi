@@ -39,11 +39,11 @@ class KalmanDecoder:
 
     def fit(self, X_train, y_train):
         if self.reg_type == 'l1':
-            regres = Lasso(alpha=self.reg_alpha)            
+            regres = Lasso(alpha=self.alpha_reg)            
         elif self.reg_type == 'l2':
-            regres = Ridge(alpha=self.reg_alpha)
+            regres = Ridge(alpha=self.alpha_reg)
         elif self.reg_type == 'l12':
-            regres = ElasticNet(alpha=self.reg_alpha)
+            regres = ElasticNet(alpha=self.alpha_reg)
         else:
             regres = LinearRegression()
         
@@ -177,6 +177,7 @@ def MLPDecoder(config):
             metrics=[config["metric"]]
     )
 
+    #print(model.summary())
     return model
 
 def LSTMDecoder(config):
@@ -231,6 +232,7 @@ def LSTMDecoder(config):
         optimizer=opt,
         metrics=[config["metric"]]
     )
+    #print(model.summary())
     return model
 
 def _dropout(x, level, noise_shape=None, seed=None):
@@ -296,8 +298,7 @@ class QRNN(Layer):
         if self.stateful:
             self.reset_states()
 
-        # One convolution computes all three gates: Z (candidate), F (forget), O (output).
-        kernel_shape = (self.window_size, 1, self.input_dim, self.units * 3)
+        kernel_shape = (self.window_size, 1, self.input_dim, self.units * 3) # Origin of 3 x units for the kernel MAC/ACC, where the 3 corresponds to the Z (input) F (forget) O (output) gates
         self.kernel = self.add_weight(name='kernel',
                                       shape=kernel_shape,
                                       initializer=self.kernel_initializer,
@@ -504,9 +505,12 @@ class QRNN(Layer):
         f = f if self.dropout is not None and 0. < self.dropout < 1. else K.sigmoid(f)
         o = K.sigmoid(o)
 
+        #output = f * prev_output + (1 - f) * z
+        #output = o * output
         c_output = f * prev_output + (1 - f) * z
         h_output = o * c_output
 
+        #return output, [output]
         return h_output, [c_output]
 
     def get_constants(self, inputs, training=None):
@@ -537,7 +541,7 @@ class QRNN(Layer):
 
 def QRNNDecoder(config):
     """
-    Quasi-recurrent neural network (QRNN) decoding algorithm.
+    Long short-term memory (LSTM) decoding algorithm.
 
     Parameters
     ----------
@@ -587,4 +591,5 @@ def QRNNDecoder(config):
             optimizer=opt,
             metrics=[config["metric"]]
     )
+    #print(model.summary())
     return model

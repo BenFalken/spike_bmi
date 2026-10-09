@@ -3,6 +3,7 @@ Metrics to assess performance of BMI decoding.
 """
 
 import numpy as np
+from numpy.core.fromnumeric import mean, squeeze
 from sklearn.metrics import mean_squared_error
 
 def pearson_corrcoef(ytrue, ypred, multioutput="uniform_average"):
@@ -64,9 +65,7 @@ def normalized_mse(ytrue, ypred, multioutput='uniform_average', squared=True, no
     norm_error : float or ndarray
         A scalar or array of non-negative floating point values.
     """
-    error = mean_squared_error(ytrue, ypred, multioutput=multioutput)
-    if not squared:
-        error = np.sqrt(error)
+    error = mean_squared_error(ytrue, ypred, multioutput=multioutput, squared=squared)
     if norm == 'minmax':
         norm_error = error / (ytrue.max() - ytrue.min())
     elif norm == 'mean':

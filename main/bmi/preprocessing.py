@@ -87,8 +87,10 @@ class TimeSeriesSplitCustom(TimeSeriesSplit):
         (smallest) fold. Checked after folds are generated; raises
         ValueError if violated.
     gap : int, default=0
-        Number of samples excluded between each fold's training and test
-        indices.
+        Number of samples excluded between the end of each fold's
+        training indices and the start of its test indices. Needed
+        whenever consecutive rows of X are built from overlapping raw
+        data (e.g. densely-strided windows).
 
     Returns
     ----------
@@ -110,88 +112,79 @@ class TimeSeriesSplitCustom(TimeSeriesSplit):
             yield train_idx, test_idx
 
 
-def aligned_train_boundary(total_raw_samples, test_frac, base_nperseg=65):
-    """
-    Number of raw samples in the training split, rounded down to a
-    multiple of base_nperseg.
-
-    Every dataset built from a session (dense ANN windows, non-overlapping
-    SNN windows, grouped SNN trials) computes its train/test boundary with
-    this function from the same raw session length, so all of them hold out
-    the same stretch of recording and no SNN window straddles the boundary.
-
-    Parameters
-    ----------
-    total_raw_samples : int
-        Length of the unwindowed session (len(task_time)).
-    test_frac : float
-        Fraction of the session held out as test (taken from the end).
-    base_nperseg : int, default=65
-        SNN window length in raw samples (256 ms at 4 ms/sample).
-
-    Returns
-    ----------
-    n_train_raw : int
-    """
-    n_test_raw = round(test_frac * total_raw_samples)
-    n_train_raw = total_raw_samples - n_test_raw
-    return (n_train_raw // base_nperseg) * base_nperseg
-
-
 def chronological_holdout_split(X, y, test_frac, gap=0, base_nperseg=65, n_train_override=None):
     """
-    Single chronological train/test split of a dense-windowed ANN dataset,
-    with the boundary aligned to the SNN windows (see aligned_train_boundary).
+    Single chronological train/test split, designed to split train/test
+    groups based on multiples of nperseg (ie: we split data according to
+    the nearest multiple of the window of interest). Data is chronological
+    and ordered by time continuously.
 
     Parameters
     ----------
     X, y : ndarray
-        Full, chronologically-ordered dataset. Rows must come from step=1
-        (4 ms) windowing, so that row index equals raw sample index and
-        len(X) == total_raw_samples - base_nperseg.
+        Full, chronologically-ordered dataset.
     test_frac : float
-        Fraction of the session held out as test.
+        Fraction of samples (by count, taken from the end) held out as test.
     gap : int, default=0
-        Rows dropped from the end of the training set (purge gap against
-        leakage between overlapping windows).
+        Number of samples excluded from the end of the training set,
+        immediately before the test set begins.
     base_nperseg : int, default=65
-        SNN window length in raw samples.
+        The SNN's base trial length in raw samples.
+        256ms at this project's native 4ms/sample, the shared windowing
+        base unit. Only correct for X built with step=1 (dense, near-
+        total-overlap) windowing (--wdw_time 0.256 --ol_time 0.252)
     n_train_override : int, optional
-        Use this row count as the boundary instead. Required for
-        trial-structured (NWB) datasets, whose rows are concatenated trials
-        rather than one continuous session.
+        If set, use this row count directly as the train/test boundary,
+        bypassing the base_nperseg-aligned computation below entirely.
+        Needed for trial-structured data (e.g. the NWB/Jenkins-Nitschke
+        conversion, where many independent trials are concatenated into
+        one X/y rather than X coming from a single continuous session).
 
     Returns
     ----------
     X_train, y_train, X_test, y_test : ndarray
     """
     n_samples = _num_samples(X)
-    if n_train_override is not None:
-        n_train = n_train_override
-    else:
-        n_train = aligned_train_boundary(n_samples + base_nperseg, test_frac, base_nperseg)
 
-    n_train_end = n_train - gap
+    if n_train_override is not None:
+        n_train_aligned = n_train_override
+        n_test = n_samples - n_train_aligned
+    else:
+        # Reconstruct the raw (unwindowed) session length EXACTLY: for step=1
+        # dense windowing, extract()'s own convention gives
+        # n_samples == total_raw_samples - base_nperseg. This is the ONE
+        # quantity both this function and export_snn_pkl.py can derive
+        # identically (the SNN side reads it directly from an attr saved by
+        # make_snn_dataset.py, since ITS windowing doesn't invert as cleanly)
+        # -- confirmed by direct test to produce identical results to a
+        # pipeline with direct access to the true raw length, not just
+        # approximately close.
+        total_raw_samples = n_samples + base_nperseg
+        naive_n_test_raw = round(test_frac * total_raw_samples)
+        naive_n_train_raw = total_raw_samples - naive_n_test_raw
+        n_train_aligned = (naive_n_train_raw // base_nperseg) * base_nperseg
+        n_test = n_samples - n_train_aligned
+
+    n_train_end = n_samples - n_test - gap
     if n_train_end <= 0:
         raise ValueError(
             f"test_frac={test_frac} and gap={gap} leave no training data "
             f"out of {n_samples} samples.")
     X_train, y_train = X[:n_train_end], y[:n_train_end]
-    X_test, y_test = X[n_train:], y[n_train:]
+    X_test, y_test = X[n_samples - n_test:], y[n_samples - n_test:]
     return X_train, y_train, X_test, y_test
 
 
 def transform_data(X, y, timesteps):
     """
-    Stack `timesteps` consecutive rows of X into one example, paired with
-    the target at the example's last row.
+    Transform data into sequence data with timesteps
 
     Parameters
     ----------
     X : ndarray
-        The input data
+        The nput data 
     y : ndarray
-        The output (target) data
+        The utput (target) data
     timesteps: int
         The number of input steps to predict next step
 

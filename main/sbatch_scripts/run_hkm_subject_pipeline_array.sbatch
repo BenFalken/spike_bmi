@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=hkm_pipeline
-#SBATCH --output=hkm_logs/%x_%A_%a.out
-#SBATCH --error=hkm_logs/%x_%A_%a.err
+#SBATCH --output=hkm_single_subject_pipeline_logs/%x_%A_%a.out
+#SBATCH --error=hkm_single_subject_pipeline_logs/%x_%A_%a.err
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64G
-#SBATCH --time=24:00:00
+#SBATCH --mem=128G
+#SBATCH --time=48:00:00
 #
 # HKM equivalent of run_bmi_subject_pipeline_array.sbatch -- same
 # structure, adapted for two real differences: (1) HKM sessions are
@@ -23,9 +23,9 @@
 # skip logic handles this, nothing bash-level needed here.
 #
 # Submit with:
-#   mkdir -p hkm_logs
+#   mkdir -p hkm_single_subject_pipeline_logs
 #   N=$(find /users/bfalkenb/scratch/bfalkenb/data/dataset/hkm -mindepth 2 -maxdepth 2 -name '*_binning.h5' | wc -l)
-#   sbatch --array=0-10 run_hkm_subject_pipeline_array.sbatch
+#   sbatch --array=4-9 run_hkm_subject_pipeline_array.sbatch
 #
 
 set -eo pipefail
@@ -54,7 +54,7 @@ export TF_NUM_INTEROP_THREADS=1
 # group-size subdirectory in between (unlike the BMI/.mat convention).
 DATASET_DIR="/users/bfalkenb/scratch/bfalkenb/data/dataset/hkm"
 
-mapfile -t H5_FILES < <(find "$DATASET_DIR" -mindepth 2 -maxdepth 2 -name '*_binning.h5' | sort)
+mapfile -t H5_FILES < <(find "$DATASET_DIR" -mindepth 3 -maxdepth 3 -name '*_binning.h5' | sort)
 
 if [ "${#H5_FILES[@]}" -eq 0 ]; then
     echo "ERROR: found zero *_binning.h5 files two levels under $DATASET_DIR " >&2
@@ -81,4 +81,5 @@ echo "Host: $(hostname), CPUs allocated: $SLURM_CPUS_PER_TASK"
 
 python3 ../preprocessing_training/single_subject_pipeline.py \
     --raw_stem "$RAW_STEM" \
-    --nwb_dataset_filepath "$H5_FILE"
+    --nwb_dataset_filepath "$H5_FILE" \
+    --overwrite

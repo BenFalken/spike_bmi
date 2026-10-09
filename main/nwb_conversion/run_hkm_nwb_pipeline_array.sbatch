@@ -3,7 +3,7 @@
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=16G
 #SBATCH --time=8:00:00
 #
 # Runs run_nwb_pipeline.sh once per session, in parallel, across every
@@ -15,15 +15,24 @@
 # applied to .nwb files and run_nwb_pipeline.sh instead of .mat files
 # and single_subject_pipeline.py.
 #
-# This code is safe to re-run from any failure/stoppage point: each
-# session's own conversion writes into its own, session-named
-# subdirectory (see run_nwb_pipeline.sh's own stage-skip checks), so a
-# resubmission does not redo a session that already finished.
+# RE-RUNS: each session is rebuilt from scratch every time (run_nwb_pipeline.sh
+# deletes that session's intermediates and previous final outputs first and
+# then fails the task if any velocity glitch survives). Sessions never touch
+# each other's files -- every intermediate, final and check directory is
+# named by session id -- so any subset can safely run at the same time.
 #
-# Submit with:
-#   mkdir -p logs
-#   N=$(find /users/bfalkenb/scratch/bfalkenb/data/raw/hkm -mindepth 2 -maxdepth 2 -name '*.nwb' | wc -l)
+# SUBJECT selects which subject's sessions form the array (default: nitschke,
+# so Jenkins' good data is never rewritten by accident). SUBJECT=all runs
+# every subject.
+#
+# Submit from the directory that holds run_nwb_pipeline.sh and the other
+# pipeline scripts:
+#   cd /users/bfalkenb/spike_bmi_main/<code dir>
+#   mkdir -p logs        # must exist BEFORE submitting, or SLURM cannot open the log files
+#   N=$(find /users/bfalkenb/scratch/bfalkenb/data/raw/hkm/nitschke -maxdepth 1 -name '*.nwb' | wc -l)
 #   sbatch --array=0-$((N-1)) run_hkm_nwb_pipeline_array.sbatch
+# Other subject:  sbatch --export=ALL,SUBJECT=jenkins --array=0-3 ...
+# Throttle (optional): --array=0-5%3 runs at most 3 sessions at once.
 
 set -eo pipefail
 # NOTE: -u (errexit on unbound variable) deliberately left off here -- some
@@ -69,16 +78,18 @@ TEST_FRAC=0.1
 FEATURE=mua
 METHOD=binning
 
-# run_nwb_pipeline.sh MUST be resolvable from wherever this job's cwd
-# ends up (SLURM's default: wherever `sbatch` was run from) -- same
-# resolution issue diagnosed earlier for single_subject_pipeline.py's
-# own subprocess calls. Anchored here to this array script's own
-# location rather than assumed to be a sibling of cwd.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NWB_PIPELINE_SCRIPT="./run_nwb_pipeline.sh"
+# SLURM runs a COPY of this file from its spool directory, so BASH_SOURCE
+# points there, not at your code. The code directory is therefore the
+# directory sbatch was submitted from (or CODE_DIR if you export it).
+SCRIPT_DIR="${CODE_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
+NWB_PIPELINE_SCRIPT="$SCRIPT_DIR/run_nwb_pipeline.sh"
 if [ ! -f "$NWB_PIPELINE_SCRIPT" ]; then
     echo "ERROR: run_nwb_pipeline.sh not found at $NWB_PIPELINE_SCRIPT -- " >&2
-    echo "       expected it as a sibling of this array script." >&2
+    echo "       submit from the directory that contains it (or export CODE_DIR)." >&2
+    exit 1
+fi
+if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
+    echo "ERROR: SLURM_ARRAY_TASK_ID is not set -- submit with sbatch --array=0-N" >&2
     exit 1
 fi
 
@@ -90,11 +101,16 @@ fi
 # jenkins' and nitschke's sessions are naturally interleaved (sorted by
 # subject name first), so an early --array range doesn't accidentally
 # finish one subject entirely before starting the next.
-mapfile -t NWB_FILES < <(find "$RAW_DATA_DIR" -mindepth 2 -maxdepth 2 -name '*.nwb' | sort)
+SUBJECT="${SUBJECT:-nitschke}"
+if [ "$SUBJECT" = "all" ]; then
+    mapfile -t NWB_FILES < <(find "$RAW_DATA_DIR" -mindepth 2 -maxdepth 2 -name '*.nwb' | sort)
+else
+    mapfile -t NWB_FILES < <(find "$RAW_DATA_DIR/$SUBJECT" -mindepth 1 -maxdepth 1 -name '*.nwb' 2>/dev/null | sort)
+fi
 
 if [ "${#NWB_FILES[@]}" -eq 0 ]; then
     echo "ERROR: found zero .nwb files two levels under $RAW_DATA_DIR " >&2
-    echo "(expected {subject}/{session}.nwb) -- check RAW_DATA_DIR matches the " >&2
+    echo "(SUBJECT=$SUBJECT; expected {subject}/{session}.nwb) -- check RAW_DATA_DIR matches the " >&2
     echo "real raw data layout, and that this job's working directory is what " >&2
     echo "you expect (SLURM's default is the directory 'sbatch' was run from)." >&2
     exit 1
@@ -108,10 +124,12 @@ fi
 
 NWB_FILE="${NWB_FILES[$SLURM_ARRAY_TASK_ID]}"
 
+echo "Subject filter: $SUBJECT   sessions found: ${#NWB_FILES[@]}"
 echo "Array task $SLURM_ARRAY_TASK_ID / $((${#NWB_FILES[@]} - 1)) -> $NWB_FILE"
+echo "Code dir: $SCRIPT_DIR"
 echo "Host: $(hostname), CPUs allocated: $SLURM_CPUS_PER_TASK"
 
-"$NWB_PIPELINE_SCRIPT" \
+bash "$NWB_PIPELINE_SCRIPT" \
     --nwb-path "$NWB_FILE" \
     --output-root "$OUTPUT_ROOT" \
     --dataset-root "$DATASET_ROOT" \

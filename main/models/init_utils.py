@@ -4,6 +4,7 @@ Initialization utilities for SNN models
 
 import torch
 import torch.nn as nn
+import math
 
 def initialize_snn_model(model: nn.Module, weight_init: str) -> None:
     """

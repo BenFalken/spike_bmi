@@ -58,9 +58,13 @@ CLI usage:
 import argparse
 import os
 
+import glob
+import json
+
 import h5py
 import numpy as np
-from pynwb import NWBHDF5IO
+
+from hkm_despike import despike_position, DEFAULT_MAX_SPEED
 
 DELTA_TIME = 0.004  # 250 Hz -- MUST match make_dataset.py/make_snn_dataset.py's hardcoded value
 
@@ -76,16 +80,27 @@ def build_uniform_grid(trial_start, trial_stop, delta_time=DELTA_TIME):
 
 
 def convert_one_trial(trial_id, trial_start, trial_stop, hand_timestamps, hand_xy,
-                       unit_spike_times, max_gap_s, min_samples):
+                       unit_spike_times, max_gap_s, min_samples, max_speed=DEFAULT_MAX_SPEED,
+                       despike_log=None):
     """Returns (task_time, task_data, target_pos, sua_trains, mua_trains) or
     None if this trial should be skipped (too few samples, internal gap
-    too large, or too short after resampling)."""
+    too large, or too short after resampling).
+
+    max_speed: native position intervals faster than this (units/s) are tracking glitches and are
+    removed before resampling -- see hkm_despike.py. 0/None disables. Per-trial glitch counts are
+    appended to despike_log (a list) when given."""
     mask = (hand_timestamps >= trial_start) & (hand_timestamps <= trial_stop)
     t_trial = hand_timestamps[mask]
     xy_trial = hand_xy[mask]
 
     if len(t_trial) < 2:
         return None, f"trial {trial_id}: fewer than 2 hand samples in [{trial_start:.3f}, {trial_stop:.3f}]"
+
+    # Remove tracking glitches BEFORE the gap check/resampling/diff: a position jump of a few hundred
+    # units between two native samples becomes a ~70,000 units/s velocity spike after diff/dt.
+    xy_trial, glitch = despike_position(t_trial, xy_trial, max_speed)
+    if despike_log is not None and glitch["n_glitch_intervals"]:
+        despike_log.append({"trial_id": int(trial_id), **glitch})
 
     max_gap = np.max(np.diff(t_trial))
     if max_gap > max_gap_s:
@@ -125,6 +140,7 @@ def convert_one_trial(trial_id, trial_start, trial_stop, hand_timestamps, hand_x
 
 
 def main(args):
+    from pynwb import NWBHDF5IO  # imported here so hkm_despike/convert_one_trial work without pynwb
     print(f"Reading NWB file: {args.nwb_path}")
     io = NWBHDF5IO(args.nwb_path, "r")
     nwbfile = io.read()
@@ -144,6 +160,17 @@ def main(args):
     session_id = os.path.splitext(os.path.basename(args.nwb_path))[0]
     os.makedirs(args.output_dir, exist_ok=True)
 
+    stale = glob.glob(os.path.join(args.output_dir, f"{session_id}_trial*.h5"))
+    if stale:
+        if not args.overwrite:
+            raise SystemExit(f"{len(stale)} existing trial file(s) for {session_id} in {args.output_dir} -- "
+                             f"stale files from an earlier (uncleaned) run would silently mix with the new "
+                             f"ones. Re-run with --overwrite to delete them first.")
+        for fpath in stale:
+            os.remove(fpath)
+        print(f"Removed {len(stale)} stale trial file(s) from {args.output_dir}")
+    despike_log = []
+
     max_gap_s = args.max_gap_ms / 1000.0
     n_written, n_skipped = 0, 0
     for trial_id in range(n_trials):
@@ -152,7 +179,8 @@ def main(args):
 
         result, skip_reason = convert_one_trial(
             trial_id, trial_start, trial_stop, hand_timestamps, hand_xy,
-            unit_spike_times, max_gap_s, args.min_samples)
+            unit_spike_times, max_gap_s, args.min_samples,
+            max_speed=args.max_speed, despike_log=despike_log)
 
         if result is None:
             print(f"  [skip] {skip_reason}")
@@ -176,6 +204,19 @@ def main(args):
     io.close()
     print(f"\n{n_written} trial file(s) written to {args.output_dir}, {n_skipped} skipped "
           f"(of {n_trials} total)")
+
+    n_glitches = sum(g["n_glitch_intervals"] for g in despike_log)
+    print(f"Despike (max_speed={args.max_speed}): {n_glitches} glitch interval(s) removed across "
+          f"{len(despike_log)} trial(s)")
+    if despike_log:
+        worst = max((s for g in despike_log for s in g["glitch_speeds"]), default=0.0)
+        print(f"  fastest removed interval: {worst:.0f} units/s")
+    report_path = os.path.join(args.output_dir, f"{session_id}_despike_report.json")
+    with open(report_path, "w") as f:
+        json.dump({"session_id": session_id, "max_speed": args.max_speed, "n_trials_total": n_trials,
+                   "n_trials_written": n_written, "n_trials_with_glitches": len(despike_log),
+                   "n_glitch_intervals": n_glitches, "trials": despike_log}, f, indent=1)
+    print(f"  report: {report_path}")
 
 
 if __name__ == "__main__":
@@ -204,5 +245,12 @@ if __name__ == "__main__":
                               "window to produce a single row. Confirmed via "
                               "compare_ann_snn_trial_coverage.py that a meaningful fraction of "
                               "real HKM trials fall under the old 130-sample threshold.")
+    parser.add_argument("--max-speed", type=float, default=DEFAULT_MAX_SPEED,
+                         help="Native hand-position intervals faster than this (position units/s) are "
+                              "tracking glitches and are removed before resampling (see hkm_despike.py). "
+                              "Default 3000 is ~3.5x the real 99.5th-percentile speed (~865) and far "
+                              "below the ~70,000 glitch spikes. 0 disables cleaning.")
+    parser.add_argument("--overwrite", action="store_true",
+                         help="Delete existing {session}_trial*.h5 files in --output-dir first.")
     args = parser.parse_args()
     main(args)

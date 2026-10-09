@@ -1,14 +1,177 @@
 """
-Training helpers for snn_training/train_snn.py: early stopping and
-checkpoint saving/loading.
-"""
+Training utilities for OTM
 
-import os
-import time
-from typing import Dict, Optional
+This module provides training loop functions, evaluation, and checkpointing utilities.
+"""
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import time
+from typing import Dict, Tuple, Optional, Union
+import os
+import sinabs
+
+
+def train_epoch(
+    model: nn.Module,
+    train_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    device: torch.device,
+    epoch: int = 0,
+    use_amp: bool = False
+) -> Tuple[float, Dict]:
+    """
+    Train the model for one epoch
+    
+    Args:
+        model: The neural network model
+        train_loader: DataLoader for training data
+        optimizer: Optimizer for updating weights
+        criterion: Loss function
+        device: Device to run on (cuda/cpu)
+        epoch: Current epoch number
+        use_amp: Whether to use automatic mixed precision
+        
+    Returns:
+        Tuple of (average_loss, metrics_dict)
+    """
+    model.train()
+    running_loss = 0.0
+    num_batches = len(train_loader)
+    
+    # Initialize AMP if requested
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    
+    # Progress bar
+    pbar = tqdm(train_loader, desc=f"Training Epoch {epoch}", leave=False)
+    
+    for batch_idx, (labels, inputs, targets) in enumerate(pbar):
+        # Move data to device and reshape
+        inputs = inputs.permute(1, 0, 2, 3, 4).to(device)  # [T, N, C, H, W]
+        targets = targets.permute(1, 0, 2).to(device)      # [T, N, 2]
+        
+        # Reset neuron states
+        if hasattr(model, 'reset_states'):
+            model.reset_states()
+        else:
+            sinabs.reset_states(model)
+        
+        # Zero gradients
+        optimizer.zero_grad()
+        
+        # Forward pass with or without AMP
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                outputs = model(inputs)  # [N, T, 2]
+                # Permute to match target shape [T, N, 2]
+                outputs = outputs.permute(1, 0, 2)
+                loss = criterion(outputs, targets)
+        else:
+            outputs = model(inputs)  # [N, T, 2]
+            # Permute to match target shape [T, N, 2]
+            outputs = outputs.permute(1, 0, 2)
+            loss = criterion(outputs, targets)
+        
+        # Backward pass
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+        
+        # Update metrics
+        running_loss += loss.item()
+        avg_loss = running_loss / (batch_idx + 1)
+        
+        # Update progress bar
+        pbar.set_postfix({'loss': f'{avg_loss:.4f}'})
+    
+    # Calculate epoch metrics
+    epoch_loss = running_loss / num_batches
+    
+    metrics = {
+        'train_loss': epoch_loss,
+        'learning_rate': optimizer.param_groups[0]['lr']
+    }
+    
+    return epoch_loss, metrics
+
+
+def evaluate_epoch(
+    model: nn.Module,
+    test_loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    epoch: int = 0
+) -> Tuple[float, Dict]:
+    """
+    Evaluate the model on test data
+    
+    Args:
+        model: The neural network model
+        test_loader: DataLoader for test data
+        criterion: Loss function
+        device: Device to run on (cuda/cpu)
+        epoch: Current epoch number
+        
+    Returns:
+        Tuple of (average_loss, metrics_dict)
+    """
+    model.eval()
+    running_loss = 0.0
+    num_batches = len(test_loader)
+    
+    # For trajectory prediction, we might want to track additional metrics
+    total_position_error = 0.0
+    num_samples = 0
+    
+    pbar = tqdm(test_loader, desc=f"Evaluating Epoch {epoch}", leave=False)
+    
+    with torch.no_grad():
+        for batch_idx, (labels, inputs, targets) in enumerate(pbar):
+            # Move data to device and reshape
+            inputs = inputs.permute(1, 0, 2, 3, 4).to(device)  # [T, N, C, H, W]
+            targets = targets.permute(1, 0, 2).to(device)      # [T, N, 2]
+            
+            # Reset neuron states
+            if hasattr(model, 'reset_states'):
+                model.reset_states()
+            else:
+                sinabs.reset_states(model)
+            
+            # Forward pass
+            outputs = model(inputs)  # [N, T, 2]
+            # Permute to match target shape [T, N, 2]
+            outputs = outputs.permute(1, 0, 2)
+            loss = criterion(outputs, targets)
+            
+            # Update metrics
+            running_loss += loss.item()
+            avg_loss = running_loss / (batch_idx + 1)
+            
+            # Calculate position error (Euclidean distance)
+            position_error = torch.sqrt(((outputs - targets) ** 2).sum(dim=-1)).mean()
+            total_position_error += position_error.item() * inputs.size(1)
+            num_samples += inputs.size(1)
+            
+            # Update progress bar
+            pbar.set_postfix({'loss': f'{avg_loss:.4f}'})
+    
+    # Calculate epoch metrics
+    epoch_loss = running_loss / num_batches
+    avg_position_error = total_position_error / num_samples
+    
+    metrics = {
+        'test_loss': epoch_loss,
+        'position_error': avg_position_error
+    }
+    
+    return epoch_loss, metrics
 
 
 class EarlyStopping:

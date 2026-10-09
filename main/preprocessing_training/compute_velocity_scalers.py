@@ -37,8 +37,8 @@ Usage:
     # Narrow to specific experiments/subjects rather than discovering all:
     python compute_velocity_scalers.py \
         --snn-datasets-root /users/bfalkenb/scratch/bfalkenb/data/snn_datasets \
-        --experiments bmi --subjects indy loco \
-        --output ../snn_training/velocity_scalers.json
+        --experiments hkm --subjects jenkins nitschke \
+        --output ../snn_training/velocity_scalers_hkm.json
 """
 
 import argparse
@@ -49,7 +49,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from check_velocity_distribution import load_session_velocities, compute_scaling_bounds
+from check_velocity_distribution import load_session_velocities, compute_scaling_bounds, summarize
 
 
 def find_session_dirs(subject_dir):

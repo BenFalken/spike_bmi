@@ -1,0 +1,97 @@
+# Configuration for IAF model with hard reset
+
+# Model configuration
+model:
+  neuron_type: "iaf"
+  reset_type: "soft"
+  channels: 64
+  use_exodus: false # Enable CUDA acceleration (requires GPU, forces soft reset)
+  
+  # Surrogate gradient configuration
+  # surrogate_grad:
+  #   type: "periodic_exponential"  # Options: periodic_exponential, single_exponential, gaussian, multi_gaussian, heaviside
+    # Parameters for specific surrogate gradients (optional):
+    # grad_width: 0.5  # For periodic_exponential and single_exponential
+    # grad_scale: 1.0  # For all types
+    # mu: 0.0         # For gaussian and multi_gaussian
+    # sigma: 0.5      # For gaussian and multi_gaussian
+    # h: 0.15         # For multi_gaussian only
+    # s: 6            # For multi_gaussian only
+    # window: 1.0     # For heaviside only
+  # Example 2: Single Exponential
+    # Uncomment to use:
+  # surrogate_grad:
+  #   type: "single_exponential"
+  #   grad_width: 0.5
+  #   grad_scale: 1.0
+
+  # Example 3: Gaussian
+  # Uncomment to use:
+  # surrogate_grad:
+  #   type: "gaussian"
+  #   mu: 0.0
+  #   sigma: 0.5
+  #   grad_scale: 1.0
+
+  # Example 4: Multi-Gaussian
+  # Uncomment to use:
+  # surrogate_grad:
+  #   type: "multi_gaussian"
+  #   mu: 0.0
+  #   sigma: 0.5
+  #   h: 0.15
+  #   s: 6
+  #   grad_scale: 1.0
+
+  # Example 5: Heaviside
+  # Uncomment to use:
+  # surrogate_grad:
+  #   type: "heaviside"
+  #   window: 1.0
+
+# Dataset configuration
+data:
+  path: "../datasets/"
+  batch_size: 20
+
+# Training hyperparameters
+training:
+  epochs: 4000
+  lr: 0.001
+  weight_decay: 0.001
+  patience: 20  # Early stopping patience (if enabled)
+  use_amp: false
+  
+  # New learning rate reduction options
+  disable_early_stopping: false  # Set to true to continue training with LR reduction
+  scheduler_patience: 10        # Patience for learning rate scheduler
+  min_lr: 1.0e-6               # Minimum learning rate
+  lr_factor: 0.1               # Factor to reduce learning rate by
+  max_lr_reductions: 3         # Maximum number of LR reductions before stopping
+
+# Optimizer configuration
+optimizer:
+  type: "AdamW"
+  betas: [0.9, 0.999]
+
+# Scheduler configuration
+scheduler:
+  type: "ReduceLROnPlateau"
+  mode: "min"
+  # Note: factor and patience are now controlled by training.lr_factor and training.scheduler_patience
+
+# Checkpoint configuration
+checkpoint:
+  dir: "checkpoints/iaf_hard"
+  interval: 10
+
+# WandB configuration
+wandb:
+  project: "otm-snn"
+  tags: ["iaf", "hard-reset", "baseline"]
+
+# Other settings
+device: "cuda"
+seed: 42
+verbose: true
+log_interval: 10
