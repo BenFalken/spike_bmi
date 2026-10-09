@@ -16,7 +16,11 @@ script in this directory, run as a subprocess:
      combine_snn_dataset.py SNN windows -> long (group_size-window) trials
   3. eval_wf_decoder.py, eval_kf_decoder.py
   4. eval_dl_decoders.py    (hyperparameter JSONs written from DL_HYPERPARAMS)
-  5. comparison figures
+  5. comparison figures     (only with --cv_folds; the reported results come
+                             from inference/test_all_decoders.py)
+
+By default each decoder is fit once, on all training data: no CV folds
+(--cv_folds) and no training-duration sweep (--durations).
 
 SNN training is separate (snn_training/train_snn.py, driven by
 sbatch_scripts/run_snn_*.sbatch), and the cross-decoder comparison
@@ -72,7 +76,10 @@ RAW_STEM = "indy_20160407_02"   # default session
 FEATURE = "mua"                  # "mua" (threshold crossings per channel) or "sua" (sorted units)
 METHOD = "binning"               # spike-rate estimation method for the ANN dataset
 TEST_FRAC = 0.1                  # chronologically last fraction held out as test
-DURATIONS = tuple(range(1, 11))  # training durations (minutes) for the duration sweep
+DURATIONS = ()                   # training durations (minutes) to sweep; none by default
+                                 # (--durations 1,2,...,10 for the duration analysis)
+CV_FOLDS = 0                     # cross-validation folds; none by default (--cv_folds 2 for the
+                                 # quick-look CV results and figures)
 MIN_TRAIN_SIZE = 0.45            # minimum first-CV-fold training size (fraction of rows)
 
 # Windowing. Both datasets use 256 ms (65-sample) windows. The ANN windows
@@ -302,9 +309,10 @@ def build_combined_snn_dataset(raw_stem, snn_dataset_filepath, feature=FEATURE,
 
 def _run_decoder_eval(script, decoder, raw_stem, dataset_filepath, feature, method, extra_args,
                       overwrite, n_train_override, gap_samples):
-    """Run an eval script twice: once on all training data, once sweeping
-    DURATIONS. The script skips any result or model bundle that already
-    exists, so this is cheap to repeat."""
+    """Run an eval script on all training data and, if DURATIONS is set,
+    again sweeping DURATIONS (CV_FOLDS-fold CV in both, if set). The script
+    skips any result or model bundle that already exists, so this is cheap
+    to repeat."""
     args = [PYTHON, os.path.join(SCRIPT_DIR, script),
             "--input_filepath", dataset_filepath,
             "--output_filepath", result_path(raw_stem, decoder, feature, method),
@@ -314,6 +322,7 @@ def _run_decoder_eval(script, decoder, raw_stem, dataset_filepath, feature, meth
             "--wdw_time", str(WDW_TIME),
             "--step_ms", str(ANN_STEP_MS),
             "--min_train_size", str(MIN_TRAIN_SIZE),
+            "--n_folds", str(CV_FOLDS),
             *extra_args]
     if n_train_override is not None:
         args += ["--n_train_override", str(n_train_override)]
@@ -322,9 +331,10 @@ def _run_decoder_eval(script, decoder, raw_stem, dataset_filepath, feature, meth
     if overwrite:
         args.append("--overwrite")
 
-    run_cmd(args, f"{decoder.upper()} full-data eval")
-    run_cmd(args + ["--train_durations", ",".join(str(d) for d in DURATIONS)],
-            f"{decoder.upper()} duration sweep")
+    run_cmd(args, f"{decoder.upper()} full-data model")
+    if DURATIONS:
+        run_cmd(args + ["--train_durations", ",".join(str(d) for d in DURATIONS)],
+                f"{decoder.upper()} duration sweep")
     return result_path(raw_stem, decoder, feature, method)
 
 
@@ -470,11 +480,15 @@ def _evaluate_and_plot(raw_stem, dataset_filepath, feature, overwrite, wf_tap,
     eval_kf(raw_stem, dataset_filepath, feature=feature, overwrite=overwrite, **split)
     write_dl_decoder_configs(raw_stem, feature=feature, overwrite=overwrite)
     eval_dl_decoders(raw_stem, dataset_filepath, feature=feature, overwrite=overwrite, **split)
+    if not CV_FOLDS:
+        return      # the quick-look figures plot CV results
 
     full_results = load_full_results(raw_stem, feature=feature)
-    duration_results = load_duration_results(raw_stem, feature=feature)
+    duration_results = load_duration_results(raw_stem, feature=feature, durations=DURATIONS)
     plot_full_comparison(raw_stem, full_results, feature=feature)
-    plot_duration_comparison(raw_stem, duration_results, full_results=full_results, feature=feature)
+    if DURATIONS:
+        plot_duration_comparison(raw_stem, duration_results, full_results=full_results,
+                                 durations=DURATIONS, feature=feature)
 
 
 def process_session(raw_stem=RAW_STEM, feature=FEATURE, overwrite=False):
@@ -503,11 +517,10 @@ def process_nwb_session(raw_stem, dataset_filepath, feature=FEATURE, overwrite=F
     the train/test boundary is read from its n_train attribute (a trial
     boundary, shared with the SNN dataset) rather than computed.
 
-    gap_samples=None keeps the eval scripts' default purge gap: the final
-    split already falls between trials, but the CV folds split rows at
-    arbitrary points, often inside a trial, where neighbouring rows share
-    most of their window. The gap costs the final model only the last
-    ~140 rows of its last training trial."""
+    gap_samples=None keeps the eval scripts' default purge gap for CV folds
+    (they split rows at arbitrary points, often inside a trial, where
+    neighbouring rows share most of their window); the final split falls
+    between trials and gets no gap (bmi/evaluation.py)."""
     with h5py.File(dataset_filepath, "r") as f:
         n_train = f.attrs.get("n_train")
     if n_train is None:
@@ -531,10 +544,17 @@ if __name__ == "__main__":
     parser.add_argument("--nwb_dataset_filepath", type=str, default=None,
                         help="Run process_nwb_session() on this {session}_binning.h5 instead of "
                              "the full .mat pipeline")
+    parser.add_argument("--cv_folds", type=int, default=CV_FOLDS,
+                        help="Cross-validation folds before the final model (default 0: none)")
+    parser.add_argument("--durations", type=str, default="",
+                        help="Training durations (minutes) to also train models for, e.g. "
+                             "1,2,3,4,5,6,7,8,9,10 (default: none)")
     parser.add_argument("--gap_samples", type=int, default=None,
                         help="Purge gap for --nwb_dataset_filepath runs (default: the eval "
                              "scripts' default, see bmi/evaluation.py)")
     args = parser.parse_args()
+    CV_FOLDS = args.cv_folds
+    DURATIONS = tuple(float(d) for d in args.durations.split(",") if d.strip())
     if args.nwb_dataset_filepath:
         process_nwb_session(args.raw_stem, args.nwb_dataset_filepath, feature=args.feature,
                             overwrite=args.overwrite, gap_samples=args.gap_samples)

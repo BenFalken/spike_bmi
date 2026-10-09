@@ -37,56 +37,71 @@ it. Data live under one root (`BMI_DATA_ROOT` / `DATA_ROOT`), laid out as
 
 ## Workflow
 
-1. **Datasets and classical/DL decoders.** `preprocessing_training/single_subject_pipeline.py`
-   runs one session end to end: raw `.mat` → binned spikes and kinematics (4 ms bins) →
-   ANN and SNN datasets → KF, WF, LSTM and QRNN, trained on all data and per training
-   duration. On the cluster: `sbatch_scripts/run_bmi_subject_pipeline_array.sbatch`.
-   Every stage skips outputs that already exist.
-2. **SNN training.** `snn_training/train_snn.py`, driven by:
-   - `run_snn_sweep.sbatch`: an architecture/hyperparameter sweep, per session
-     (`--plan`, then submit the printed command).
-   - `run_snn_pooled_pretrain.sbatch`, then `run_snn_pooled_finetune_array.sbatch`:
-     pretrain the "medium" network (256 → 128) on all sessions of a subject, then
-     fine-tune it per session. `RESET_TYPE=hard|soft` and `TAU_SYN` select the variant
-     (`snn_medium_config.sh`). With `LOSO=1`, pretraining is an array: session i's model
-     is pretrained on every other session, so its own data never reaches pretraining
-     (`loso_pretrained_medium/<session>/`, then `loso_finetuned_medium/<session>/`).
-3. **Inference and report.** `bash sbatch_scripts/run_inference.sbatch --submit bmi indy`
-   evaluates every decoder on every session (`inference/test_all_decoders.py`), then builds
-   `combined_metrics*.json` and the efficiency, energy and 4x2 comparison figures
-   (`inference/make_report.py`).
+The final pipeline, run the same way for all four subjects: bmi `indy` and `loco`
+(continuous `.mat` sessions), hkm `jenkins` and `nitschke` (NWB sessions of separate
+reaches; see [HKM](#hkm-jenkins-nitschke) for what differs). Steps 1–4 run on the
+cluster, step 5 on the Speck-connected laptop, so every decoder's speed, energy and
+accuracy is measured on one platform.
+
+1. **Datasets, KF, WF, LSTM, QRNN.** `preprocessing_training/single_subject_pipeline.py`
+   runs one session: raw data → binned spikes and kinematics (4 ms bins) → ANN and SNN
+   datasets → each decoder fit once on the session's training split. No cross-validation
+   folds and no per-duration models by default (`--cv_folds 2`, `--durations 1,2,...,10`
+   add them). Arrays: `run_bmi_subject_pipeline_array.sbatch`; for hkm first
+   `nwb_conversion/run_hkm_nwb_pipeline_array.sbatch`, then
+   `run_hkm_subject_pipeline_array.sbatch`. Every stage skips outputs that already exist.
+2. **Velocity scalers** (once, after the SNN datasets exist):
+   `python compute_velocity_scalers.py --snn-datasets-root $DATA_ROOT/snn_datasets
+   --output ../snn_training/velocity_scalers.json` (merged into the file).
+3. **SNN for PyTorch ('snn'):** `run_snn_pooled_pretrain.sbatch`, then
+   `run_snn_pooled_finetune_array.sbatch` (chained per session; see the pretrain script's
+   header). 512 → 256 → 128, threshold 1.0, 2 EMA stages, `tau_syn` initialized at 2, 4, 8
+   and 16 over the four spiking layers and trained. Leave-one-session-out by default
+   (`LOSO=1`): session i is fine-tuned from a model pretrained on every other session, so
+   its own data never reaches pretraining. At most 50 epochs per stage for bmi, 10 for hkm.
+   → `snn_checkpoints/<exp>/<subject>/loso_finetuned/<session>/`
+4. **SNN for Speck ('speck'):** `run_snn_per_session_array.sbatch`. 256 → 128 → 64,
+   threshold 1.0, 2 EMA stages, no `tau_syn` (the chip has no synaptic stage), trained
+   per session from scratch. At most 50 epochs for bmi, 20 for hkm.
+   → `snn_checkpoints/<exp>/<subject>/per_session/<session>/`
+
+   Both configurations are in `sbatch_scripts/snn_config.sh`. Every SNN trains on
+   **binarized input** (spike counts clipped to 0/1, `train_snn.py --binarize-input`,
+   default): the chip raises a neuron's membrane once per input event, so bins of several
+   spikes drove the deployed network into runaway spiking. The setting is stored in each
+   checkpoint, and inference, profiling, the chip run and the diagnosis binarize the same
+   way (checkpoints made before it are evaluated unbinarized, as trained).
+   `run_snn_sweep.sbatch` remains for architecture sweeps.
+5. **Inference, report and Speck diagnosis**, on the laptop, per subject:
+   `bash sbatch_scripts/run_inference.sbatch --local <exp> <subject>` (e.g. `--local bmi indy`).
+   - Evaluates every decoder on every session (`inference/test_all_decoders.py`): accuracy,
+     latency and energy per sample, `speck` on the devkit. `snn` runs the `loso_finetuned`
+     checkpoints and `speck` the `per_session` ones (`SNN_CHECKPOINT_ROOT=`,
+     `SPECK_CHECKPOINT_ROOT=` override them).
+   - Builds the report (`inference/make_report.py`): `combined_metrics.json`,
+     `efficiency_summary.json`, and the efficiency, energy and comparison figures. The
+     comparison figure has three rows (accuracy, pairwise comparisons, accuracy over
+     time); the training-duration row is added only when durations are evaluated
+     (`TRAIN_DURATIONS=1,2,...`, which needs per-duration models) or supplied
+     (`DURATIONS_JSON=...`).
+   - Runs `inference/diagnose_speck.py` on the `per_session` checkpoints: the
+     PyTorch → quantized → chip comparison (`speck_diagnosis.json`) and every session's
+     layer spike-density figure and GIF (`speck_layer_activity_<session>.png/.gif`),
+     recorded on the devkit (`SPIKE_DENSITY=0` skips this step).
+   - The laptop needs the datasets' test splits (`inference/export_test_split.py` writes
+     test-only copies of the ANN datasets), the model bundles, both checkpoint folders and
+     `snn_datasets/.../<session>/test/`.
    - **Overriding settings:** put them after the subject, e.g.
-     `... --local bmi indy SNN_CHECKPOINT_ROOT=... FIGURES=1`. A `NAME=value` typed on a
-     shell line of its own is not seen by the script. The script prints the paths it uses.
-   - **Rebuild only the report:** `--report bmi indy`. Training-duration results that the
-     session files lack are kept from the existing `combined_metrics_durations.json` (or taken
-     from `DURATIONS_JSON=...`), so cluster durations survive a laptop report.
-   - **Redraw only the per-session figures and crosshair GIFs:**
-     `--figures bmi indy FIGURE_DECODERS=snn,speck`. This draws from the saved predictions,
-     with no evaluation and no chip. The GIF grid is two panels wide (ground truth, one panel
-     per decoder, overlay).
-4. **Speck.** On the devkit-connected laptop, `bash sbatch_scripts/run_inference.sbatch --local bmi indy`
-   runs the same evaluation in series with `speck` added. Copy the cluster's
-   `sessions/*.json` in first to extend them. `inference/export_test_split.py` writes the
-   test-only data the laptop needs. `speck` runs the SNN checkpoints unless
-   `SPECK_CHECKPOINT_ROOT` (and `SPECK_CHECKPOINT_SUBDIR`) name others. The PyTorch SNN and
-   the chip can then be scored with different checkpoints on the same test rows; a changed
-   checkpoint re-runs the full-data section.
-5. **Speck diagnosis** (no devkit needed, from `main/inference`):
-   - `diagnose_speck.py` scores each session's checkpoint as trained (`pytorch`) and as
-     quantized for the chip, next to the saved `snn` and `speck` results. It also compares
-     the chip's output spikes with the quantized network's step by step: spike ratio,
-     agreement, delay, re-decoding and a cross-validated readout re-fit. It writes
-     `speck_diagnosis.json`.
-   - It also draws the layer-activity figure, `speck_layer_activity_<session>.png`, and the
-     same data animated as `speck_layer_activity_<session>.gif` (see
-     [How the figures were made](#how-the-figures-were-made)). With
-     `--speck_devkit speck2fdevkit:0` the Speck half is recorded on the chip; without it,
-     the quantized network is emulated on the host.
-   - `probe_speck.py` (with the devkit) measures how a single chip neuron integrates and
-     fires.
-   - `compare_speck_runs.py` draws the figure below from up to three
-     `speck_diagnosis.json` files.
+     `... --local bmi indy FIGURES=1`. A `NAME=value` typed on a shell line of its own is
+     not seen by the script. The script prints the paths it uses. `FIGURES=1` also saves
+     per-session diagnostic figures and crosshair GIFs (`FIGURE_DECODERS=snn,speck` limits
+     them).
+   - **Rebuild only the report:** `--report <exp> <subject>`. **Redraw only the per-session
+     figures** from the saved predictions (no evaluation, no chip): `--figures <exp> <subject>`.
+   - `--submit` runs the same evaluation (without the chip) as Slurm jobs.
+6. **Other Speck tools** (from `main/inference`): `probe_speck.py` (with the devkit)
+   measures how a single chip neuron integrates and fires; `compare_speck_runs.py` draws
+   one figure from up to three `speck_diagnosis.json` files.
 
 ### HKM (Jenkins, Nitschke)
 
@@ -112,33 +127,30 @@ decoded as its own trial, from rest, never as part of one continuous recording.
    lack the trial IDs inference needs, so rebuild them, then retrain every decoder.
 2. **KF, WF, LSTM, QRNN.** `sbatch_scripts/run_hkm_subject_pipeline_array.sbatch`
    trains them on the concatenated windows, with the train/test boundary taken from
-   the dataset (WF uses 8 taps: 192 channels × 15 taps exhausts memory). Set
-   `OVERWRITE=1` on the first run after rebuilding the datasets.
-3. **Velocity scalers.** Add the HKM subjects to `snn_training/velocity_scalers.json`:
-   `python compute_velocity_scalers.py --snn-datasets-root $DATA_ROOT/snn_datasets
-   --experiments hkm --output ../snn_training/velocity_scalers.json` (merged into the
-   file; the bmi entries are kept).
-4. **SNN.** The same scripts as bmi, with `hkm` as the experiment:
-   `bash run_snn_sweep.sbatch --plan hkm [subject]`, or
-   `run_snn_pooled_pretrain.sbatch` / `run_snn_pooled_finetune_array.sbatch` with
-   `EXPERIMENT=hkm` (and `LOSO=1`). Trials differ in length, so HKM trains with batch
-   size 1, one trial per step with the state reset at its start. An epoch takes about
-   an hour per session, so HKM runs fewer epochs (sweep 20, pooled 10), checkpoints
-   every epoch and resumes when re-submitted.
-5. **Inference.** `bash run_inference.sbatch --submit hkm <subject>
-   SNN_CHECKPOINT_ROOT=...` (and `--local` with `speck`). Every SNN test trial runs
-   from rest (the chip is reset before each), and its timesteps 65 … T − 1 are scored
-   on that trial's own ANN rows. Trials of 65 samples or fewer have no ANN rows and
-   are not scored. The other decoders are scored on the same rows. Before scoring,
-   inference checks that the two datasets hold out the same trials with the same
-   velocity, and compares the SNN's mean per-trial RMSE with the loss recorded in its
-   checkpoint (`training_check` in the session results; they match for a checkpoint
-   selected on that session). The per-session figures show one trial per grid panel.
+   the dataset (a trial boundary, so no purge gap is needed; WF uses 8 taps: 192 channels
+   × 15 taps exhausts memory). Set `OVERWRITE=1` on the first run after rebuilding the
+   datasets.
+3. **SNN.** The same scripts as bmi with `EXPERIMENT=hkm`. Trials differ in length, so
+   HKM trains with batch size 1, one trial per step with the state reset at its start. An
+   epoch takes about an hour per session, so HKM checkpoints every epoch and resumes when
+   re-submitted.
+4. **Inference.** Every SNN test trial runs from rest (the chip is reset before each,
+   about 1 s per layer), and its timesteps 65 … T − 1 are scored on that trial's own ANN
+   rows. Trials of 65 samples or fewer have no ANN rows and are not scored. The other
+   decoders are scored on the same rows. Before scoring, inference checks that the two
+   datasets hold out the same trials with the same velocity, and compares the SNN's mean
+   per-trial RMSE with the loss recorded in its checkpoint (`training_check` in the
+   session results; they match to within 0.1% for a checkpoint selected on that
+   session). The per-session figures show one trial per grid panel; the spike-density
+   figure follows the session's longest test trial.
    - **Transition only:** datasets built before trial IDs were stored can be evaluated with
      `LEGACY_HKM=1` (`inference/test_all_decoders_legacy_hkm.py`), which matches the SNN
      test trials to ANN rows by velocity and writes to `results/test_all_decoders_legacy/`.
 
 ## Findings
+
+These results predate the final pipeline above: they come from earlier bmi runs
+(unbinarized input, other SNN configurations) and will be replaced by its results.
 
 ### Decoders (indy, 36 sessions)
 

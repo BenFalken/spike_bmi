@@ -321,10 +321,12 @@ def _over_x(ax, x_values, series, decoders, ylabel, xlabel, fmt, clip_decoder=No
                                 arrowprops=dict(arrowstyle='-|>', color=color, lw=1.2))
 
 
-def comparison_4x2_figure(combined, durations=None):
+def comparison_4x2_figure(combined, durations=None, show_durations=False):
     """combined: {session: {decoder: metrics}}; durations: {session: {"Nmin":
-    {decoder: metrics}}} or None. Sessions missing any decoder are left out
-    of rows a-d and g-h so the paired tests compare the same sessions."""
+    {decoder: metrics}}} or None. Rows: accuracy box plots, pairwise
+    matrices, accuracy vs. training duration (only with show_durations) and
+    accuracy over time. Sessions missing any decoder are left out of every
+    row but the duration row, so the paired tests compare the same sessions."""
     present = {d for entry in combined.values() for d in entry}
     decoders = [d for d in DECODER_ORDER if d in present]
     sessions = []
@@ -344,7 +346,8 @@ def comparison_4x2_figure(combined, durations=None):
     reference = min(decoders, key=lambda d: np.mean(rmse[d]))
     print(f"  [4x2] {len(sessions)} sessions; significance vs. {reference.upper()}")
 
-    fig, axes = plt.subplots(4, 2, figsize=(12, 20))
+    n_rows = 4 if show_durations else 3
+    fig, axes = plt.subplots(n_rows, 2, figsize=(12, 5 * n_rows))
     for col, (values, ylabel) in enumerate([(rmse, 'Average RMSE'), (cc, 'Average CC')]):
         others = [d for d in decoders if d != reference]
         p_adj = _holm([_wilcoxon_p(values[d], values[reference]) for d in others])
@@ -352,32 +355,10 @@ def comparison_4x2_figure(combined, durations=None):
         _boxplot(axes[0, col], values, decoders, sig, ylabel)
         _pairwise_matrix(axes[1, col], values, decoders, higher_is_better=(col == 1))
 
-    # e/f: accuracy vs. training duration, mean and 95% CI across sessions
-    samples = {}   # (decoder, minutes) -> ([rmse], [cc])
-    for per_tag in (durations or {}).values():
-        for tag, entry in per_tag.items():
-            for d, m in entry.items():
-                r, c = samples.setdefault((d, float(tag[:-3])), ([], []))
-                r.append(m['rmse'])
-                c.append(average_cc(m))
-    duration_decoders = [d for d in DECODER_ORDER if any(k[0] == d for k in samples)]
-    minutes = sorted({k[1] for k in samples})
-    for col, (idx, ylabel, clip) in enumerate([(0, 'RMSE', 'wf'), (1, 'Correlation', None)]):
-        ax = axes[2, col]
-        if not duration_decoders:
-            ax.text(0.5, 0.5, 'No training-duration results', ha='center', va='center',
-                    transform=ax.transAxes, fontsize=10, color='gray')
-            continue
-        series = {}
-        for d in duration_decoders:
-            stats = [mean_ci(samples[(d, m)][idx]) if (d, m) in samples else (np.nan,) * 3 for m in minutes]
-            series[d] = tuple(zip(*stats))
-        # WF's unregularized short-duration fits can explode; clip them so
-        # the other decoders stay readable (RMSE only; CC is bounded).
-        _over_x(ax, minutes, series, duration_decoders, ylabel, 'Training Duration (min)',
-                lambda x: f"{x:g}", clip_decoder=clip)
+    if show_durations:
+        _duration_row(axes[2], durations)
 
-    # g/h: accuracy vs. days since the first session
+    # last row: accuracy vs. days since the first session
     first = min(session_date(s) for s in sessions)
     days = [(session_date(s) - first).days for s in sessions]
     for col, (key, ylabel) in enumerate([('rmse', 'RMSE'), ('cc', 'Correlation')]):
@@ -391,13 +372,41 @@ def comparison_4x2_figure(combined, durations=None):
                 mean = [average_cc(e) for e in entries]
                 series[d] = (mean, [e.get('cc_ci_low', m) for e, m in zip(entries, mean)],
                              [e.get('cc_ci_high', m) for e, m in zip(entries, mean)])
-        _over_x(axes[3, col], days, series, decoders, ylabel, 'Days Since Implantation',
+        _over_x(axes[-1, col], days, series, decoders, ylabel, 'Days Since Implantation',
                 lambda x: str(int(round(x))))
 
-    handles, labels = axes[3, 0].get_legend_handles_labels()
+    handles, labels = axes[-1, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='upper center', ncol=len(decoders), bbox_to_anchor=(0.5, 1.01),
                frameon=False)
     for ax, letter in zip(axes.flat, 'abcdefgh'):
         ax.text(-0.12, 1.05, letter, transform=ax.transAxes, fontsize=13, fontweight='bold', va='top')
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     return fig
+
+
+def _duration_row(axes, durations):
+    """Accuracy vs. training duration, mean and 95% CI across sessions."""
+    samples = {}   # (decoder, minutes) -> ([rmse], [cc])
+    for per_tag in (durations or {}).values():
+        for tag, entry in per_tag.items():
+            for d, m in entry.items():
+                r, c = samples.setdefault((d, float(tag[:-3])), ([], []))
+                r.append(m['rmse'])
+                c.append(average_cc(m))
+    duration_decoders = [d for d in DECODER_ORDER if any(k[0] == d for k in samples)]
+    minutes = sorted({k[1] for k in samples})
+    for col, (idx, ylabel, clip) in enumerate([(0, 'RMSE', 'wf'), (1, 'Correlation', None)]):
+        ax = axes[col]
+        if not duration_decoders:
+            ax.text(0.5, 0.5, 'No training-duration results', ha='center', va='center',
+                    transform=ax.transAxes, fontsize=10, color='gray')
+            continue
+        series = {}
+        for d in duration_decoders:
+            stats = [mean_ci(samples[(d, m)][idx]) if (d, m) in samples else (np.nan,) * 3 for m in minutes]
+            series[d] = tuple(zip(*stats))
+        # WF's unregularized short-duration fits can explode; clip them so
+        # the other decoders stay readable (RMSE only; CC is bounded).
+        _over_x(ax, minutes, series, duration_decoders, ylabel, 'Training Duration (min)',
+                lambda x: f"{x:g}", clip_decoder=clip)
+

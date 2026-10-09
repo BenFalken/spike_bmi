@@ -39,7 +39,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from decoder_eval import _load_pickle, snn_test_files, unscale_velocity
+from decoder_eval import _load_pickle, snn_input, snn_test_files, unscale_velocity
 
 POWER_SAMPLE_RATE_HZ = 100
 RESET_SETTLE_S = 1.0     # after writing zeroed membrane values to a layer
@@ -300,7 +300,8 @@ def open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt
     check_deployable(model, checkpoint)
     snn_seq = flatten_snn(model)
     snn_seq.eval()
-    cross_check_flattened(model, snn_seq, _load_pickle(snn_test_files(snn_dataset_path)[0])['input_spikes'])
+    first = _load_pickle(snn_test_files(snn_dataset_path)[0])['input_spikes']
+    cross_check_flattened(model, snn_seq, snn_input(model, first))
     return SpeckDevkit(snn_seq, model.layers[0].in_features, devkit, wait_time, raster_dt, monitor_all)
 
 
@@ -326,7 +327,7 @@ def predict_speck_test_set(model, velocity_scale, trials, device, experiment, co
             continue                                  # dropped anyway; skip the chip time
         if not continuous or i == 0:
             device.reset()
-        spikes = trial['input_spikes']
+        spikes = snn_input(model, trial['input_spikes'])
         counts, seconds, power_w, events = device.run(spikes, n_outputs)
         n_events, n_input = n_events + events, n_input + int(np.round(spikes).sum())
         print(f"  [speck] trial {i + 1}/{len(trials)}: {spikes.shape[1]} timesteps, "

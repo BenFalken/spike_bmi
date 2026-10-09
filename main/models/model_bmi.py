@@ -163,7 +163,7 @@ class NeuronFactory:
         min_vmem: float,
         spike_fn: Optional[Callable],
         use_squeeze: bool,
-        tau_syn: Optional[float] = None,
+        tau_syn: Optional[Union[float, List[float]]] = None,
         norm_input: bool = True,
     ):
         self.use_squeeze = use_squeeze
@@ -361,7 +361,7 @@ class SNN_Speck(nn.Module):
         temporal_decay_stages: int = 1,
         num_input_channels: int = 96,
         hidden_dims: Optional[List[int]] = None,
-        tau_syn: Optional[float] = None,
+        tau_syn: Optional[Union[float, List[float]]] = None,
         norm_input: bool = True,
         velocity_lo: float = -280.56,
         velocity_hi: float = 316.54,
@@ -386,6 +386,11 @@ class SNN_Speck(nn.Module):
                 f"given hidden_dims={hidden_dims} -> {n_layers} layers total), "
                 f"got {len(thresholds)}")
 
+        # tau_syn: one initial value for every spiking layer, or one per layer.
+        taus = list(tau_syn) if isinstance(tau_syn, (list, tuple)) else [tau_syn] * n_layers
+        if len(taus) != n_layers:
+            raise ValueError(f"tau_syn must have 1 or {n_layers} values (one per layer), got {len(taus)}")
+
         factory = NeuronFactory(
             neuron_type=neuron_type,
             use_spikingjelly=use_spikingjelly,
@@ -404,6 +409,7 @@ class SNN_Speck(nn.Module):
         raw_layers: List[nn.Module] = []
         for i in range(n_layers):
             is_last = (i == n_layers - 1)
+            factory.tau_syn = taus[i]
             add_linear_block(
                 raw_layers, layer_widths[i], layer_widths[i + 1], factory,
                 spike_threshold=thresholds[i],
@@ -678,7 +684,7 @@ def create_model(
     temporal_decay_stages: int = 1,
     num_input_channels: int = 96,
     hidden_dims: Optional[List[int]] = None,
-    tau_syn: Optional[float] = None,
+    tau_syn: Optional[Union[float, List[float]]] = None,
     norm_input: bool = True,
     velocity_lo: float = -280.56,
     velocity_hi: float = 316.54,

@@ -8,6 +8,8 @@ Writes  {results_dir}/combined_metrics.json            {session: {decoder: metri
         {results_dir}/efficiency_summary.json          {machine: {decoder: means across sessions}}
         {results_dir}/decoder_efficiency.png, decoder_energy.png, decoder_comparison_4x2.png
 
+The comparison figure has a training-duration row only with --durations.
+
 Training-duration results the session files lack (e.g. sessions evaluated on
 the Speck laptop, where durations are not run) are kept from the existing
 combined_metrics_durations.json, or from --durations_json (e.g. the cluster's
@@ -180,7 +182,8 @@ def main(args):
     outside = sorted(set(durations) - set(sessions))
     if outside:
         print(f"[durations] kept in the file but left out of the figure (not in sessions/): {outside}")
-    _save_figure(comparison_4x2_figure(combined, {s: d for s, d in durations.items() if s in sessions}),
+    _save_figure(comparison_4x2_figure(combined, {s: d for s, d in durations.items() if s in sessions},
+                                       show_durations=args.durations),
                  os.path.join(results_dir, 'decoder_comparison_4x2.png'))
 
 
@@ -192,6 +195,8 @@ if __name__ == '__main__':
     parser.add_argument('--durations_json', default=None,
                         help='combined_metrics_durations.json to take training-duration results from '
                              'where the session files have none (default: the one in --results_dir)')
+    parser.add_argument('--durations', action='store_true',
+                        help='Add the accuracy vs. training duration row to the comparison figure')
     parser.add_argument('--error_bars', action='store_true',
                         help='Draw 95%% CI error bars on the efficiency figure')
     main(parser.parse_args())

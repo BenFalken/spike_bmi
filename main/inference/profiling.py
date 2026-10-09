@@ -26,7 +26,7 @@ import numpy as np
 import sinabs
 import torch
 
-from decoder_eval import load_ann_decoder, load_snn_model, snn_test_files, _load_pickle
+from decoder_eval import load_ann_decoder, load_snn_model, snn_input, snn_test_files, _load_pickle
 
 
 def count_params(name, model):
@@ -88,7 +88,7 @@ def _snn_single_timestep_pass(model, snn_dataset_path, n_timesteps):
     state on every call, so the reset is suppressed except at trial starts."""
     timesteps = []
     for path in snn_test_files(snn_dataset_path):
-        spikes = _load_pickle(path)['input_spikes']              # (C, T)
+        spikes = snn_input(model, _load_pickle(path)['input_spikes'])   # (C, T)
         timesteps += [(torch.from_numpy(spikes[:, t].astype(np.float32))[None, None, :], t == 0)
                       for t in range(spikes.shape[1])]
         if len(timesteps) >= n_timesteps:

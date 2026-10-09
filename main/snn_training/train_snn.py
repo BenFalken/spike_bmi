@@ -19,8 +19,14 @@ hkm needs --batch-size 1: one trial per optimizer step.
 Synaptic time constant: --tau-syn is off by default (no synaptic-current
 stage). With a value, every spiking layer low-pass filters its input
 current with a time constant (in 4 ms timesteps) initialized to that value
-and trained with the weights, like the readout's EMA decay. The trained
+(or to its own value, given one per spiking layer, e.g. 2 4 8 16) and
+trained with the weights, like the readout's EMA decay. The trained
 per-layer values are part of the model state dict.
+
+Input: spike counts are clipped to 0/1 (--binarize-input, default on).
+A Speck input event raises a neuron's membrane once per event, so bins of
+several spikes drive the chip far harder than training assumed. The
+setting is saved with the checkpoint, and inference applies the same.
 
 Outputs in --checkpoint-dir, with exp_name = bmi_{neuron_type}_{reset_type}:
     best_model_weights.pth                   lowest test loss so far
@@ -70,8 +76,9 @@ def parse_arguments():
     model.add_argument("--final-layer-reset-type", type=str, default=None, choices=["hard", "soft"],
                        help="Reset for the output layer (default: same as --reset-type)")
     model.add_argument("--tau-mem", type=float, default=12.0, help="LIF membrane time constant")
-    model.add_argument("--tau-syn", type=float, default=None,
-                       help="Initial synaptic time constant, trained per layer (default: none)")
+    model.add_argument("--tau-syn", type=float, nargs="+", default=None,
+                       help="Initial synaptic time constant, trained per layer: one value for "
+                            "every spiking layer or one per layer (default: none)")
     model.add_argument("--hidden-dims", type=int, nargs="+", default=None,
                        help="Hidden layer widths (default: 512 256 128)")
     model.add_argument("--spike-thresholds", type=float, nargs="+", default=None,
@@ -103,6 +110,9 @@ def parse_arguments():
                       help="Directory with train/ and test/ .pkl trials")
     data.add_argument("--experiment", type=str, default=None, choices=["bmi", "hkm"],
                       help="Default: derived from --data-path")
+    data.add_argument("--binarize-input", type=str2bool, default=True,
+                      help="Clip input spike counts to 0/1 (recorded in the checkpoint; inference "
+                           "binarizes the same way)")
     data.add_argument("--batch-size", type=int, default=20)
     data.add_argument("--num-workers", type=int, default=20)
     data.add_argument("--train-data-min", type=float, default=None,
@@ -262,7 +272,7 @@ def build_loaders(args, experiment, subject):
                          f"(got {args.batch_size})")
     train_loader, test_loader = create_dataloaders(
         data_path=args.data_path, batch_size=args.batch_size, num_workers=args.num_workers,
-        shuffle_train=True, experiment=experiment, subject=subject)
+        shuffle_train=True, experiment=experiment, subject=subject, binarize=args.binarize_input)
 
     trial_timesteps = train_loader.dataset[0][1].shape[0]
     print(f"First train trial: {trial_timesteps} timesteps ({trial_timesteps * STEP_MS:.0f} ms)")
@@ -313,7 +323,7 @@ def build_model(args, experiment, num_input_channels, device):
         temporal_decay_stages=args.temporal_decay_stages,
         num_input_channels=num_input_channels,
         hidden_dims=args.hidden_dims,
-        tau_syn=args.tau_syn,
+        tau_syn=args.tau_syn[0] if args.tau_syn and len(args.tau_syn) == 1 else args.tau_syn,
         velocity_lo=args.velocity_lo,
         velocity_hi=args.velocity_hi,
         velocity_margin=args.velocity_margin,
@@ -358,7 +368,8 @@ def main():
           f"tau_syn: {args.tau_syn} | decay stages: {args.temporal_decay_stages}")
     print(f"Velocity scaling: lo={args.velocity_lo}, hi={args.velocity_hi}, "
           f"margin={args.velocity_margin}")
-    print(f"Batch size: {args.batch_size} | lr: {args.lr} | epochs: {args.epochs}")
+    print(f"Batch size: {args.batch_size} | lr: {args.lr} | epochs: {args.epochs} | "
+          f"binarized input: {args.binarize_input}")
 
     train_loader, test_loader = build_loaders(args, experiment, subject)
     input_shape = test_loader.dataset[0][1].shape[1:]

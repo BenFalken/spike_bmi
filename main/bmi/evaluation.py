@@ -3,15 +3,19 @@ Shared evaluation loop for the ANN-side decoder scripts
 (preprocessing_training/eval_{kf,wf}_decoder.py, eval_dl_decoders.py).
 
 For each requested training duration (or the full training set), a decoder
-script gets two outputs:
+script gets up to two outputs:
 
-1. Cross-validation results: chronological K-fold CV (TimeSeriesSplitCustom)
-   with a purge gap between train and test. Per-fold RMSE/CC and the last
-   fold's predictions go to an .h5 file.
-2. A final model bundle (optional, with --model_dir): one model fit on the
+1. Cross-validation results (only with --n_folds > 0; off by default):
+   chronological K-fold CV (TimeSeriesSplitCustom) with a purge gap between
+   train and test. Per-fold RMSE/CC and the last fold's predictions go to an
+   .h5 file. These are quick-look numbers; the reported results come from
+   inference/test_all_decoders.py.
+2. A final model bundle (with --model_dir): one model fit on the
    chronological training split (chronological_holdout_split). Downstream
    inference scripts load these bundles and evaluate them on the held-out
-   test split.
+   test split. The purge gap also separates this split, except where the
+   boundary is a trial boundary (--n_train_override, trial-structured NWB
+   data): different trials share no samples, so no gap is needed there.
 
 With a duration cap, each training set is cut down to its most recent
 `minutes` of rows, the ones just before the test data. Outputs for a
@@ -47,7 +51,8 @@ def add_eval_args(parser):
                         help='CV results file; per-duration results get a _{N}min suffix')
     parser.add_argument('--feature', type=str, default='mua', choices=['sua', 'mua'],
                         help='Which input matrix to use: X_sua or X_mua')
-    parser.add_argument('--n_folds', type=int, default=2, help='Number of CV folds')
+    parser.add_argument('--n_folds', type=int, default=0,
+                        help='Number of CV folds (default 0: no cross-validation, only the final model)')
     parser.add_argument('--min_train_size', type=float, default=0.5,
                         help='Minimum training size of the first CV fold (fraction of rows)')
     parser.add_argument('--test_size', type=float, default=0.1,
@@ -177,7 +182,9 @@ def run_evaluation(args, X, y, gap_samples, cv_fold, fit_final=None, bundle_path
     final fit is skipped. on_duration_start(), if given, runs before each
     duration's work (the DL script uses it to reseed).
     """
-    print(f"Purge gap: {gap_samples} rows; {60000.0 / args.step_ms:.1f} rows/minute")
+    final_gap = 0 if args.n_train_override is not None else gap_samples
+    print(f"Purge gap: {gap_samples} rows between CV folds, {final_gap} before the final model's "
+          f"test split; {60000.0 / args.step_ms:.1f} rows/minute")
     for duration_minutes in parse_train_durations(args.train_durations):
         suffix = duration_suffix(duration_minutes)
         if duration_minutes is None:
@@ -191,7 +198,7 @@ def run_evaluation(args, X, y, gap_samples, cv_fold, fit_final=None, bundle_path
             on_duration_start()
 
         results_path = add_suffix_to_path(args.output_filepath, suffix)
-        if not _outputs_exist([results_path], args.overwrite, "CV results"):
+        if args.n_folds > 0 and not _outputs_exist([results_path], args.overwrite, "CV results"):
             rmse, cc, y_true, y_pred = cross_validate(args, X, y, gap_samples,
                                                       n_train_samples, cv_fold)
             write_cv_results(results_path, rmse, cc, y_true, y_pred,
@@ -204,7 +211,7 @@ def run_evaluation(args, X, y, gap_samples, cv_fold, fit_final=None, bundle_path
             continue
 
         X_train, y_train, _, _ = chronological_holdout_split(
-            X, y, args.test_frac, gap=gap_samples, n_train_override=args.n_train_override)
+            X, y, args.test_frac, gap=final_gap, n_train_override=args.n_train_override)
         if n_train_samples is not None:
             if n_train_samples > len(y_train):
                 print(f"  Not saving a final model: only {len(y_train)} training rows available")
@@ -217,7 +224,7 @@ def run_evaluation(args, X, y, gap_samples, cv_fold, fit_final=None, bundle_path
                 'feature': args.feature,
                 'train_duration_minutes': duration_minutes,
                 'train_duration_samples': n_train_samples,
-                'split_gap_samples': gap_samples}
+                'split_gap_samples': final_gap}
         fit_final(X_train, y_train, scaler, suffix, meta)
         print(f"Saved final model bundle to {args.model_dir} "
               f"(duration={duration_minutes if duration_minutes is not None else 'full'})")

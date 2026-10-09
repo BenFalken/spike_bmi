@@ -12,8 +12,14 @@
 #   bash run_inference.sbatch --local bmi indy      # on one machine, e.g. the Speck laptop
 #   bash run_inference.sbatch --local bmi           # every subject of the experiment in turn
 #
+# Checkpoints (defaults; see run_snn_pooled_*.sbatch and run_snn_per_session_array.sbatch):
+#   'snn'    ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/loso_finetuned/<session>/
+#   'speck'  ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/per_session/<session>/
+# Sessions are those with an 'snn' checkpoint; a session without a 'speck'
+# checkpoint is evaluated without 'speck'.
+#
 # Without a subject, every subject with a ${DATA_ROOT}/snn_checkpoints/<experiment>/
-# <subject>/per_session/ directory is run as if named (one report per subject).
+# <subject>/loso_finetuned/ directory is run as if named (one report per subject).
 #
 # --submit submits (from this directory):
 #   1. an array job, one task per session with an SNN checkpoint, running
@@ -26,8 +32,13 @@
 #
 # --local runs the same steps in series without Slurm. Its defaults suit the
 # Speck-connected laptop: DECODERS adds 'speck' (the SNN on the devkit),
-# TRAIN_DURATIONS is empty (durations come from the cluster run), MACHINE=laptop
-# labels its profile, and math libraries use one thread. The data layout under
+# MACHINE=laptop labels its profile, and math libraries use one thread. When it
+# runs 'speck' it ends with inference/diagnose_speck.py: the chip-vs-PyTorch
+# diagnosis and every session's layer spike-density figure, recorded on the
+# devkit (SPIKE_DENSITY=0 skips it).
+# No training durations are evaluated unless TRAIN_DURATIONS is set (e.g.
+# 1,2,...,10, for models trained per duration); the report's duration row
+# appears only then, or with DURATIONS_JSON. The data layout under
 # DATA_ROOT is the same as on the cluster; to extend the cluster results, copy
 # the cluster's sessions/*.json into the laptop's results directory first: their
 # durations and cluster profile are kept, and full-data results gain 'speck'.
@@ -40,8 +51,8 @@
 #   bash run_inference.sbatch --local bmi indy SNN_CHECKPOINT_ROOT=.../per_session FIGURES=1
 # or in the environment: before the command on the same line, or exported
 # (a plain NAME=value on a line of its own is not seen by this script), e.g.
-#   SNN_CHECKPOINT_ROOT=.../full_cohort_finetuned_medium bash run_inference.sbatch --submit bmi indy
-#   SPECK_CHECKPOINT_ROOT=.../per_session ...   run 'speck' with other checkpoints than 'snn'
+#   SNN_CHECKPOINT_ROOT=.../full_cohort_finetuned bash run_inference.sbatch --submit bmi indy
+#   SPECK_CHECKPOINT_ROOT=.../other_checkpoints ...   run 'speck' with other checkpoints
 #   FIGURES=1 bash run_inference.sbatch --submit bmi indy     # also per-session diagnostic figures
 #   FIGURE_DECODERS=snn,speck FIGURES=1 ...   only these decoders in them (and the crosshair GIFs)
 #   DATA_ROOT=~/data VENV=~/speck-env bash run_inference.sbatch --local bmi indy
@@ -63,7 +74,7 @@ set -eo pipefail
 # Settings this script reads from the environment (see the examples above).
 SETTINGS="DATA_ROOT VENV DECODERS TRAIN_DURATIONS MACHINE SNN_CHECKPOINT_ROOT SNN_CHECKPOINT_SUBDIR
           SPECK_CHECKPOINT_ROOT SPECK_CHECKPOINT_SUBDIR RESULTS_DIR FIGURES FIGURE_DECODERS
-          SPECK_WAIT_TIME ENERGY_METER_NUM_THREADS DURATIONS_JSON LEGACY_HKM"
+          SPECK_WAIT_TIME ENERGY_METER_NUM_THREADS DURATIONS_JSON LEGACY_HKM SPIKE_DENSITY"
 
 case "${1:-}" in
     --submit|--local|--report|--figures)
@@ -121,11 +132,11 @@ if [ -z "${SUBJECT:-}" ]; then
     fi
     SUBJECTS=()
     for d in $(find "${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}" -mindepth 2 -maxdepth 2 -type d \
-                    -name per_session 2>/dev/null | sort); do
+                    -name loso_finetuned 2>/dev/null | sort); do
         SUBJECTS+=("$(basename "$(dirname "$d")")")
     done
     if [ "${#SUBJECTS[@]}" -eq 0 ]; then
-        echo "ERROR: no ${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/<subject>/per_session/" >&2
+        echo "ERROR: no ${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/<subject>/loso_finetuned/" >&2
         exit 1
     fi
     echo "Subjects of ${EXPERIMENT}: ${SUBJECTS[*]}"
@@ -147,23 +158,18 @@ fi
 FEATURE="mua"
 DECODERS="${DECODERS:-kf,wf,lstm,qrnn,snn}"
 TEST_FRAC=0.1
-TRAIN_DURATIONS="${TRAIN_DURATIONS-1,2,3,4,5,6,7,8,9,10}"
+TRAIN_DURATIONS="${TRAIN_DURATIONS-}"     # e.g. 1,2,3,4,5,6,7,8,9,10 (needs duration-trained models)
 MACHINE="${MACHINE:-cluster}"
 
 DATASET_ROOT="${DATA_ROOT}/dataset/${EXPERIMENT}/${SUBJECT}/mua"
 MODEL_CACHE_ROOT="${DATA_ROOT}/results/model_cache/${EXPERIMENT}/${SUBJECT}"
 # SNN checkpoints: ${SNN_CHECKPOINT_ROOT}/<session>/[${SNN_CHECKPOINT_SUBDIR}/]best_model_weights.pth
 # (SNN_CHECKPOINT_SUBDIR selects one config of a sweep, e.g. wide768_2x)
-SNN_CHECKPOINT_ROOT="${SNN_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/per_session}"
+SNN_CHECKPOINT_ROOT="${SNN_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/loso_finetuned}"
 SNN_CHECKPOINT_SUBDIR="${SNN_CHECKPOINT_SUBDIR:-}"
-# The 'speck' decoder runs the SNN checkpoints unless SPECK_CHECKPOINT_ROOT
-# (and SPECK_CHECKPOINT_SUBDIR) name others, laid out the same way.
-if [ -n "${SPECK_CHECKPOINT_ROOT:-}" ]; then
-    SPECK_CHECKPOINT_SUBDIR="${SPECK_CHECKPOINT_SUBDIR:-}"
-else
-    SPECK_CHECKPOINT_ROOT="$SNN_CHECKPOINT_ROOT"
-    SPECK_CHECKPOINT_SUBDIR="${SPECK_CHECKPOINT_SUBDIR:-$SNN_CHECKPOINT_SUBDIR}"
-fi
+# 'speck' needs a deployable network (no tau_syn): the per-session models.
+SPECK_CHECKPOINT_ROOT="${SPECK_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/per_session}"
+SPECK_CHECKPOINT_SUBDIR="${SPECK_CHECKPOINT_SUBDIR:-}"
 if [ "$EXPERIMENT" = "hkm" ]; then
     SNN_DATASET_ROOT="${DATA_ROOT}/snn_datasets/${EXPERIMENT}/${SUBJECT}/mua"          # whole trials
 else
@@ -244,8 +250,10 @@ export MKL_NUM_THREADS=$OMP_NUM_THREADS
 INFERENCE_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}/../inference"
 
 run_report() {
+    local duration_args=()
+    [ -n "${TRAIN_DURATIONS}${DURATIONS_JSON:-}" ] && duration_args=(--durations)
     python3 "$INFERENCE_DIR/make_report.py" --results_dir "$RESULTS_DIR" \
-        ${DURATIONS_JSON:+--durations_json "$DURATIONS_JSON"}
+        ${DURATIONS_JSON:+--durations_json "$DURATIONS_JSON"} "${duration_args[@]}"
 }
 
 run_session() {  # run_session SESSION_ID
@@ -271,7 +279,7 @@ run_session() {  # run_session SESSION_ID
 }
 
 # --------------------------------------------------------------------------
-# LOCAL: every session in series, then the report
+# LOCAL: every session in series, then the report (and the Speck diagnosis)
 # --------------------------------------------------------------------------
 if [ "${RUN:-}" = "--local" ]; then
     show_settings
@@ -282,6 +290,14 @@ if [ "${RUN:-}" = "--local" ]; then
     done
     [ "${#FAILED[@]}" -gt 0 ] && echo "Failed sessions (see above): ${FAILED[*]}"
     run_report
+    if [[ ",$DECODERS," == *,speck,* ]] && [ "${SPIKE_DENSITY:-1}" = "1" ]; then
+        echo "=== Speck diagnosis and layer spike density, every session ==="
+        python3 "$INFERENCE_DIR/diagnose_speck.py" --experiment "$EXPERIMENT" --subject "$SUBJECT" \
+            --data_root "$DATA_ROOT" --snn_checkpoint_root "$SPECK_CHECKPOINT_ROOT" \
+            --snn_checkpoint_subdir "$SPECK_CHECKPOINT_SUBDIR" --results_dir "$RESULTS_DIR" \
+            --figure_session all --speck_devkit speck2fdevkit:0 \
+            ${SPECK_WAIT_TIME:+--speck_wait_time "$SPECK_WAIT_TIME"}
+    fi
     exit 0
 fi
 

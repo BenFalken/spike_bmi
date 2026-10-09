@@ -47,12 +47,16 @@ The same densities are also animated as a GIF: per network, the layers
 side by side in the direction spikes travel, each box coloured by the
 current bin's density, one frame per bin.
 
+--figure_session all draws them for every session (run_inference.sbatch
+--local does this whenever it runs 'speck'). Inputs are binarized when the
+checkpoint was trained on binarized input.
+
 Writes {results_dir}/speck_diagnosis.json,
 {results_dir}/speck_layer_activity_{session}.png and .gif.
 
 Usage (no devkit needed):
     python diagnose_speck.py --experiment bmi --subject indy --data_root ../../data \
-        --snn_checkpoint_root ../../data/snn_checkpoints/bmi/indy/full_cohort_finetuned_medium \
+        --snn_checkpoint_root ../../data/snn_checkpoints/bmi/indy/per_session \
         --results_dir ../../data/results/test_all_decoders_finetuned/bmi/indy
 
     Add --speck_devkit speck2fdevkit:0 (devkit connected) for the chip's own
@@ -69,7 +73,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import numpy as np  # noqa: E402
 
 from decoder_eval import (BASE_NPERSEG, STEP_S, _load_pickle, checkpoint_id, load_snn_model,  # noqa: E402
-                          snn_test_files, unscale_velocity)
+                          snn_input, snn_test_files, unscale_velocity)
 import speck  # noqa: E402
 
 VERSIONS = ('pytorch', 'quantized')
@@ -99,6 +103,7 @@ def decode_versions(checkpoint_path, snn_dataset_path, experiment):
         if experiment != 'hkm' and i == 0 and len(files) > 1:
             continue                                # dropped, as in test_all_decoders.py
         trial = _load_pickle(path)
+        trial['input_spikes'] = snn_input(model, trial['input_spikes'])
         keep = slice(BASE_NPERSEG, None) if experiment == 'hkm' or len(files) == 1 else slice(None)
         targets.append(trial['velocity'][keep])
         for version, run in runners.items():
@@ -270,8 +275,10 @@ def layer_activity(checkpoint_path, snn_dataset_path, experiment, trial, start, 
     snn_seq = speck.flatten_snn(model)
     snn_seq.eval()
     files = snn_test_files(snn_dataset_path)
+    if trial < 0:      # the longest test trial (hkm trials are separate reaches of any length)
+        trial = int(np.argmax([_load_pickle(f)['input_spikes'].shape[1] for f in files]))
     trial = min(trial, len(files) - 1)
-    spikes = _load_pickle(files[trial])['input_spikes'][:, :start + steps]
+    spikes = snn_input(model, _load_pickle(files[trial])['input_spikes'][:, :start + steps])
     # Discretize before running snn_seq: the run leaves its neuron states as
     # views, which the copied layers could then not reset.
     quant_seq = None if devkit else speck.discretized_sequential(
@@ -463,25 +470,34 @@ def main(args):
         json.dump(report, f, indent=2)
     print(f"Saved {path}")
 
-    figure_session = args.figure_session or next(iter(report['sessions']), None)
-    if args.figure_steps > 0 and figure_session:
-        import matplotlib.pyplot as plt
-        checkpoint = os.path.join(root, figure_session, args.snn_checkpoint_subdir, 'best_model_weights.pth')
-        inputs, layers, trial = layer_activity(
-            checkpoint, os.path.join(dataset_root, figure_session), args.experiment, args.figure_trial,
-            args.figure_start, args.figure_steps, args.speck_devkit, args.speck_wait_time,
-            args.speck_raster_dt)
-        fig = layer_activity_figure(inputs, layers, args.figure_bin,
-                                    'Spike Density by Layer (Test Session)')
-        path = os.path.join(results_dir, f'speck_layer_activity_{figure_session}.png')
-        fig.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        print(f"Saved {path}")
-        path = os.path.join(results_dir, f'speck_layer_activity_{figure_session}.gif')
-        save_layer_activity_gif(inputs, layers, path, args.figure_bin,
-                                'Spike Density by Layer (Test Session)',
-                                fps=args.figure_fps)
-        print(f"Saved {path}")
+    if args.figure_session == 'all':
+        figure_sessions = list(report['sessions'])
+    else:
+        figure_sessions = [args.figure_session or next(iter(report['sessions']), None)]
+    for figure_session in figure_sessions:
+        if args.figure_steps > 0 and figure_session:
+            save_layer_activity(args, root, dataset_root, results_dir, figure_session)
+
+
+def save_layer_activity(args, root, dataset_root, results_dir, session):
+    """The layer spike-density figure and GIF of one session."""
+    import matplotlib.pyplot as plt
+    checkpoint = os.path.join(root, session, args.snn_checkpoint_subdir, 'best_model_weights.pth')
+    figure_trial = args.figure_trial if args.figure_trial is not None else (
+        -1 if args.experiment == 'hkm' else 1)
+    inputs, layers, trial = layer_activity(
+        checkpoint, os.path.join(dataset_root, session), args.experiment, figure_trial,
+        args.figure_start, args.figure_steps, args.speck_devkit, args.speck_wait_time,
+        args.speck_raster_dt)
+    title = f'Spike Density by Layer ({session}, test trial {trial})'
+    fig = layer_activity_figure(inputs, layers, args.figure_bin, title)
+    path = os.path.join(results_dir, f'speck_layer_activity_{session}.png')
+    fig.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved {path}")
+    path = os.path.join(results_dir, f'speck_layer_activity_{session}.gif')
+    save_layer_activity_gif(inputs, layers, path, args.figure_bin, title, fps=args.figure_fps)
+    print(f"Saved {path}")
 
 
 if __name__ == '__main__':
@@ -500,9 +516,10 @@ if __name__ == '__main__':
                         help='Largest chip output delay (in steps) searched for the best-lag correlation')
     parser.add_argument('--output', default=None)
     figure = parser.add_argument_group('layer activity figure')
-    figure.add_argument('--figure_session', default=None, help='Default: the first session diagnosed')
-    figure.add_argument('--figure_trial', type=int, default=1,
-                        help='Test trial index (default 1, the first one scored)')
+    figure.add_argument('--figure_session', default=None,
+                        help="Session to draw, or 'all' for every session (default: the first diagnosed)")
+    figure.add_argument('--figure_trial', type=int, default=None,
+                        help='Test trial drawn; -1 is the longest (default: 1 for bmi, the longest for hkm)')
     figure.add_argument('--figure_start', type=int, default=0, help='First timestep shown')
     figure.add_argument('--figure_steps', type=int, default=750,
                         help='Timesteps shown (4 ms each); 0 skips the figure')

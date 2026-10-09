@@ -207,7 +207,17 @@ def load_snn_model(checkpoint_path, experiment, num_input_channels=None):
     module.load_model_weights(model, state_dict, neuron_type=args.get('neuron_type', 'lif'),
                               source_description=checkpoint_path)
     model.eval()
+    model.binarize_input = bool(args.get('binarize_input', False))
     return model, checkpoint, velocity_scale
+
+
+def snn_input(model, input_spikes):
+    """A trial's input spikes (C, T) as the model was trained on them:
+    clipped to 0/1 for checkpoints trained with --binarize-input, unchanged
+    for older ones."""
+    if getattr(model, 'binarize_input', False):
+        return (input_spikes > 0).astype(np.float32)
+    return input_spikes
 
 
 def unscale_velocity(v_scaled, velocity_scale):
@@ -219,7 +229,7 @@ def predict_snn_trial(model, input_spikes, velocity_scale, experiment, reset_sta
     """Run one trial (input_spikes (C, T)) and return ((T, 2) velocity,
     op counts). reset_state=False (HKM only) carries state in from the
     previous call."""
-    x = torch.from_numpy(input_spikes.T[:, np.newaxis, :].astype(np.float32))
+    x = torch.from_numpy(snn_input(model, input_spikes).T[:, np.newaxis, :].astype(np.float32))
     kwargs = {'count_ops': True}
     if experiment == 'hkm':
         kwargs['reset_state'] = reset_state
@@ -339,9 +349,10 @@ def training_loss_check(preds, trials, checkpoint, experiment):
     if best is None:
         print(f"  Training-loss check: test loss {test_loss:.4f} (checkpoint has no best_loss)")
     else:
-        verdict = ('matches' if check['relative_difference'] < 0.02 else
+        verdict = ('matches' if check['relative_difference'] < 1e-3 else
                    'DIFFERS: the checkpoint was selected on another test split (e.g. a pooled '
-                   'pretraining checkpoint), or the model, velocity scaling or test data differ')
+                   'pretraining checkpoint, or trials left out), or the model, input binarization, '
+                   'velocity scaling or test data differ')
         print(f"  Training-loss check: test loss {test_loss:.4f} vs checkpoint best_loss {best:.4f} "
               f"({check['relative_difference']:.1%}): {verdict}")
     return check
