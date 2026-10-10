@@ -22,7 +22,7 @@ Per trial:
     spikes came from mixing runs, which the piece assignment prevents);
   - trials with an internal tracking gap over --max-gap-ms, or fewer than
     --min-samples samples after resampling, are skipped;
-  - position is linearly interpolated from the native ~676 Hz onto a uniform
+  - position is linearly interpolated, by its own timestamps, onto a uniform
     250 Hz (4 ms) grid spanning the trial, and velocity and acceleration are
     derived on that grid exactly as in process_data.py.
 
