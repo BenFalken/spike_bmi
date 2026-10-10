@@ -121,6 +121,19 @@ decoded as its own trial, from rest, never as part of one continuous recording.
      from the native position samples (`hkm_despike.py`; the Nitschke sessions hold a
      few hundred position jumps each, which would otherwise become velocity spikes of
      ~70,000 units/s);
+   - each trial is read from its own recording run (`nwb_pieces.py`). Several Nitschke
+     files join separate runs whose clocks restart, so the same clock time occurs in
+     several runs and the trials table's row slices point to the wrong run. The hand
+     array is cut where its clock steps back. Trials whose time only one piece covers
+     calibrate a linear hand → `hit_target_position` fit; each other trial goes to the
+     piece where the hand ends on its target (its run's majority piece, else its own
+     clear winner, else it is skipped). Spikes are cut and mapped to runs the same way,
+     and units 0/1, which are cut at the wrong place in some sessions, are re-cut.
+     Sessions of one piece (all of Jenkins) convert exactly as before.
+     `conversion_reports/<session>_conversion_report.json` records the pieces, the
+     assignment and its calibration, the trials per run and per piece, the skips and
+     the glitches. For a multi-run session, check there that `resolved_distance_median`
+     is close to `calibration.median_distance` and that no run lost most of its trials;
    - ANN dataset: 256 ms windows at 4 ms steps within each trial, concatenated
      (`dataset/hkm/<subject>/mua/<session>_binning.h5`). A trial of T samples gives
      T − 65 rows, and each row records its trial;
@@ -131,6 +144,8 @@ decoded as its own trial, from rest, never as part of one continuous recording.
 
    Every run rebuilds its session from scratch. Datasets built before this version
    lack the trial IDs inference needs, so rebuild them, then retrain every decoder.
+   Nitschke sessions built before the run-aware conversion must be rebuilt too
+   (`REBUILD=1`), even if they have trial IDs.
 2. **KF, WF, LSTM, QRNN.** `sbatch_scripts/run_hkm_subject_pipeline_array.sbatch`
    trains them on the concatenated windows, with the train/test boundary taken from
    the dataset (a trial boundary, so no purge gap is needed; WF uses 8 taps: 192 channels

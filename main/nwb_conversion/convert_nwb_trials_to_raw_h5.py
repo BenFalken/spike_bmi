@@ -10,9 +10,16 @@ trial is therefore its own recording, and the datasets are pooled from the
 per-trial outputs later (combine_trial_windows_to_ann_h5.py,
 make_snn_dataset_whole_trial.py).
 
+Sessions recorded in several runs (some Nitschke files concatenate runs,
+each with its own clock): every trial is first assigned to the run (hand
+"piece") holding its reach, and its samples and spikes are taken from that
+piece only; see nwb_pieces.py. Trials that cannot be assigned are skipped.
+A single-run session (Jenkins, Nitschke 20090922) is converted as before.
+
 Per trial:
   - hand-tracking glitches are removed from the native position samples
-    (hkm_despike.py, --max-speed);
+    (hkm_despike.py, --max-speed; a safety net: in multi-run sessions the
+    spikes came from mixing runs, which the piece assignment prevents);
   - trials with an internal tracking gap over --max-gap-ms, or fewer than
     --min-samples samples after resampling, are skipped;
   - position is linearly interpolated from the native ~676 Hz onto a uniform
@@ -25,8 +32,9 @@ Output: {output_dir}/{session}_trial{id:04d}.h5 with
     target_pos (N, 2)  zeros (unused downstream)
     sua_trains, mua_trains  spike times per unit; identical, as every unit
                             has its own electrode in these recordings
-and attributes trial_id, trial_start_time, trial_stop_time; plus
-{session}_despike_report.json listing the glitches removed per trial.
+and attributes trial_id, trial_start_time, trial_stop_time, hand_piece; plus
+{session}_conversion_report.json: the pieces, how each trial was assigned
+(or why it was skipped, per run), and the glitches removed per trial.
 
 Usage:
     python convert_nwb_trials_to_raw_h5.py --nwb-path sub-Jenkins_ses-20090912_behavior+ecephys.nwb \
@@ -37,11 +45,13 @@ import argparse
 import glob
 import json
 import os
+from collections import Counter
 
 import h5py
 import numpy as np
 
 from hkm_despike import DEFAULT_MAX_SPEED, despike_position
+from nwb_pieces import SpikePieces, assign_trials, repair_units_0_1, split_pieces, trial_runs
 
 DELTA_TIME = 0.004  # 250 Hz, the native sampling interval of every other dataset
 
@@ -120,17 +130,42 @@ def main(args):
     n_trials = len(trials_df)
     print(f"Units: {len(unit_spike_times)}, trials: {n_trials}")
 
+    # Runs: hand pieces, the trial -> piece assignment, spikes per piece (nwb_pieces.py).
+    pieces = split_pieces(hand_timestamps)
+    hand_ranges = [(hand_timestamps[a], hand_timestamps[b - 1]) for a, b in pieces]
+    print(f"Hand pieces: {len(pieces)} " + ", ".join(f"[{lo:.0f}, {hi:.0f}] s" for lo, hi in hand_ranges))
+    unit_spike_times, repair_note = repair_units_0_1(unit_spike_times)
+    if repair_note:
+        print(repair_note)
+    trial_piece, reasons, assignment = assign_trials(hand_timestamps, hand_xy, pieces, trials_df)
+    spikes = SpikePieces(unit_spike_times, hand_ranges)
+    if len(pieces) > 1:
+        print(f"Trial assignment: {assignment}")
+        print(f"Spike pieces: {spikes.summary()}")
+    piece_spikes = {p: spikes.trial_spikes(p) for p in sorted(set(trial_piece.tolist())) if p >= 0}
+    runs = trial_runs(trials_df["start_time"].to_numpy(float))
+
     max_gap_s = args.max_gap_ms / 1000.0
-    despike_log = []
+    despike_log, skipped = [], Counter()
     n_written = 0
     for trial_id in range(n_trials):
         trial_start = float(trials_df.iloc[trial_id]["start_time"])
         trial_stop = float(trials_df.iloc[trial_id]["stop_time"])
+        p = int(trial_piece[trial_id])
+        if p < 0:
+            skipped[(int(runs[trial_id]), reasons[trial_id])] += 1
+            continue
+        if spikes.window_is_ambiguous(p, trial_start, trial_stop):
+            skipped[(int(runs[trial_id]), "spike pieces overlap in the trial window")] += 1
+            continue
+        a, b = pieces[p]
         result, skip_reason = convert_one_trial(
-            trial_id, trial_start, trial_stop, hand_timestamps, hand_xy, unit_spike_times,
+            trial_id, trial_start, trial_stop, hand_timestamps[a:b], hand_xy[a:b], piece_spikes[p],
             max_gap_s, args.min_samples, max_speed=args.max_speed, despike_log=despike_log)
         if result is None:
             print(f"  [skip] {skip_reason}")
+            skipped[(int(runs[trial_id]), "hand-tracking gap" if "gap" in skip_reason
+                     else "too few hand samples")] += 1
             continue
 
         task_time, task_data, target_pos, sua_trains, mua_trains = result
@@ -145,19 +180,29 @@ def main(args):
             f.attrs["trial_id"] = trial_id
             f.attrs["trial_start_time"] = trial_start
             f.attrs["trial_stop_time"] = trial_stop
+            f.attrs["hand_piece"] = p
         n_written += 1
     io.close()
     print(f"\n{n_written} trial file(s) written to {args.output_dir}, {n_trials - n_written} skipped")
+    for (run, why), count in sorted(skipped.items()):
+        print(f"  run {run}: {count} skipped, {why}")
 
     n_glitches = sum(g["n_glitch_intervals"] for g in despike_log)
     print(f"Despike (--max-speed {args.max_speed:g}): {n_glitches} glitch interval(s) removed in "
           f"{len(despike_log)} trial(s)")
-    report_path = os.path.join(args.output_dir, f"{session_id}_despike_report.json")
+    kept = trial_piece >= 0
+    report_path = os.path.join(args.output_dir, f"{session_id}_conversion_report.json")
     with open(report_path, "w") as f:
-        json.dump({"session_id": session_id, "max_speed": args.max_speed, "n_trials_total": n_trials,
-                   "n_trials_written": n_written, "n_trials_with_glitches": len(despike_log),
-                   "n_glitch_intervals": n_glitches, "trials": despike_log}, f, indent=1)
-    print(f"Despike report: {report_path}")
+        json.dump({"session_id": session_id, "n_trials_total": n_trials, "n_trials_written": n_written,
+                   "hand_pieces": [{"rows": [a, b], "clock_s": [float(lo), float(hi)]}
+                                   for (a, b), (lo, hi) in zip(pieces, hand_ranges)],
+                   "units_repair": repair_note, "assignment": assignment, "spikes": spikes.summary(),
+                   "trials_per_run_and_piece": [{"run": int(r), "piece": int(p), "n": int(n)} for (r, p), n in
+                                                sorted(Counter(zip(runs[kept], trial_piece[kept])).items())],
+                   "skipped": [{"run": r, "reason": why, "n": n} for (r, why), n in sorted(skipped.items())],
+                   "max_speed": args.max_speed, "n_trials_with_glitches": len(despike_log),
+                   "n_glitch_intervals": n_glitches, "glitches": despike_log}, f, indent=1)
+    print(f"Conversion report: {report_path}")
 
 
 if __name__ == "__main__":

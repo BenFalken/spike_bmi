@@ -5,6 +5,7 @@
 #   bash train_all.sh                      # bmi indy, bmi loco, hkm jenkins
 #   DRY_RUN=1 bash train_all.sh            # print the sbatch commands, submit nothing
 #   SUBJECTS="hkm:jenkins" bash train_all.sh
+#   SUBJECTS="hkm:nitschke" bash train_all.sh   # the fourth subject, on its own
 #
 # Per subject (sessions = {DATA_ROOT}/raw/<exp>/<subject>/*.mat or *.nwb):
 #   1. datasets      bmi: run_bmi_subject_pipeline_array.sbatch STAGE=datasets

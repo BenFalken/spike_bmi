@@ -1,8 +1,9 @@
 #!/bin/bash
 # Build the ANN and SNN datasets of one HKM (NWB) session.
 #
-#   1. convert_nwb_trials_to_raw_h5.py        NWB -> one raw .h5 per trial, tracking
-#                                             glitches removed (--max-speed)
+#   1. convert_nwb_trials_to_raw_h5.py        NWB -> one raw .h5 per trial, each from its own
+#                                             recording run (nwb_pieces.py), tracking glitches
+#                                             removed (--max-speed)
 #   2. run_dense_windowing_for_all_trials.sh  make_dataset.py on each trial (65-sample
 #                                             windows at 4 ms steps, never across trials)
 #   3. combine_trial_windows_to_ann_h5.py     -> ${DATASET_ROOT}/hkm/<subject>/<feature>/<session>_<method>.h5
@@ -17,8 +18,8 @@
 # intermediate files (under --output-root) and previous final outputs first,
 # so nothing from an earlier run can mix in. Sessions never share files, so
 # any number can run at once. --cleanup-intermediate deletes the per-trial
-# intermediates after a successful run (the despike report is kept under
-# ${OUTPUT_ROOT}/despike_reports/).
+# intermediates after a successful run (the conversion report is kept under
+# ${OUTPUT_ROOT}/conversion_reports/).
 #
 # The pipeline's Python scripts are always the ones next to this file,
 # whatever directory it is run from.
@@ -89,7 +90,7 @@ EXPERIMENT="hkm"
 
 RAW_DIR="${OUTPUT_ROOT}/raw_trials/${SESSION_ID}"
 ANN_WINDOWED_DIR="${OUTPUT_ROOT}/ann_windowed_per_trial/${SESSION_ID}"
-REPORT_DIR="${OUTPUT_ROOT}/despike_reports"
+REPORT_DIR="${OUTPUT_ROOT}/conversion_reports"
 ANN_OUTPUT_PATH="${DATASET_ROOT}/${EXPERIMENT}/${SUBJECT}/${FEATURE}/${SESSION_ID}_${METHOD}.h5"
 SNN_OUTPUT_DIR="${SNN_DATASET_ROOT}/${EXPERIMENT}/${SUBJECT}/${FEATURE}/${SESSION_ID}"
 
@@ -113,7 +114,7 @@ echo "--- Stage 1: NWB -> per-trial raw h5 ---"
 python3 convert_nwb_trials_to_raw_h5.py \
     --nwb-path "$NWB_PATH" --output-dir "$RAW_DIR" \
     --max-gap-ms "$MAX_GAP_MS" --min-samples "$MIN_SAMPLES" --max-speed "$MAX_SPEED" --overwrite
-cp -f "${RAW_DIR}/${SESSION_ID}_despike_report.json" "$REPORT_DIR/"
+cp -f "${RAW_DIR}/${SESSION_ID}_conversion_report.json" "$REPORT_DIR/"
 
 echo ""
 echo "--- Stage 2: per-trial raw -> per-trial dense windows (ANN) ---"
