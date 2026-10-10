@@ -43,6 +43,12 @@ reaches; see [HKM](#hkm-jenkins-nitschke) for what differs). Steps 1–4 run on 
 cluster, step 5 on the Speck-connected laptop, so every decoder's speed, energy and
 accuracy is measured on one platform.
 
+**All training in one command:** `bash sbatch_scripts/train_all.sh` submits steps 1–4
+for bmi `indy`, bmi `loco` and hkm `jenkins` (`SUBJECTS="exp:subject ..."` changes the
+list) as Slurm jobs chained by dependencies; `DRY_RUN=1` prints them instead. Re-running
+it resumes (cancel its pending jobs first). New SNN checkpoints go to `*_binarized`
+directories, so earlier runs' checkpoints are never skipped over or resumed from.
+
 1. **Datasets, KF, WF, LSTM, QRNN.** `preprocessing_training/single_subject_pipeline.py`
    runs one session: raw data → binned spikes and kinematics (4 ms bins) → ANN and SNN
    datasets → each decoder fit once on the session's training split. No cross-validation
@@ -59,11 +65,11 @@ accuracy is measured on one platform.
    and 16 over the four spiking layers and trained. Leave-one-session-out by default
    (`LOSO=1`): session i is fine-tuned from a model pretrained on every other session, so
    its own data never reaches pretraining. At most 50 epochs per stage for bmi, 10 for hkm.
-   → `snn_checkpoints/<exp>/<subject>/loso_finetuned/<session>/`
+   → `snn_checkpoints/<exp>/<subject>/loso_finetuned_binarized/<session>/`
 4. **SNN for Speck ('speck'):** `run_snn_per_session_array.sbatch`. 256 → 128 → 64,
    threshold 1.0, 2 EMA stages, no `tau_syn` (the chip has no synaptic stage), trained
    per session from scratch. At most 50 epochs for bmi, 20 for hkm.
-   → `snn_checkpoints/<exp>/<subject>/per_session/<session>/`
+   → `snn_checkpoints/<exp>/<subject>/per_session_binarized/<session>/`
 
    Both configurations are in `sbatch_scripts/snn_config.sh`. Every SNN trains on
    **binarized input** (spike counts clipped to 0/1, `train_snn.py --binarize-input`,
@@ -75,8 +81,8 @@ accuracy is measured on one platform.
 5. **Inference, report and Speck diagnosis**, on the laptop, per subject:
    `bash sbatch_scripts/run_inference.sbatch --local <exp> <subject>` (e.g. `--local bmi indy`).
    - Evaluates every decoder on every session (`inference/test_all_decoders.py`): accuracy,
-     latency and energy per sample, `speck` on the devkit. `snn` runs the `loso_finetuned`
-     checkpoints and `speck` the `per_session` ones (`SNN_CHECKPOINT_ROOT=`,
+     latency and energy per sample, `speck` on the devkit. `snn` runs the
+     `loso_finetuned_binarized` checkpoints and `speck` the `per_session_binarized` ones (`SNN_CHECKPOINT_ROOT=`,
      `SPECK_CHECKPOINT_ROOT=` override them).
    - Builds the report (`inference/make_report.py`): `combined_metrics.json`,
      `efficiency_summary.json`, and the efficiency, energy and comparison figures. The
@@ -84,7 +90,7 @@ accuracy is measured on one platform.
      time); the training-duration row is added only when durations are evaluated
      (`TRAIN_DURATIONS=1,2,...`, which needs per-duration models) or supplied
      (`DURATIONS_JSON=...`).
-   - Runs `inference/diagnose_speck.py` on the `per_session` checkpoints: the
+   - Runs `inference/diagnose_speck.py` on the `per_session_binarized` checkpoints: the
      PyTorch → quantized → chip comparison (`speck_diagnosis.json`) and every session's
      layer spike-density figure and GIF (`speck_layer_activity_<session>.png/.gif`),
      recorded on the devkit (`SPIKE_DENSITY=0` skips this step).

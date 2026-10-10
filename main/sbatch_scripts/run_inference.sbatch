@@ -13,13 +13,13 @@
 #   bash run_inference.sbatch --local bmi           # every subject of the experiment in turn
 #
 # Checkpoints (defaults; see run_snn_pooled_*.sbatch and run_snn_per_session_array.sbatch):
-#   'snn'    ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/loso_finetuned/<session>/
-#   'speck'  ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/per_session/<session>/
+#   'snn'    ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/loso_finetuned_binarized/<session>/
+#   'speck'  ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/per_session_binarized/<session>/
 # Sessions are those with an 'snn' checkpoint; a session without a 'speck'
 # checkpoint is evaluated without 'speck'.
 #
 # Without a subject, every subject with a ${DATA_ROOT}/snn_checkpoints/<experiment>/
-# <subject>/loso_finetuned/ directory is run as if named (one report per subject).
+# <subject>/loso_finetuned_binarized/ directory is run as if named (one report per subject).
 #
 # --submit submits (from this directory):
 #   1. an array job, one task per session with an SNN checkpoint, running
@@ -51,7 +51,7 @@
 #   bash run_inference.sbatch --local bmi indy SNN_CHECKPOINT_ROOT=.../per_session FIGURES=1
 # or in the environment: before the command on the same line, or exported
 # (a plain NAME=value on a line of its own is not seen by this script), e.g.
-#   SNN_CHECKPOINT_ROOT=.../full_cohort_finetuned bash run_inference.sbatch --submit bmi indy
+#   SNN_CHECKPOINT_ROOT=.../full_cohort_finetuned_binarized bash run_inference.sbatch --submit bmi indy
 #   SPECK_CHECKPOINT_ROOT=.../other_checkpoints ...   run 'speck' with other checkpoints
 #   FIGURES=1 bash run_inference.sbatch --submit bmi indy     # also per-session diagnostic figures
 #   FIGURE_DECODERS=snn,speck FIGURES=1 ...   only these decoders in them (and the crosshair GIFs)
@@ -132,11 +132,11 @@ if [ -z "${SUBJECT:-}" ]; then
     fi
     SUBJECTS=()
     for d in $(find "${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}" -mindepth 2 -maxdepth 2 -type d \
-                    -name loso_finetuned 2>/dev/null | sort); do
+                    -name loso_finetuned_binarized 2>/dev/null | sort); do
         SUBJECTS+=("$(basename "$(dirname "$d")")")
     done
     if [ "${#SUBJECTS[@]}" -eq 0 ]; then
-        echo "ERROR: no ${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/<subject>/loso_finetuned/" >&2
+        echo "ERROR: no ${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/<subject>/loso_finetuned_binarized/" >&2
         exit 1
     fi
     echo "Subjects of ${EXPERIMENT}: ${SUBJECTS[*]}"
@@ -165,10 +165,10 @@ DATASET_ROOT="${DATA_ROOT}/dataset/${EXPERIMENT}/${SUBJECT}/mua"
 MODEL_CACHE_ROOT="${DATA_ROOT}/results/model_cache/${EXPERIMENT}/${SUBJECT}"
 # SNN checkpoints: ${SNN_CHECKPOINT_ROOT}/<session>/[${SNN_CHECKPOINT_SUBDIR}/]best_model_weights.pth
 # (SNN_CHECKPOINT_SUBDIR selects one config of a sweep, e.g. wide768_2x)
-SNN_CHECKPOINT_ROOT="${SNN_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/loso_finetuned}"
+SNN_CHECKPOINT_ROOT="${SNN_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/loso_finetuned_binarized}"
 SNN_CHECKPOINT_SUBDIR="${SNN_CHECKPOINT_SUBDIR:-}"
 # 'speck' needs a deployable network (no tau_syn): the per-session models.
-SPECK_CHECKPOINT_ROOT="${SPECK_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/per_session}"
+SPECK_CHECKPOINT_ROOT="${SPECK_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/per_session_binarized}"
 SPECK_CHECKPOINT_SUBDIR="${SPECK_CHECKPOINT_SUBDIR:-}"
 if [ "$EXPERIMENT" = "hkm" ]; then
     SNN_DATASET_ROOT="${DATA_ROOT}/snn_datasets/${EXPERIMENT}/${SUBJECT}/mua"          # whole trials

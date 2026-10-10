@@ -26,8 +26,8 @@
 #       run_snn_pooled_finetune_array.sbatch
 #   (hkm: sessions under snn_datasets/hkm/<subject>/mua)
 #
-# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/loso_pretrained/<held-out session>/
-#              (LOSO=0: .../full_cohort_pretrained/)
+# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/loso_pretrained_binarized/<held-out session>/
+#              (LOSO=0: .../full_cohort_pretrained_binarized/)
 # Re-submitting skips a finished run and resumes an interrupted one (for hkm,
 # where an epoch over a pool takes hours, expect to re-submit).
 

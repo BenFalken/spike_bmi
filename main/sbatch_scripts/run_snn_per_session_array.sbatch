@@ -16,7 +16,7 @@
 #   sbatch --export=ALL,EXPERIMENT=bmi,SUBJECT=indy --array=0-$((N-1)) run_snn_per_session_array.sbatch
 #   (hkm: sessions under snn_datasets/hkm/<subject>/mua)
 #
-# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/per_session/<session>/
+# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/per_session_binarized/<session>/
 # These are the 'speck' checkpoints of run_inference.sbatch.
 # Re-submitting skips finished sessions and resumes interrupted ones.
 

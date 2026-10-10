@@ -36,8 +36,11 @@ case "$LOSO" in
     1) POOL_KIND="loso" ;;
     *) echo "ERROR: LOSO must be 0 or 1, got '$LOSO'" >&2; exit 1 ;;
 esac
-FINETUNE_ROOT="${CHECKPOINT_BASE}/${POOL_KIND}_finetuned"
-PER_SESSION_ROOT="${CHECKPOINT_BASE}/per_session"
+# Checkpoint directories end in _binarized (binarized input), so they never
+# meet the checkpoints of earlier runs, which the skip/resume checks would
+# otherwise take for this pipeline's.
+FINETUNE_ROOT="${CHECKPOINT_BASE}/${POOL_KIND}_finetuned_binarized"
+PER_SESSION_ROOT="${CHECKPOINT_BASE}/per_session_binarized"
 
 # select_model pooled|per_session -> the network and training controls.
 # Epochs are maxima (early stopping); hkm epochs take about an hour per
@@ -96,9 +99,9 @@ pool_dir() {
 }
 pretrain_dir() {
     if [ "$LOSO" = "1" ]; then
-        echo "${CHECKPOINT_BASE}/loso_pretrained/$1"
+        echo "${CHECKPOINT_BASE}/loso_pretrained_binarized/$1"
     else
-        echo "${CHECKPOINT_BASE}/full_cohort_pretrained"
+        echo "${CHECKPOINT_BASE}/full_cohort_pretrained_binarized"
     fi
 }
 

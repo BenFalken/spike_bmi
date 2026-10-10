@@ -10,8 +10,11 @@
 # task per session. Sessions are {RAW_DATA_DIR}/<subject>/*.nwb, sorted;
 # SUBJECT=<name> limits the array to one subject (default: every subject).
 #
-# Each task rebuilds its session from scratch (see run_nwb_pipeline.sh), so
-# re-submitting any subset is safe, and no two sessions share files.
+# A session whose datasets were already built by this pipeline (the ANN
+# dataset records trial IDs and the SNN test split exists) is skipped, so
+# re-submitting never rebuilds data that training may be reading; REBUILD=1
+# rebuilds it anyway (run_nwb_pipeline.sh starts each session from scratch).
+# No two sessions share files.
 #
 # Submit from this directory (nwb_conversion/; logs/ must exist first):
 #   mkdir -p logs
@@ -62,6 +65,16 @@ if [ "$SLURM_ARRAY_TASK_ID" -ge "${#NWB_FILES[@]}" ]; then
     exit 0
 fi
 NWB_FILE="${NWB_FILES[$SLURM_ARRAY_TASK_ID]}"
+SESSION_ID="$(basename "$NWB_FILE" .nwb)"
+SUBJECT_DIR="$(basename "$(dirname "$NWB_FILE")")"
+ANN_PATH="${DATASET_ROOT}/hkm/${SUBJECT_DIR}/${FEATURE}/${SESSION_ID}_${METHOD}.h5"
+SNN_TEST_DIR="${SNN_DATASET_ROOT}/hkm/${SUBJECT_DIR}/${FEATURE}/${SESSION_ID}/test"
+if [ "${REBUILD:-0}" != "1" ] && [ -n "$(ls -A "$SNN_TEST_DIR" 2>/dev/null)" ] \
+        && python3 -c "import h5py, sys; sys.exit(0 if 'trial_id' in h5py.File(sys.argv[1], 'r') else 1)" \
+           "$ANN_PATH" 2>/dev/null; then
+    echo "[skip] $SESSION_ID: datasets already built with trial IDs (REBUILD=1 rebuilds them)"
+    exit 0
+fi
 
 echo "Array task $SLURM_ARRAY_TASK_ID / $((${#NWB_FILES[@]} - 1)) -> $NWB_FILE"
 echo "Host: $(hostname), CPUs allocated: $SLURM_CPUS_PER_TASK"

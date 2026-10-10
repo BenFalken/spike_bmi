@@ -491,7 +491,7 @@ def _evaluate_and_plot(raw_stem, dataset_filepath, feature, overwrite, wf_tap,
                                  durations=DURATIONS, feature=feature)
 
 
-def process_session(raw_stem=RAW_STEM, feature=FEATURE, overwrite=False):
+def process_session(raw_stem=RAW_STEM, feature=FEATURE, overwrite=False, datasets_only=False):
     """Full pipeline for a continuous (.mat) session.
 
     Outputs are namespaced by raw_stem and feature, so different sessions can
@@ -505,6 +505,9 @@ def process_session(raw_stem=RAW_STEM, feature=FEATURE, overwrite=False):
                                                 overwrite=overwrite)
     build_combined_snn_dataset(raw_stem, snn_dataset_filepath, feature=feature, group_size=8,
                                overwrite=overwrite)
+    if datasets_only:
+        print(f"\nDone: {raw_stem} ({feature}) datasets")
+        return
     _evaluate_and_plot(raw_stem, dataset_filepath, feature, overwrite, wf_tap=WF_TAP)
     print(f"\nDone: {raw_stem} ({feature})")
 
@@ -541,6 +544,9 @@ if __name__ == "__main__":
     parser.add_argument("--raw_stem", type=str, default=RAW_STEM, help="Session identifier")
     parser.add_argument("--feature", type=str, default=FEATURE, choices=["mua", "sua"])
     parser.add_argument("--overwrite", action="store_true", help="Recompute every stage")
+    parser.add_argument("--datasets_only", action="store_true",
+                        help="Continuous sessions: build the datasets only, no decoders (SNN training "
+                             "can then start while the decoders train)")
     parser.add_argument("--nwb_dataset_filepath", type=str, default=None,
                         help="Run process_nwb_session() on this {session}_binning.h5 instead of "
                              "the full .mat pipeline")
@@ -559,4 +565,5 @@ if __name__ == "__main__":
         process_nwb_session(args.raw_stem, args.nwb_dataset_filepath, feature=args.feature,
                             overwrite=args.overwrite, gap_samples=args.gap_samples)
     else:
-        process_session(raw_stem=args.raw_stem, feature=args.feature, overwrite=args.overwrite)
+        process_session(raw_stem=args.raw_stem, feature=args.feature, overwrite=args.overwrite,
+                        datasets_only=args.datasets_only)

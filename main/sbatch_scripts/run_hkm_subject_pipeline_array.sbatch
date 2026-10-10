@@ -15,14 +15,14 @@
 # to ~30x the rows of a bmi session, hence the memory (WF's tap-delay matrix).
 #
 # Every stage skips outputs that already exist, so a re-submission resumes.
-# After rebuilding the datasets, set OVERWRITE=1 for the first run (or delete
-# results/{,model_cache/}hkm/), or the models of the old datasets are kept.
+# A session whose model bundles are older than its dataset (rebuilt since)
+# is retrained from scratch; OVERWRITE=1 retrains every session.
+# SUBJECT=<name> limits the array to one subject (default: every subject).
 #
 # Submit from this directory:
 #   mkdir -p hkm_logs
-#   N=$(find $DATA_ROOT/dataset/hkm -mindepth 3 -maxdepth 3 -name '*_binning.h5' | wc -l)
-#   sbatch --array=0-$((N-1)) run_hkm_subject_pipeline_array.sbatch
-#   sbatch --export=ALL,OVERWRITE=1 --array=0-$((N-1)) run_hkm_subject_pipeline_array.sbatch
+#   N=$(find $DATA_ROOT/dataset/hkm/jenkins/mua -name '*_binning.h5' | wc -l)
+#   sbatch --export=ALL,SUBJECT=jenkins --array=0-$((N-1)) run_hkm_subject_pipeline_array.sbatch
 
 set -eo pipefail
 
@@ -41,9 +41,13 @@ export BMI_DATA_ROOT="$DATA_ROOT"
 DATASET_DIR="${DATA_ROOT}/dataset/hkm"
 
 # {subject}/mua/{session}_binning.h5
-mapfile -t H5_FILES < <(find "$DATASET_DIR" -mindepth 3 -maxdepth 3 -name '*_binning.h5' | sort)
+if [ -n "${SUBJECT:-}" ]; then
+    mapfile -t H5_FILES < <(find "$DATASET_DIR/$SUBJECT/mua" -mindepth 1 -maxdepth 1 -name '*_binning.h5' 2>/dev/null | sort)
+else
+    mapfile -t H5_FILES < <(find "$DATASET_DIR" -mindepth 3 -maxdepth 3 -name '*_binning.h5' | sort)
+fi
 if [ "${#H5_FILES[@]}" -eq 0 ]; then
-    echo "ERROR: no <subject>/mua/<session>_binning.h5 under $DATASET_DIR" >&2
+    echo "ERROR: no <subject>/mua/<session>_binning.h5 under $DATASET_DIR${SUBJECT:+ for SUBJECT=$SUBJECT}" >&2
     exit 1
 fi
 if [ "$SLURM_ARRAY_TASK_ID" -ge "${#H5_FILES[@]}" ]; then
@@ -57,7 +61,13 @@ echo "Array task $SLURM_ARRAY_TASK_ID / $((${#H5_FILES[@]} - 1)) -> $RAW_STEM"
 echo "Host: $(hostname), CPUs allocated: $SLURM_CPUS_PER_TASK"
 
 OVERWRITE_ARGS=()
-[ "${OVERWRITE:-0}" = "1" ] && OVERWRITE_ARGS=(--overwrite)
+MODEL_DIR="${DATA_ROOT}/results/model_cache/hkm/$(basename "$(dirname "$(dirname "$H5_FILE")")")/${RAW_STEM}/mua"
+if [ "${OVERWRITE:-0}" = "1" ]; then
+    OVERWRITE_ARGS=(--overwrite)
+elif [ -n "$(find "$MODEL_DIR" -name '*_config.json' ! -newer "$H5_FILE" 2>/dev/null)" ]; then
+    echo "[retrain] model bundles in $MODEL_DIR are older than $H5_FILE"
+    OVERWRITE_ARGS=(--overwrite)
+fi
 
 python3 ../preprocessing_training/single_subject_pipeline.py \
     --raw_stem "$RAW_STEM" \

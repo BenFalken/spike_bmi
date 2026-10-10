@@ -13,8 +13,8 @@
 # session i starts from the model pretrained without it. See
 # run_snn_pooled_pretrain.sbatch for how to chain the two.
 #
-# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/loso_finetuned/<session>/
-#              (LOSO=0: .../full_cohort_finetuned/<session>/)
+# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/loso_finetuned_binarized/<session>/
+#              (LOSO=0: .../full_cohort_finetuned_binarized/<session>/)
 # These are the 'snn' checkpoints of run_inference.sbatch.
 # Re-submitting skips finished sessions and resumes interrupted ones.
 
