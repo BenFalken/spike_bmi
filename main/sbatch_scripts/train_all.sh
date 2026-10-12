@@ -57,9 +57,15 @@ DATASET_JOBS=()
 for entry in $SUBJECTS; do
     exp="${entry%%:*}"; subject="${entry#*:}"
     ext=$([ "$exp" = "hkm" ] && echo nwb || echo mat)
-    n=$(find "${DATA_ROOT}/raw/${exp}/${subject}" -maxdepth 1 -name "*.${ext}" 2>/dev/null | wc -l)
+    raw_dir="${DATA_ROOT}/raw/${exp}/${subject}"
+    # Checked first: under pipefail a failing find would end the script silently.
+    if [ ! -d "$raw_dir" ] || [ ! -r "$raw_dir" ]; then
+        echo "ERROR: ${raw_dir} does not exist or is not readable" >&2
+        exit 1
+    fi
+    n=$(find "$raw_dir" -maxdepth 1 -name "*.${ext}" | wc -l)
     if [ "$n" -eq 0 ]; then
-        echo "ERROR: no ${DATA_ROOT}/raw/${exp}/${subject}/*.${ext}" >&2
+        echo "ERROR: no *.${ext} files in ${raw_dir}" >&2
         exit 1
     fi
     N_SESSIONS[$entry]=$n
