@@ -323,6 +323,27 @@ The chip adds more error the more a model relies on stored state:
 | fine-tuned | fewer spikes, longer-lived sub-threshold charge | 4.4 |
 | soft reset | every spike's remainder is kept | 8.2 |
 
+### Indy against Jenkins: activity, power and energy on Speck
+
+`inference/speck_activity_study.py` ran one Jenkins session (20090912, 30 test trials)
+under five conditions; `inference/plot_speck_activity.py` draws its output
+(`docs/data/speck_activity_jenkins_20090912.json`) against the Indy numbers below.
+
+![Firing rate by layer, Indy and Jenkins](docs/speck_activity_rates.png)
+![Jenkins conditions: output rate against chip fidelity](docs/speck_activity_conditions.png)
+![Input load, chip power, latency and energy](docs/speck_activity_energy.png)
+
+- **Same relative excess, different absolute level.** On both subjects the chip fires about
+  2x the trained network at the output. Indy's network fires 0.23 spikes per output neuron
+  per timestep; Jenkins' fires 3.2, the regime in which the chip's per-event updates
+  compress its predictions to about a fifth (slope 0.21).
+- **Activity, not input, sets the chip's error.** Binarizing the input and a 5 ms wait
+  change nothing. Halving the input helps a little. Doubling the thresholds on the same
+  input (output 0.10) brings the slope to 0.85 and the chip's added RMSE from 63 to 8.
+- **Energy.** Jenkins sends about 5x as many input events per timestep (32 against 6)
+  and uses about 4x the energy per timestep (10.7 against 2.7 uJ). Compare energy, not
+  mW: the 5 ms wait lowers mean power to 2.6 mW but raises energy per timestep.
+
 ### Spike density through the layers
 
 One test trial (3 s) of one session, through the per-session Speck checkpoint (96 inputs →
