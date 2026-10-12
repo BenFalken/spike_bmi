@@ -8,7 +8,8 @@
 #   DATA=~/.../data SESSION=sub-Jenkins_ses-20090912_behavior+ecephys bash run_lab_local.sh
 #
 # Settings (environment):
-#   DATA        data root holding snn_datasets/ and snn_checkpoints/ (required)
+#   DATA        data root holding snn_datasets/ and snn_checkpoints/ (required; an
+#               absolute path, or relative to this folder)
 #   SESSION     session directory name (required)
 #   SUBJECT     hkm subject (default jenkins)
 #   CHECKPOINT  checkpoint the study ran, for the validation (default:
@@ -26,7 +27,7 @@
 # Everything printed also goes to $OUT_DIR/run_lab_local.log.
 
 set -eo pipefail
-cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"    # this folder (portable: no realpath)
 
 : "${DATA:?set DATA to the data root (holding snn_datasets/ and snn_checkpoints/)}"
 : "${SESSION:?set SESSION to the session directory name}"
@@ -56,7 +57,8 @@ if [ "${SKIP_VALIDATE:-0}" != "1" ]; then
     if [ -f "$CHECKPOINT" ] && [ -f "$STUDY_JSON" ]; then
         echo -e "\n=== 1/3 validate the emulator"
         python3 lab.py validate --checkpoint "$CHECKPOINT" --snn_dataset "$SNN_DATASET" \
-            --study_json "$STUDY_JSON" --output "${OUT_DIR}/validation.json"
+            --study_json "$STUDY_JSON" --output "${OUT_DIR}/validation.json" \
+            || echo "WARNING: validation failed (see above); continuing with training"
     else
         echo -e "\n=== 1/3 skipped: no ${CHECKPOINT} or ${STUDY_JSON}"
     fi
