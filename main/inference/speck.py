@@ -110,7 +110,6 @@ def reset_states(seq):
 
 def run_float(snn_seq, input_spikes):
     """(C, T) input -> (T, n_out) output spikes of the flattened network."""
-    import sinabs
     x = torch.from_numpy(input_spikes.T.astype(np.float32))
     reset_states(snn_seq)
     with torch.no_grad():
@@ -120,7 +119,6 @@ def run_float(snn_seq, input_spikes):
 def run_discretized(disc_seq, input_spikes):
     """(C, T) input -> (T, n_out) output spikes of the quantized network,
     one timestep per call (state carried between calls, as in training)."""
-    import sinabs
     x = torch.from_numpy(input_spikes.T.astype(np.float32))[:, :, None, None]
     reset_states(disc_seq)
     with torch.no_grad():
@@ -131,7 +129,6 @@ def run_layers(seq, input_spikes):
     """(C, T) input -> [(T, n) spikes of each neuron layer of seq], in order,
     one timestep per call; seq is the flattened (Linear) or the discretized
     (Conv2d) network."""
-    import sinabs
     conv = any(isinstance(m, nn.Conv2d) for m in seq)
     x = torch.from_numpy(input_spikes.T.astype(np.float32))
     if conv:
@@ -163,7 +160,6 @@ def check_deployable(model, checkpoint):
 def cross_check_flattened(model, snn_seq, input_spikes, tol=1e-4):
     """Run one trial (C, T) through snn_seq + host decode and model(); they
     must agree, or the network deployed to the chip is not the trained one."""
-    import sinabs
     x = torch.from_numpy(input_spikes.T.astype(np.float32))           # (T, C)
     reset_states(snn_seq)
     with torch.no_grad():

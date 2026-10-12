@@ -142,7 +142,6 @@ def run_with_drive(seq, x):
     ([(T, n) spikes per neuron layer], [risk counts per neuron layer]); the
     risk counts are taken before each neuron update from the layer's
     weighted input split into its excitatory and inhibitory parts."""
-    import sinabs
     conv = any(isinstance(m, nn.Conv2d) for m in seq)
     xt = torch.from_numpy(x.T.astype(np.float32))
     speck.reset_states(seq)
