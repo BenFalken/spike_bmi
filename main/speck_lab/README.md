@@ -29,6 +29,22 @@ The lab trains small models under different regimes and scores each one as
 | `plots.py` | `lab_rmse.png`, `lab_rates.png` |
 | `run_lab.sbatch` | trains the regimes on the cluster, one array task each |
 
+## Everything on the Speck laptop, in one go
+
+```bash
+cd main/speck_lab
+DATA=~/path/to/data SESSION=sub-Jenkins_ses-20090912_behavior+ecephys bash run_lab_local.sh
+```
+
+`run_lab_local.sh` runs the steps below in sequence: validates the emulator against
+the study's chip run, trains every regime one after another, scores each one as
+PyTorch, quantized, emulated chip and on the chip, and writes the summary. It needs
+the session's `train/` and `test/` splits under `$DATA/snn_datasets/hkm/<subject>/mua/`.
+Options (environment): `REGIMES`, `N_TRAIN`, `N_VAL`, `N_TEST`, `EPOCHS`, `OUT_DIR`,
+`DEVKIT` (`none` for host only), `SHUFFLE`, `SKIP_VALIDATE=1`; see the script's header.
+Re-running resumes: trained regimes are only re-scored. The log is
+`$OUT_DIR/run_lab_local.log`.
+
 ## 1. Validate the emulator (laptop, once)
 
 Before trusting the emulator, compare it with the real chip run of the study, on the
