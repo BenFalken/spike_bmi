@@ -15,6 +15,7 @@
 # Checkpoints (defaults; see run_snn_pooled_*.sbatch and run_snn_per_session_array.sbatch):
 #   'snn'    ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/loso_finetuned_binarized_soft/<session>/
 #   'speck'  ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/per_session_binarized/<session>/
+#            (hkm: per_session_binarized_ratereg, trained with the spike-rate penalty)
 # Sessions are those with an 'snn' checkpoint; a session without a 'speck'
 # checkpoint is evaluated without 'speck'.
 #
@@ -168,7 +169,8 @@ MODEL_CACHE_ROOT="${DATA_ROOT}/results/model_cache/${EXPERIMENT}/${SUBJECT}"
 SNN_CHECKPOINT_ROOT="${SNN_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/loso_finetuned_binarized_soft}"
 SNN_CHECKPOINT_SUBDIR="${SNN_CHECKPOINT_SUBDIR:-}"
 # 'speck' needs a deployable network (no tau_syn): the per-session models.
-SPECK_CHECKPOINT_ROOT="${SPECK_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/per_session_binarized}"
+SPECK_SUFFIX=$([ "$EXPERIMENT" = "hkm" ] && echo _ratereg || true)
+SPECK_CHECKPOINT_ROOT="${SPECK_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/per_session_binarized${SPECK_SUFFIX}}"
 SPECK_CHECKPOINT_SUBDIR="${SPECK_CHECKPOINT_SUBDIR:-}"
 if [ "$EXPERIMENT" = "hkm" ]; then
     SNN_DATASET_ROOT="${DATA_ROOT}/snn_datasets/${EXPERIMENT}/${SUBJECT}/mua"          # whole trials

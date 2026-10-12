@@ -72,7 +72,13 @@ checkpoints are never skipped over or resumed from.
    threshold 1.0, 2 EMA stages, no `tau_syn` (the chip has no synaptic stage), hard reset
    (soft reset loses more accuracy on the chip; see below), trained
    per session from scratch. At most 50 epochs for bmi, 20 for hkm.
+   For hkm, a spike-rate penalty (`train_snn.py --spike-rate-weight 10`, targets 0.1
+   spikes per neuron per timestep in each hidden layer and 0.25 at the output) keeps the
+   network sparse: trained without it, the Jenkins model fired about 3 spikes per output
+   neuron per timestep, and on the chip its predictions shrank to about a fifth of the
+   trained network's (`inference/speck_activity_study.py`).
    → `snn_checkpoints/<exp>/<subject>/per_session_binarized/<session>/`
+   (hkm: `per_session_binarized_ratereg/`)
 
    Both configurations are in `sbatch_scripts/snn_config.sh`. Every SNN trains on
    **binarized input** (spike counts clipped to 0/1, `train_snn.py --binarize-input`,

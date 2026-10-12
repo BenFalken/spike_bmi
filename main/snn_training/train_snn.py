@@ -23,6 +23,14 @@ current with a time constant (in 4 ms timesteps) initialized to that value
 trained with the weights, like the readout's EMA decay. The trained
 per-layer values are part of the model state dict.
 
+Spike-rate penalty (--spike-rate-weight, off by default): adds weight x
+sum over spiking layers of max(0, rate - target) to the training loss, the
+rate being the layer's spikes per neuron per timestep (--spike-rate-target,
+one value or one per layer). On Speck, a densely firing network diverges
+from training (the chip updates per input event), so the deployed per-session
+models keep every layer's rate low. The test loss, which picks the best
+model, stays the RMSE.
+
 Input: spike counts are clipped to 0/1 (--binarize-input, default on).
 A Speck input event raises a neuron's membrane once per event, so bins of
 several spikes drive the chip far harder than training assumed. The
@@ -129,6 +137,13 @@ def parse_arguments():
     train.add_argument("--weight-decay", type=float, default=0.001)
     train.add_argument("--channel-lasso-weight", type=float, default=0.0,
                        help="Group-lasso penalty on the first layer's input channels (0 = off)")
+    train.add_argument("--spike-rate-weight", type=float, default=0.0,
+                       help="Spike-rate penalty (0 = off): weight x the sum over spiking layers of "
+                            "max(0, rate - target), rate in spikes per neuron per timestep. Added "
+                            "to the training loss only; the test loss stays the RMSE")
+    train.add_argument("--spike-rate-target", type=float, nargs="+", default=[0.1],
+                       help="Rate each spiking layer may reach before the penalty applies: one "
+                            "value for every layer or one per layer (len(hidden_dims) + 1)")
     train.add_argument("--patience", type=int, default=20, help="Early-stopping patience (epochs)")
     train.add_argument("--scheduler-patience", type=int, default=10,
                        help="Epochs without improvement before the LR is reduced")
@@ -189,18 +204,32 @@ def unscale_velocity(v_scaled, lo, hi, margin):
     return lo + (hi - lo) * (v_scaled - margin) / (1 - 2 * margin)
 
 
+def spike_rate_penalty(model, n_steps, targets):
+    """(sum over spiking layers of max(0, rate - target), [rate per layer]),
+    rate = the layer's spikes per neuron per timestep in the last forward
+    pass (n_steps = timesteps x batch size)."""
+    rates = [spikes / (n_steps * width) for spikes, width in zip(model.layer_spikes, model.layer_widths)]
+    penalty = sum(torch.relu(rate - target) for rate, target in zip(rates, targets))
+    return penalty, [float(rate) for rate in rates]
+
+
 def run_epoch(model, loader, criterion, device, scale, loss_eps, optimizer=None, use_amp=False,
-              channel_lasso_weight=0.0, log_interval=50, verbose=True, desc=""):
+              channel_lasso_weight=0.0, spike_rate_weight=0.0, spike_rate_targets=None,
+              log_interval=50, verbose=True, desc=""):
     """One pass over `loader`; trains if an optimizer is given, else evaluates.
 
     Returns (mean loss, metrics dict). Loss is RMSE in physical velocity
-    units (plus the channel-lasso penalty when training with it)."""
+    units (plus the channel-lasso and spike-rate penalties when training
+    with them). metrics["layer_rates"] holds each spiking layer's mean
+    spikes per neuron per timestep."""
     training = optimizer is not None
     model.train(training)
     grad_scaler = torch.cuda.amp.GradScaler() if (training and use_amp) else None
     first_linear = model.layers[0] if channel_lasso_weight > 0 else None
     sums = {k: 0.0 for k in ("loss", "pred_loss", "channel_penalty", "velocity_error",
-                             "membrane_mean", "membrane_max", "non_zero_ratio", "spike_rate")}
+                             "membrane_mean", "membrane_max", "non_zero_ratio", "spike_rate",
+                             "spike_rate_penalty")}
+    layer_rate_sums = None
 
     for batch_idx, (_, inputs, targets) in enumerate(tqdm(loader, desc=desc, disable=not verbose)):
         inputs = inputs.transpose(0, 1).to(device)    # [N, T, C] -> [T, N, C]
@@ -217,6 +246,12 @@ def run_epoch(model, loader, criterion, device, scale, loss_eps, optimizer=None,
                 penalty = torch.norm(first_linear.weight, dim=0).sum()  # L2 per input channel
                 loss = pred_loss + channel_lasso_weight * penalty
                 sums["channel_penalty"] += penalty.item()
+            rate_penalty, layer_rates = spike_rate_penalty(model, T * N, spike_rate_targets or [0.0])
+            if training and spike_rate_weight > 0:
+                loss = loss + spike_rate_weight * rate_penalty
+            sums["spike_rate_penalty"] += float(rate_penalty)
+            layer_rate_sums = layer_rates if layer_rate_sums is None else [
+                a + b for a, b in zip(layer_rate_sums, layer_rates)]
 
         if training:
             optimizer.zero_grad()
@@ -246,6 +281,7 @@ def run_epoch(model, loader, criterion, device, scale, loss_eps, optimizer=None,
                   f"spike_rate={spike_rate:.4f}")
 
     metrics = {k: v / len(loader) for k, v in sums.items()}
+    metrics["layer_rates"] = [v / len(loader) for v in layer_rate_sums]
     if training:
         metrics["learning_rate"] = optimizer.param_groups[0]["lr"]
     return metrics["loss"], metrics
@@ -413,6 +449,15 @@ def main():
                 "experiment": experiment, **extra}
 
     scale = (args.velocity_lo, args.velocity_hi, args.velocity_margin)
+    n_spiking = len(model.layer_widths)
+    if len(args.spike_rate_target) not in (1, n_spiking):
+        raise ValueError(f"--spike-rate-target takes 1 or {n_spiking} values (one per spiking "
+                         f"layer), got {len(args.spike_rate_target)}")
+    spike_rate_targets = (args.spike_rate_target * n_spiking if len(args.spike_rate_target) == 1
+                          else list(args.spike_rate_target))
+    if args.spike_rate_weight > 0:
+        print(f"Spike-rate penalty: weight {args.spike_rate_weight}, targets per layer "
+              f"{spike_rate_targets} (spikes per neuron per timestep)")
     training_start = time.time()
     epoch = start_epoch - 1
     for epoch in range(start_epoch, args.epochs):
@@ -420,6 +465,7 @@ def main():
         train_loss, train_metrics = run_epoch(
             model, train_loader, criterion, device, scale, args.loss_eps, optimizer=optimizer,
             use_amp=args.use_amp, channel_lasso_weight=args.channel_lasso_weight,
+            spike_rate_weight=args.spike_rate_weight, spike_rate_targets=spike_rate_targets,
             log_interval=args.log_interval, verbose=args.verbose, desc=f"Epoch {epoch + 1} [train]")
         test_loss, test_metrics = run_epoch(
             model, test_loader, criterion, device, scale, args.loss_eps,
@@ -439,10 +485,19 @@ def main():
         print(f"Epoch {epoch + 1}/{args.epochs} ({epoch_time:.1f}s) | train {train_loss:.5f} | "
               f"test {test_loss:.5f} | velocity error {test_metrics['velocity_error']:.5f} | "
               f"spike rate {test_metrics['spike_rate']:.4f} | lr {train_metrics['learning_rate']:.6f}")
+        print(f"  spikes per neuron per timestep by layer: test "
+              f"[{' '.join(f'{r:.3f}' for r in test_metrics['layer_rates'])}], train "
+              f"[{' '.join(f'{r:.3f}' for r in train_metrics['layer_rates'])}]"
+              + (f", train penalty {train_metrics['spike_rate_penalty']:.4f}"
+                 if args.spike_rate_weight > 0 else ""))
         if args.wandb:
+            def flat(metrics):
+                out = {k: v for k, v in metrics.items() if k != "layer_rates"}
+                out.update({f"layer_rate_{i}": r for i, r in enumerate(metrics["layer_rates"])})
+                return out
             wandb.log({"epoch": epoch + 1, "epoch_time": epoch_time,
-                       **{f"train/{k}": v for k, v in train_metrics.items()},
-                       **{f"test/{k}": v for k, v in test_metrics.items()}}, step=epoch)
+                       **{f"train/{k}": v for k, v in flat(train_metrics).items()},
+                       **{f"test/{k}": v for k, v in flat(test_metrics).items()}}, step=epoch)
 
         if test_loss < best_loss:
             best_loss = test_loss

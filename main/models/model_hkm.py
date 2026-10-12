@@ -436,6 +436,7 @@ class SNN_Speck(nn.Module):
             )
         self.layers = nn.ModuleList(raw_layers)
         self.total_neuron_units = sum(layer_widths[1:])
+        self.layer_widths = list(layer_widths[1:])   # neurons per spiking layer
 
         positions_init = torch.linspace(0.0, 1.0, n_bins, dtype=torch.float32)
         self.register_buffer("positions", positions_init)
@@ -599,6 +600,10 @@ class SNN_Speck(nn.Module):
         predictions_over_time = []
         final_layer_spikes = torch.zeros(1, device=x_total.device)
         total_spikes = torch.zeros(1, device=x_total.device)
+        # Spikes summed over the call, one entry per neuron layer (with
+        # gradients), for train_snn.py's per-layer --spike-rate-weight
+        # penalty; widths in self.layer_widths.
+        self.layer_spikes = []
 
         if count_ops:
             op_mac = 0
@@ -612,6 +617,7 @@ class SNN_Speck(nn.Module):
         for ts in range(T):
             x = x_total[ts]  # (N, num_input_channels)
             linear_seen = 0
+            neuron_seen = 0
             for layer in self.layers:
                 if count_ops and isinstance(layer, nn.Linear):
                     out_features = layer.out_features
@@ -645,7 +651,13 @@ class SNN_Speck(nn.Module):
                     # all. --min-vmem should still be set (as it already
                     # is in normal usage) to prevent the instability
                     # itself; this clamp is a backstop, not a substitute.
-                    total_spikes = total_spikes + x.sum().clamp(min=0)
+                    step_spikes = x.sum().clamp(min=0)
+                    total_spikes = total_spikes + step_spikes
+                    if ts == 0:
+                        self.layer_spikes.append(step_spikes)
+                    else:
+                        self.layer_spikes[neuron_seen] = self.layer_spikes[neuron_seen] + step_spikes
+                    neuron_seen += 1
                     if count_ops:
                         units = x.shape[-1]
                         if isinstance(layer, _SinabsNeuronLayer):
