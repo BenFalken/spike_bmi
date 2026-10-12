@@ -210,7 +210,7 @@ def spike_rate_penalty(model, n_steps, targets):
     pass (n_steps = timesteps x batch size)."""
     rates = [spikes / (n_steps * width) for spikes, width in zip(model.layer_spikes, model.layer_widths)]
     penalty = sum(torch.relu(rate - target) for rate, target in zip(rates, targets))
-    return penalty, [float(rate) for rate in rates]
+    return penalty, [float(rate.detach()) for rate in rates]
 
 
 def run_epoch(model, loader, criterion, device, scale, loss_eps, optimizer=None, use_amp=False,
