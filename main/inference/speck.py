@@ -96,11 +96,23 @@ def discretized_sequential(network):
     return nn.Sequential(*[m for pair in pairs for m in pair])
 
 
+def reset_states(seq):
+    """sinabs.reset_states(seq), after replacing any neuron state a run left
+    as a view of another tensor (sinabs cannot reset those in place: "Can't
+    detach views in-place")."""
+    import sinabs
+    for m in seq.modules():
+        for name, buf in list(m._buffers.items()):
+            if buf is not None and buf._base is not None:
+                m._buffers[name] = buf.detach().clone()
+    sinabs.reset_states(seq)
+
+
 def run_float(snn_seq, input_spikes):
     """(C, T) input -> (T, n_out) output spikes of the flattened network."""
     import sinabs
     x = torch.from_numpy(input_spikes.T.astype(np.float32))
-    sinabs.reset_states(snn_seq)
+    reset_states(snn_seq)
     with torch.no_grad():
         return torch.cat([snn_seq(x[t:t + 1]) for t in range(len(x))]).numpy()
 
@@ -110,7 +122,7 @@ def run_discretized(disc_seq, input_spikes):
     one timestep per call (state carried between calls, as in training)."""
     import sinabs
     x = torch.from_numpy(input_spikes.T.astype(np.float32))[:, :, None, None]
-    sinabs.reset_states(disc_seq)
+    reset_states(disc_seq)
     with torch.no_grad():
         return torch.cat([disc_seq(x[t:t + 1]).reshape(1, -1) for t in range(len(x))]).numpy()
 
@@ -124,7 +136,7 @@ def run_layers(seq, input_spikes):
     x = torch.from_numpy(input_spikes.T.astype(np.float32))
     if conv:
         x = x[:, :, None, None]
-    sinabs.reset_states(seq)
+    reset_states(seq)
     steps = []
     with torch.no_grad():
         for t in range(len(x)):
@@ -153,12 +165,12 @@ def cross_check_flattened(model, snn_seq, input_spikes, tol=1e-4):
     must agree, or the network deployed to the chip is not the trained one."""
     import sinabs
     x = torch.from_numpy(input_spikes.T.astype(np.float32))           # (T, C)
-    sinabs.reset_states(snn_seq)
+    reset_states(snn_seq)
     with torch.no_grad():
         spikes = torch.cat([snn_seq(x[t:t + 1]) for t in range(len(x))])
         flat = decode_spike_counts(model, spikes)
         ref = model(x[:, None, :])[0].squeeze(1).numpy()
-    sinabs.reset_states(snn_seq)
+    reset_states(snn_seq)
     max_diff = float(np.abs(flat - ref).max())
     if max_diff > tol:
         raise RuntimeError(f"Flattened network differs from model() by {max_diff:.2e} "
