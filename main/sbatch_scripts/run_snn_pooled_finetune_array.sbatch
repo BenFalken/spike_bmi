@@ -9,7 +9,8 @@
 # Stage 2 of 2 of the PyTorch SNN: fine-tune the pretrained "pooled" network
 # on each session of one subject (array task i = session i). Each run starts
 # from the pretrained weights (--init-weights-from, fresh optimizer) with the
-# same network and training settings (snn_config.sh); with LOSO=1 (default),
+# same network and training settings (snn_config.sh) but soft reset (the
+# pretraining used hard reset; the reset has no weights); with LOSO=1 (default),
 # session i starts from the model pretrained without it. See
 # run_snn_pooled_pretrain.sbatch for how to chain the two.
 #

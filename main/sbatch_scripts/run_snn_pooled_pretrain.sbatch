@@ -26,8 +26,8 @@
 #       run_snn_pooled_finetune_array.sbatch
 #   (hkm: sessions under snn_datasets/hkm/<subject>/mua)
 #
-# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/loso_pretrained_binarized_soft/<held-out session>/
-#              (LOSO=0: .../full_cohort_pretrained_binarized_soft/)
+# Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/loso_pretrained_binarized/<held-out session>/
+#              (LOSO=0: .../full_cohort_pretrained_binarized/)
 # Re-submitting skips a finished run and resumes an interrupted one (for hkm,
 # where an epoch over a pool takes hours, expect to re-submit).
 
@@ -39,7 +39,7 @@ if [ -z "${EXPERIMENT:-}" ] || [ -z "${SUBJECT:-}" ]; then
 fi
 DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
 source ./snn_config.sh
-select_model pooled
+select_model pooled_pretrain   # hard reset; fine-tuning uses soft
 
 EXCLUDE_ARGS=()
 if [ "$LOSO" = "1" ]; then

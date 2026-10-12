@@ -5,15 +5,19 @@
 #   pooled       run_snn_pooled_pretrain.sbatch + run_snn_pooled_finetune_array.sbatch:
 #                the PyTorch SNN ('snn' in inference). 512 -> 256 -> 128, threshold
 #                1.0, 2 EMA stages, tau_syn initialized at 2, 4, 8, 16 over the four
-#                spiking layers (trained), soft reset (the most accurate in PyTorch).
-#                Not deployable to Speck (no synaptic stage).
+#                spiking layers (trained). Pretrained with hard reset
+#                (select_model pooled_pretrain), fine-tuned with soft reset (select_model
+#                pooled), the most accurate in PyTorch; the reset has no weights, so the
+#                hard-reset pretrained weights load unchanged. Not deployable to Speck
+#                (no synaptic stage).
 #   per_session  run_snn_per_session_array.sbatch: the Speck SNN ('speck'). 256 -> 128
 #                -> 64, threshold 1.0, 2 EMA stages, no tau_syn, hard reset (soft
 #                reset loses more accuracy on the chip).
 #
 # Every model trains on binarized input (train_snn.py --binarize-input, default).
 #
-# Requires DATA_ROOT, EXPERIMENT and SUBJECT; call select_model pooled|per_session.
+# Requires DATA_ROOT, EXPERIMENT and SUBJECT; call select_model
+# pooled_pretrain|pooled|per_session.
 # LOSO (pooled only): 1 (default) pretrains one model per session on every OTHER
 # session of the subject, so a session's own data never reaches its pretraining;
 # 0 pretrains one model on every session.
@@ -37,21 +41,22 @@ case "$LOSO" in
     1) POOL_KIND="loso" ;;
     *) echo "ERROR: LOSO must be 0 or 1, got '$LOSO'" >&2; exit 1 ;;
 esac
-# Checkpoint directories end in _binarized (binarized input), and the pooled
-# ones in _binarized_soft (soft reset), so they never meet the checkpoints of
-# earlier runs, which the skip/resume checks would otherwise take for this
-# pipeline's.
+# Checkpoint directories end in _binarized (binarized input), and the
+# fine-tuned ones in _binarized_soft (soft reset), so they never meet the
+# checkpoints of earlier runs, which the skip/resume checks would otherwise take
+# for this pipeline's.
 FINETUNE_ROOT="${CHECKPOINT_BASE}/${POOL_KIND}_finetuned_binarized_soft"
 PER_SESSION_ROOT="${CHECKPOINT_BASE}/per_session_binarized"
 
-# select_model pooled|per_session -> the network and training controls.
+# select_model pooled_pretrain|pooled|per_session -> the network and training
+# controls (pooled_pretrain: the pooled network with hard reset).
 # Epochs are maxima (early stopping); hkm epochs take about an hour per
 # session, so hkm runs fewer and checkpoints every epoch.
 select_model() {
     case "$1" in
-        pooled)
+        pooled|pooled_pretrain)
             HIDDEN_DIMS=(512 256 128); THRESHOLDS=(1.0 1.0 1.0 1.0); TAU_SYN=(2 4 8 16)
-            RESET_TYPE=soft
+            RESET_TYPE=$([ "$1" = "pooled_pretrain" ] && echo hard || echo soft)
             if [ "$EXPERIMENT" = "hkm" ]; then
                 EPOCHS=10; PATIENCE=5; SCHEDULER_PATIENCE=5; CHECKPOINT_INTERVAL=1
             else
@@ -65,7 +70,7 @@ select_model() {
             else
                 EPOCHS=50; PATIENCE=10; SCHEDULER_PATIENCE=5; CHECKPOINT_INTERVAL=10
             fi ;;
-        *) echo "ERROR: select_model pooled|per_session, got '$1'" >&2; exit 1 ;;
+        *) echo "ERROR: select_model pooled_pretrain|pooled|per_session, got '$1'" >&2; exit 1 ;;
     esac
     EXP_NAME="bmi_iaf_${RESET_TYPE}"   # file prefix train_snn.py uses (bmi_{neuron}_{reset})
     TAU_SYN_ARGS=()
@@ -104,9 +109,9 @@ pool_dir() {
 }
 pretrain_dir() {
     if [ "$LOSO" = "1" ]; then
-        echo "${CHECKPOINT_BASE}/loso_pretrained_binarized_soft/$1"
+        echo "${CHECKPOINT_BASE}/loso_pretrained_binarized/$1"
     else
-        echo "${CHECKPOINT_BASE}/full_cohort_pretrained_binarized_soft"
+        echo "${CHECKPOINT_BASE}/full_cohort_pretrained_binarized"
     fi
 }
 

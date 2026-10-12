@@ -47,7 +47,7 @@ accuracy is measured on one platform.
 for bmi `indy`, bmi `loco` and hkm `jenkins` (`SUBJECTS="exp:subject ..."` changes the
 list) as Slurm jobs chained by dependencies; `DRY_RUN=1` prints them instead. Re-running
 it resumes (cancel its pending jobs first). New SNN checkpoints go to `*_binarized`
-directories (the pooled, soft-reset ones to `*_binarized_soft`), so earlier runs'
+directories (the soft-reset fine-tuned ones to `*_binarized_soft`), so earlier runs'
 checkpoints are never skipped over or resumed from.
 
 1. **Datasets, KF, WF, LSTM, QRNN.** `preprocessing_training/single_subject_pipeline.py`
@@ -63,7 +63,8 @@ checkpoints are never skipped over or resumed from.
 3. **SNN for PyTorch ('snn'):** `run_snn_pooled_pretrain.sbatch`, then
    `run_snn_pooled_finetune_array.sbatch` (chained per session; see the pretrain script's
    header). 512 → 256 → 128, threshold 1.0, 2 EMA stages, `tau_syn` initialized at 2, 4, 8
-   and 16 over the four spiking layers and trained, soft reset. Leave-one-session-out by default
+   and 16 over the four spiking layers and trained; pretrained with hard reset, fine-tuned
+   with soft reset. Leave-one-session-out by default
    (`LOSO=1`): session i is fine-tuned from a model pretrained on every other session, so
    its own data never reaches pretraining. At most 50 epochs per stage for bmi, 10 for hkm.
    → `snn_checkpoints/<exp>/<subject>/loso_finetuned_binarized_soft/<session>/`
