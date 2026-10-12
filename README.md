@@ -47,7 +47,8 @@ accuracy is measured on one platform.
 for bmi `indy`, bmi `loco` and hkm `jenkins` (`SUBJECTS="exp:subject ..."` changes the
 list) as Slurm jobs chained by dependencies; `DRY_RUN=1` prints them instead. Re-running
 it resumes (cancel its pending jobs first). New SNN checkpoints go to `*_binarized`
-directories, so earlier runs' checkpoints are never skipped over or resumed from.
+directories (the pooled, soft-reset ones to `*_binarized_soft`), so earlier runs'
+checkpoints are never skipped over or resumed from.
 
 1. **Datasets, KF, WF, LSTM, QRNN.** `preprocessing_training/single_subject_pipeline.py`
    runs one session: raw data → binned spikes and kinematics (4 ms bins) → ANN and SNN
@@ -62,12 +63,13 @@ directories, so earlier runs' checkpoints are never skipped over or resumed from
 3. **SNN for PyTorch ('snn'):** `run_snn_pooled_pretrain.sbatch`, then
    `run_snn_pooled_finetune_array.sbatch` (chained per session; see the pretrain script's
    header). 512 → 256 → 128, threshold 1.0, 2 EMA stages, `tau_syn` initialized at 2, 4, 8
-   and 16 over the four spiking layers and trained. Leave-one-session-out by default
+   and 16 over the four spiking layers and trained, soft reset. Leave-one-session-out by default
    (`LOSO=1`): session i is fine-tuned from a model pretrained on every other session, so
    its own data never reaches pretraining. At most 50 epochs per stage for bmi, 10 for hkm.
-   → `snn_checkpoints/<exp>/<subject>/loso_finetuned_binarized/<session>/`
+   → `snn_checkpoints/<exp>/<subject>/loso_finetuned_binarized_soft/<session>/`
 4. **SNN for Speck ('speck'):** `run_snn_per_session_array.sbatch`. 256 → 128 → 64,
-   threshold 1.0, 2 EMA stages, no `tau_syn` (the chip has no synaptic stage), trained
+   threshold 1.0, 2 EMA stages, no `tau_syn` (the chip has no synaptic stage), hard reset
+   (soft reset loses more accuracy on the chip; see below), trained
    per session from scratch. At most 50 epochs for bmi, 20 for hkm.
    → `snn_checkpoints/<exp>/<subject>/per_session_binarized/<session>/`
 
@@ -82,7 +84,7 @@ directories, so earlier runs' checkpoints are never skipped over or resumed from
    `bash sbatch_scripts/run_inference.sbatch --local <exp> <subject>` (e.g. `--local bmi indy`).
    - Evaluates every decoder on every session (`inference/test_all_decoders.py`): accuracy,
      latency and energy per sample, `speck` on the devkit. `snn` runs the
-     `loso_finetuned_binarized` checkpoints and `speck` the `per_session_binarized` ones (`SNN_CHECKPOINT_ROOT=`,
+     `loso_finetuned_binarized_soft` checkpoints and `speck` the `per_session_binarized` ones (`SNN_CHECKPOINT_ROOT=`,
      `SPECK_CHECKPOINT_ROOT=` override them).
    - Builds the report (`inference/make_report.py`): `combined_metrics.json`,
      `efficiency_summary.json`, and the efficiency, energy and comparison figures. The

@@ -5,9 +5,11 @@
 #   pooled       run_snn_pooled_pretrain.sbatch + run_snn_pooled_finetune_array.sbatch:
 #                the PyTorch SNN ('snn' in inference). 512 -> 256 -> 128, threshold
 #                1.0, 2 EMA stages, tau_syn initialized at 2, 4, 8, 16 over the four
-#                spiking layers (trained). Not deployable to Speck (no synaptic stage).
+#                spiking layers (trained), soft reset (the most accurate in PyTorch).
+#                Not deployable to Speck (no synaptic stage).
 #   per_session  run_snn_per_session_array.sbatch: the Speck SNN ('speck'). 256 -> 128
-#                -> 64, threshold 1.0, 2 EMA stages, no tau_syn.
+#                -> 64, threshold 1.0, 2 EMA stages, no tau_syn, hard reset (soft
+#                reset loses more accuracy on the chip).
 #
 # Every model trains on binarized input (train_snn.py --binarize-input, default).
 #
@@ -19,7 +21,6 @@
 CONFIG_YAML="../configs/iaf_hard_reset.yaml"
 TRAIN_SCRIPT="../snn_training/train_snn.py"
 POOL_SCRIPT="../preprocessing_training/build_pretraining_pool.py"
-EXP_NAME="bmi_iaf_hard"   # file prefix train_snn.py uses (bmi_{neuron}_{reset})
 
 # bmi: grouped datasets, batches of 20 equal-length trials.
 # hkm: whole-trial datasets of different lengths, one trial per batch.
@@ -36,10 +37,11 @@ case "$LOSO" in
     1) POOL_KIND="loso" ;;
     *) echo "ERROR: LOSO must be 0 or 1, got '$LOSO'" >&2; exit 1 ;;
 esac
-# Checkpoint directories end in _binarized (binarized input), so they never
-# meet the checkpoints of earlier runs, which the skip/resume checks would
-# otherwise take for this pipeline's.
-FINETUNE_ROOT="${CHECKPOINT_BASE}/${POOL_KIND}_finetuned_binarized"
+# Checkpoint directories end in _binarized (binarized input), and the pooled
+# ones in _binarized_soft (soft reset), so they never meet the checkpoints of
+# earlier runs, which the skip/resume checks would otherwise take for this
+# pipeline's.
+FINETUNE_ROOT="${CHECKPOINT_BASE}/${POOL_KIND}_finetuned_binarized_soft"
 PER_SESSION_ROOT="${CHECKPOINT_BASE}/per_session_binarized"
 
 # select_model pooled|per_session -> the network and training controls.
@@ -49,6 +51,7 @@ select_model() {
     case "$1" in
         pooled)
             HIDDEN_DIMS=(512 256 128); THRESHOLDS=(1.0 1.0 1.0 1.0); TAU_SYN=(2 4 8 16)
+            RESET_TYPE=soft
             if [ "$EXPERIMENT" = "hkm" ]; then
                 EPOCHS=10; PATIENCE=5; SCHEDULER_PATIENCE=5; CHECKPOINT_INTERVAL=1
             else
@@ -56,6 +59,7 @@ select_model() {
             fi ;;
         per_session)
             HIDDEN_DIMS=(256 128 64); THRESHOLDS=(1.0 1.0 1.0 1.0); TAU_SYN=()
+            RESET_TYPE=hard
             if [ "$EXPERIMENT" = "hkm" ]; then
                 EPOCHS=20; PATIENCE=5; SCHEDULER_PATIENCE=5; CHECKPOINT_INTERVAL=1
             else
@@ -63,6 +67,7 @@ select_model() {
             fi ;;
         *) echo "ERROR: select_model pooled|per_session, got '$1'" >&2; exit 1 ;;
     esac
+    EXP_NAME="bmi_iaf_${RESET_TYPE}"   # file prefix train_snn.py uses (bmi_{neuron}_{reset})
     TAU_SYN_ARGS=()
     [ ${#TAU_SYN[@]} -gt 0 ] && TAU_SYN_ARGS=(--tau-syn "${TAU_SYN[@]}")
     TRAIN_ARGS=(
@@ -72,7 +77,7 @@ select_model() {
         --use-iaf-squeeze
         --weight-init kaiming
         --neuron-type iaf
-        --reset-type hard
+        --reset-type "$RESET_TYPE"
         --binarize-input true
         --batch-size "$BATCH_SIZE"
         --num-workers 0
@@ -85,7 +90,7 @@ select_model() {
         --spike-thresholds "${THRESHOLDS[@]}"
         "${TAU_SYN_ARGS[@]}"
     )
-    MODEL_DESC="$1: hidden=${HIDDEN_DIMS[*]} thresholds=${THRESHOLDS[*]} tau_syn=${TAU_SYN[*]:-none} batch=${BATCH_SIZE} epochs<=${EPOCHS}"
+    MODEL_DESC="$1: hidden=${HIDDEN_DIMS[*]} reset=${RESET_TYPE} thresholds=${THRESHOLDS[*]} tau_syn=${TAU_SYN[*]:-none} batch=${BATCH_SIZE} epochs<=${EPOCHS}"
 }
 
 # Pretraining pool and checkpoint directory; per held-out session with LOSO=1.
@@ -99,9 +104,9 @@ pool_dir() {
 }
 pretrain_dir() {
     if [ "$LOSO" = "1" ]; then
-        echo "${CHECKPOINT_BASE}/loso_pretrained_binarized/$1"
+        echo "${CHECKPOINT_BASE}/loso_pretrained_binarized_soft/$1"
     else
-        echo "${CHECKPOINT_BASE}/full_cohort_pretrained_binarized"
+        echo "${CHECKPOINT_BASE}/full_cohort_pretrained_binarized_soft"
     fi
 }
 
