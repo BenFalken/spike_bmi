@@ -21,6 +21,8 @@
 #   N_TRAIN, N_VAL, N_TEST, EPOCHS   trial counts and epochs (lab.py run defaults)
 #   SHUFFLE     emulator event order: none, input or all (default none; pick the
 #               one validation shows closest to the chip)
+#   INIT        fine-tune every regime from this checkpoint (weights and velocity scale)
+#               instead of training from scratch; use a separate OUT_DIR
 #   SKIP_VALIDATE=1  skip step 1
 #
 # Re-running resumes: a regime whose model is already in OUT_DIR is only re-scored.
@@ -72,6 +74,7 @@ RUN_ARGS=(--snn_dataset "$SNN_DATASET" --out_dir "$OUT_DIR" --emulator_shuffle "
 [ -n "${N_VAL:-}" ] && RUN_ARGS+=(--n_val "$N_VAL")
 [ -n "${N_TEST:-}" ] && RUN_ARGS+=(--n_test "$N_TEST")
 [ -n "${EPOCHS:-}" ] && RUN_ARGS+=(--epochs "$EPOCHS")
+[ -n "${INIT:-}" ] && RUN_ARGS+=(--init "$INIT")
 for regime in $REGIMES; do        # one process per regime: a failure leaves the others' results
     echo -e "\n--- $(date '+%T') ${regime}"
     python3 lab.py run "${RUN_ARGS[@]}" --regimes "$regime" || echo "WARNING: ${regime} failed (see above); continuing"
