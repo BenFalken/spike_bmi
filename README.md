@@ -83,7 +83,12 @@ checkpoints are never skipped over or resumed from.
    output firing and shrink the predictions to about a fifth (Jenkins: RMSE 118 on the
    chip against 57 in PyTorch). Doubling the threshold there removes most of it (emulated
    chip 57.5, about 44% fewer synaptic events) without retraining; a spike-rate penalty
-   or training at the higher threshold did worse (`main/speck_lab/`).
+   or training at the higher threshold did worse (`main/speck_lab/`). hkm also waits
+   3 ms per timestep for the chip's output (`SPECK_WAIT_TIME`, 1 ms for bmi): with
+   about 31 input events per step the chip is not done after 1 ms, and late output
+   spikes land in the next step. On the chip, Jenkins at x2 scores 76.5 at 1 ms, 66.1
+   at 2 ms, 62.4 at 3 ms and 59.6 at 5 ms (PyTorch 56.6; x1 stays at about 118 at any
+   wait); 3 ms keeps each step within the 4 ms of data it covers.
 
    Both configurations are in `sbatch_scripts/snn_config.sh`. Every SNN trains on
    **binarized input** (spike counts clipped to 0/1, `train_snn.py --binarize-input`,

@@ -59,6 +59,7 @@
 #   DATA_ROOT=~/data VENV=~/speck-env bash run_inference.sbatch --local bmi indy
 #   (--local and --report without DATA_ROOT use the data/ folder next to main/, if there is one)
 #   SPECK_WAIT_TIME=0.005 ...   seconds the chip gets per timestep before its output is read
+#                               (default 0.003 for hkm, test_all_decoders.py's 0.001 for bmi)
 #   SPECK_H1_SCALE=1 ...        hidden layer 1 threshold factor on the chip (default 2 for hkm, 1 for bmi)
 #   Only rebuild the report:  bash run_inference.sbatch --report bmi indy
 #   (training-duration results missing from sessions/*.json are kept from the
@@ -175,6 +176,11 @@ SPECK_CHECKPOINT_ROOT="${SPECK_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${E
 # fire a neuron at once) than in training; doubling that layer's threshold on
 # the chip removes most of it (main/speck_lab/). The trained model is unchanged.
 SPECK_H1_SCALE="${SPECK_H1_SCALE:-$([ "$EXPERIMENT" = "hkm" ] && echo 2 || echo 1)}"
+# hkm's ~31 input events per step also need more than 1 ms on the chip: output
+# read too early is counted in the next step (Jenkins at x2: chip RMSE 76.5 at
+# 1 ms, 66.1 at 2 ms, 62.4 at 3 ms, 59.6 at 5 ms). 3 ms keeps a step (wait plus
+# ~0.6 ms of host overhead) inside the 4 ms of data it covers.
+SPECK_WAIT_TIME="${SPECK_WAIT_TIME:-$([ "$EXPERIMENT" = "hkm" ] && echo 0.003 || true)}"
 SPECK_CHECKPOINT_SUBDIR="${SPECK_CHECKPOINT_SUBDIR:-}"
 if [ "$EXPERIMENT" = "hkm" ]; then
     SNN_DATASET_ROOT="${DATA_ROOT}/snn_datasets/${EXPERIMENT}/${SUBJECT}/mua"          # whole trials
@@ -195,7 +201,7 @@ show_settings() {
         echo "Figures (from saved predictions) for: ${FIGURE_DECODERS:-every decoder}"
     elif [ "${MODE:-}" != "report" ]; then
         echo "SNN checkpoints: ${SNN_CHECKPOINT_ROOT}${SNN_CHECKPOINT_SUBDIR:+ (/<session>/${SNN_CHECKPOINT_SUBDIR})}"
-        [[ ",$DECODERS," == *,speck,* ]] && echo "Speck checkpoints: ${SPECK_CHECKPOINT_ROOT}${SPECK_CHECKPOINT_SUBDIR:+ (/<session>/${SPECK_CHECKPOINT_SUBDIR})}, hidden layer 1 threshold x${SPECK_H1_SCALE} on the chip"
+        [[ ",$DECODERS," == *,speck,* ]] && echo "Speck checkpoints: ${SPECK_CHECKPOINT_ROOT}${SPECK_CHECKPOINT_SUBDIR:+ (/<session>/${SPECK_CHECKPOINT_SUBDIR})}, hidden layer 1 threshold x${SPECK_H1_SCALE}, wait ${SPECK_WAIT_TIME:-0.001} s per step on the chip"
         echo "Decoders: ${DECODERS}${FIGURES:+; figures for ${FIGURE_DECODERS:-every decoder}}"
     fi
     [ "${LEGACY_HKM:-}" = "1" ] && echo "LEGACY_HKM=1: ${EVAL_SCRIPT} (trials matched by velocity)"
