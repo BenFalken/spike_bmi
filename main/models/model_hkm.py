@@ -604,6 +604,13 @@ class SNN_Speck(nn.Module):
         # gradients), for train_snn.py's per-layer --spike-rate-weight
         # penalty; widths in self.layer_widths.
         self.layer_spikes = []
+        # With self.track_cancel (speck_lab), one entry per Linear: the
+        # excitatory input that inhibitory input cancels within the same
+        # timestep, min(W+ x, -(W- x)), summed over neurons and timesteps
+        # (with gradients). The chip integrates a timestep's events one at a
+        # time, so cancelled excitation can fire it where training stays silent.
+        track_cancel = getattr(self, 'track_cancel', False)
+        self.layer_cancel = []
 
         if count_ops:
             op_mac = 0
@@ -618,6 +625,7 @@ class SNN_Speck(nn.Module):
             x = x_total[ts]  # (N, num_input_channels)
             linear_seen = 0
             neuron_seen = 0
+            cancel_seen = 0
             for layer in self.layers:
                 if count_ops and isinstance(layer, nn.Linear):
                     out_features = layer.out_features
@@ -637,6 +645,15 @@ class SNN_Speck(nn.Module):
                         # separate unit of accumulate work downstream.
                         op_acc += float(x.sum().item()) * out_features
                     linear_seen += 1
+                if track_cancel and isinstance(layer, nn.Linear):
+                    excitation = nn.functional.linear(x, layer.weight.clamp(min=0))
+                    inhibition = -nn.functional.linear(x, layer.weight.clamp(max=0))
+                    cancelled = torch.minimum(excitation, inhibition).sum()
+                    if ts == 0:
+                        self.layer_cancel.append(cancelled)
+                    else:
+                        self.layer_cancel[cancel_seen] = self.layer_cancel[cancel_seen] + cancelled
+                    cancel_seen += 1
                 x = layer(x)
                 if isinstance(layer, (_SinabsNeuronLayer, _SJNeuronLayer)):
                     # Spike counts are structurally non-negative; clamp

@@ -11,6 +11,8 @@ Keys:
     spike_rate_weight   train_snn.py --spike-rate-weight (0 = off)
     spike_rate_target   one rate (spikes per neuron per timestep) or one per spiking layer
     lr, weight_decay, epochs
+    cancel_weight       penalty on excitatory input cancelled by inhibitory input within a
+                        timestep (per neuron-step, in thresholds, averaged over layers; 0 = off)
     select              'pytorch' (default): keep the epoch with the best validation RMSE;
                         'emulated': the best validation RMSE on the emulated chip
     init                checkpoint to start from (fine-tuning: weights only)
@@ -20,7 +22,7 @@ BASE = {
     'spike_fn': 'multi', 'spike_thresholds': [1.0, 1.0, 1.0, 1.0], 'hidden_dims': [256, 128, 64],
     'reset_type': 'hard', 'min_vmem': -1, 'n_bins': 18, 'temporal_decay_stages': 2,
     'spike_rate_weight': 0.0, 'spike_rate_target': [0.1], 'lr': 1e-3, 'weight_decay': 1e-3,
-    'epochs': None, 'init': None, 'select': 'pytorch',
+    'epochs': None, 'init': None, 'select': 'pytorch', 'cancel_weight': 0.0,
 }
 
 REGIMES = {
@@ -36,6 +38,15 @@ REGIMES = {
     # at most once per input event.
     'rate10_single': {'spike_fn': 'single', 'spike_rate_weight': 10.0,
                       'spike_rate_target': [0.1, 0.1, 0.1, 0.25]},
+    # rate10 with 10x the weight decay: smaller weights, less cancellation.
+    'rate10_wd': {'spike_rate_weight': 10.0, 'spike_rate_target': [0.1, 0.1, 0.1, 0.25],
+                  'weight_decay': 1e-2},
+    # rate10 plus a penalty on excitation cancelled by inhibition within a
+    # timestep: what the chip, integrating events one at a time, gets wrong.
+    'rate10_cancel5': {'spike_rate_weight': 10.0, 'spike_rate_target': [0.1, 0.1, 0.1, 0.25],
+                       'cancel_weight': 5.0},
+    'rate10_cancel20': {'spike_rate_weight': 10.0, 'spike_rate_target': [0.1, 0.1, 0.1, 0.25],
+                        'cancel_weight': 20.0},
     # rate10, keeping the epoch whose emulated-chip validation RMSE is best.
     'rate10_emusel': {'spike_rate_weight': 10.0, 'spike_rate_target': [0.1, 0.1, 0.1, 0.25],
                       'select': 'emulated'},

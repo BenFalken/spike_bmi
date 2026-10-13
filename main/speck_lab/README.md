@@ -96,6 +96,31 @@ training from scratch (e.g. the dense Jenkins per-session checkpoint).
 | `rate10_sparse` | weight 10, targets 0.05 / 0.05 / 0.05 / 0.1 |
 | `rate10_single` | `rate10` with SingleSpike (at most one spike per neuron per timestep) |
 | `rate10_emusel` | `rate10`, keeping the epoch with the best *emulated-chip* validation RMSE |
+| `rate10_wd` | `rate10` with 10x the weight decay (1e-2): smaller weights, less cancellation |
+| `rate10_cancel5`, `rate10_cancel20` | `rate10` plus a penalty (weight 5 or 20) on excitatory input cancelled by inhibitory input within a timestep |
+
+### Why cancellation
+
+Fine-tuning the dense Jenkins model with `rate10` cut its output rate 8x at almost no
+PyTorch cost, but the emulated chip still lost ~50 RMSE, while models trained from scratch
+at similar rates lost ~8. Rate is not what the chip gets wrong: the chip integrates a
+timestep's events one at a time, so a neuron whose excitation and inhibition cancel within
+the step fires if the excitation arrives first. The cancellation penalty
+(`model.track_cancel`, `cancel_weight`) trains against exactly that.
+
+### Diagnostics and calibrated readout
+
+Every scoring also reports, per layer of the quantized network: the share of neuron-steps
+that are order-sensitive (excitation alone reaches threshold, the step's net input does
+not), the cancelled drive per neuron-step and the mean |weight| (both in thresholds).
+
+`emulated_cal` / `chip_cal`: a linear readout fitted to the emulated chip's output spikes on
+the training trials (ridge strength chosen on the validation trials; kept only if it beats
+the model's own readout there) and applied to the test trials. Like the EMA and population
+readout, it runs on the host, so it can be deployed as is. `--no_calibrate` skips it.
+
+Re-running `run` on an existing `--out_dir` re-scores the saved models with all of this,
+without retraining.
 
 ## Reading the results
 

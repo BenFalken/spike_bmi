@@ -1,8 +1,9 @@
 """
 Figures for lab.py run (also: python plots.py <out_dir> to redraw from results.json).
 
-    lab_rmse.png    RMSE of every regime as PyTorch, quantized, emulated chip and
-                    (when run) the real chip; the prediction slope of the chip
+    lab_rmse.png    RMSE of every regime as PyTorch, quantized, emulated chip (with
+                    the model's readout and with one calibrated on the emulated chip)
+                    and, when run, the real chip; the prediction slope of the chip
                     versions on the quantized network under each group
     lab_rates.png   spikes per neuron per timestep by layer, one panel per regime
 """
@@ -16,10 +17,12 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
-# Reference palette (dataviz skill), light mode; the four slots validated as a set.
+# Reference palette (dataviz skill), light mode; the six slots validated as a set.
 SURFACE, INK, INK_2, GRID = '#fcfcfb', '#0b0b0b', '#52514e', '#e4e3df'
 SERIES = {'pytorch': ('PyTorch', '#2a78d6', 'o'), 'quantized': ('quantized', '#eb6834', 's'),
-          'emulated': ('emulated chip', '#1baf7a', '^'), 'chip': ('Speck chip', '#eda100', 'D')}
+          'emulated': ('emulated chip', '#1baf7a', '^'),
+          'emulated_cal': ('emulated chip, calibrated readout', '#eda100', 'v'),
+          'chip': ('Speck chip', '#e87ba4', 'D'), 'chip_cal': ('Speck chip, calibrated readout', '#008300', 'P')}
 
 
 def style(ax):
@@ -58,10 +61,10 @@ def plot_rmse(results, path):
     ax.set_xticks(x, slopes, fontsize=8.5, color=INK)
     ax.set_ylim(0, top * 1.15)
     ax.set_ylabel('RMSE (velocity units)', color=INK_2, fontsize=9.5)
-    ax.legend(frameon=False, fontsize=8.5, ncol=len(versions), loc='upper left', bbox_to_anchor=(0, 1.12),
+    ax.legend(frameon=False, fontsize=8.5, ncol=min(len(versions), 3), loc='upper left', bbox_to_anchor=(0, 1.18),
               labelcolor=INK)
     fig.suptitle('Decoding accuracy by training regime: PyTorch against the chip', fontsize=11.5, color=INK,
-                 x=0.01, ha='left', y=1.06)
+                 x=0.01, ha='left', y=1.12)
     fig.text(0.01, -0.06, 'slope: chip predictions regressed on the quantized network\'s (1 = no compression).',
              fontsize=8, color=INK_2)
     fig.savefig(path, dpi=170, bbox_inches='tight', facecolor=SURFACE)

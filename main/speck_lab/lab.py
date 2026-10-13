@@ -61,7 +61,7 @@ from emulator import ChipEmulator, quantize  # noqa: E402
 from regimes import REGIMES, regime_config  # noqa: E402
 
 SCORE_FROM = 65          # first scored step of each trial (decoder_eval.BASE_NPERSEG)
-VERSIONS = ('pytorch', 'quantized', 'emulated', 'chip')
+VERSIONS = ('pytorch', 'quantized', 'emulated', 'emulated_cal', 'chip', 'chip_cal')
 
 
 # --------------------------------------------------------------------------- #
@@ -192,6 +192,10 @@ def train(cfg, train_trials, val_trials, scale, epochs, seed, log):
         else list(cfg['spike_rate_target'])
     opt = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
     lo, hi, margin = scale[:3]
+    cancel_weight = cfg.get('cancel_weight', 0.0)
+    model.track_cancel = cancel_weight > 0
+    thresholds = [float(torch.as_tensor(m.neuron.spike_threshold).reshape(-1)[0])
+                  for m in model.layers if hasattr(m, 'neuron')]
 
     def to_batch(t):
         x = torch.from_numpy(t['x'].T)[:, None, :]                                  # (T, 1, C)
@@ -201,7 +205,7 @@ def train(cfg, train_trials, val_trials, scale, epochs, seed, log):
     best, best_state, history = float('inf'), None, []
     for epoch in range(epochs):
         model.train()
-        t0, losses, rates = time.time(), [], []
+        t0, losses, rates, cancels = time.time(), [], [], []
         for i in rng.permutation(len(train_trials)):
             x, y = to_batch(train_trials[i])
             pred, _, _ = model(x)
@@ -209,6 +213,10 @@ def train(cfg, train_trials, val_trials, scale, epochs, seed, log):
                                 - unscale_velocity(y, lo, hi, margin)) ** 2).mean() + 1e-8)
             penalty, layer_rates = spike_rate_penalty(model, x.shape[0], targets)
             loss = rmse + cfg['spike_rate_weight'] * penalty
+            if cancel_weight > 0:
+                cancel = cancel_penalty(model, x.shape[0], thresholds)
+                loss = loss + cancel_weight * cancel
+                cancels.append(cancel.item())
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -221,6 +229,9 @@ def train(cfg, train_trials, val_trials, scale, epochs, seed, log):
         msg = (f"    epoch {epoch + 1}/{epochs} ({time.time() - t0:.0f} s): train RMSE {np.mean(losses):.2f}, "
                f"val RMSE {val['rmse']:.2f}, val rates [{' '.join(f'{r:.3f}' for r in val['layer_rates'])}]")
         criterion = val['rmse']
+        if cancels:
+            entry['train_cancel'] = float(np.mean(cancels))
+            msg += f", cancelled drive {np.mean(cancels):.3f}"
         if cfg.get('select') == 'emulated':
             entry['val_rmse_emulated'] = criterion = evaluate_emulated(model, val_trials, scale)
             msg += f", val RMSE emulated {criterion:.2f}"
@@ -231,6 +242,14 @@ def train(cfg, train_trials, val_trials, scale, epochs, seed, log):
     model.load_state_dict(best_state)
     model.eval()
     return model, history
+
+
+def cancel_penalty(model, n_steps, thresholds):
+    """Mean over spiking layers of the excitatory input that inhibitory input
+    cancels within a timestep, per neuron and timestep, in thresholds
+    (model.layer_cancel, recorded when model.track_cancel is set)."""
+    terms = [c / (n_steps * w * th) for c, w, th in zip(model.layer_cancel, model.layer_widths, thresholds)]
+    return sum(terms) / len(terms)
 
 
 def evaluate_pytorch(model, trials, scale):
@@ -253,6 +272,92 @@ def evaluate_emulated(model, trials, scale):
     emulator = ChipEmulator(qlayers)
     pred = np.concatenate([decode(model, emulator.run(t['x'])[-1], scale)[SCORE_FROM:] for t in trials])
     return rmse(pred, np.concatenate([t['v'][SCORE_FROM:] for t in trials]))
+
+
+def drive_diagnostics(qlayers, qseq, xs):
+    """Per spiking layer of the quantized network, stepped as in training:
+    order_sensitive = share of neuron-steps whose excitatory input alone takes
+    the membrane to threshold while the step's net input does not (the chip
+    fires on those if the excitation arrives first); cancelled = excitatory
+    input cancelled by inhibitory input within the step, per neuron-step, in
+    thresholds; multi_spike = share of neuron-steps whose net input reaches
+    2 thresholds. Plus each layer's mean |weight| in thresholds."""
+    convs = [m for m in qseq if isinstance(m, nn.Conv2d)]
+    neurons = [m for m in qseq if not isinstance(m, nn.Conv2d)]
+    n = len(qlayers)
+    acc = {k: np.zeros(n) for k in ('order_sensitive', 'cancelled', 'multi_spike')}
+    count = np.zeros(n)
+    with torch.no_grad():
+        for x in xs:
+            reset_states(qseq)
+            xt = torch.from_numpy(x.T.astype(np.float32))[:, :, None, None]
+            for t in range(len(xt)):
+                out = xt[t:t + 1]
+                for k, (conv, neuron) in enumerate(zip(convs, neurons)):
+                    w = conv.weight.reshape(conv.out_channels, -1)
+                    pre = out.reshape(-1)
+                    exc, inh = w.clamp(min=0) @ pre, -(w.clamp(max=0) @ pre)
+                    theta = qlayers[k].threshold
+                    v = getattr(neuron, 'v_mem', None)
+                    v = torch.zeros(w.shape[0]) if v is None or v.numel() != w.shape[0] else v.reshape(-1)
+                    acc['order_sensitive'][k] += float(((v + exc >= theta) & (v + exc - inh < theta)).sum())
+                    acc['cancelled'][k] += float(torch.minimum(exc, inh).sum()) / theta
+                    acc['multi_spike'][k] += float((v + exc - inh >= 2 * theta).sum())
+                    count[k] += w.shape[0]
+                    out = neuron(conv(out))
+    out = {k: (v / count).tolist() for k, v in acc.items()}
+    out['mean_abs_weight'] = [float(np.abs(layer.weight).mean() / layer.threshold) for layer in qlayers]
+    return out
+
+
+def readout_features(model, counts):
+    """What a calibrated readout reads: the EMA-smoothed output spikes (the
+    model's own cascade), as each axis's share per bin plus its log total."""
+    decay = model.temporal_decay
+    stages = [np.zeros(counts.shape[1]) for _ in range(model.temporal_decay_stages)]
+    acc = np.zeros_like(counts, dtype=float)
+    for t, x in enumerate(counts):
+        for i in range(len(stages)):
+            stages[i] = decay * stages[i] + x
+            x = stages[i]
+        acc[t] = x
+    n = acc.shape[1] // 2
+    feats = []
+    for axis in (acc[:, :n], acc[:, n:2 * n]):
+        total = axis.sum(axis=1, keepdims=True)
+        feats += [np.divide(axis, total, out=np.zeros_like(axis), where=total > 0), np.log1p(total)]
+    return np.hstack(feats)
+
+
+RIDGES = (1e-3, 1e-2, 1e-1, 1.0, 10.0)
+
+
+def fit_readout(model, train_counts, train_trials, val_counts, val_trials, scale):
+    """A linear readout (ridge, standardized features, intercept) fitted to the
+    emulated chip's output spikes on training trials, its ridge strength chosen
+    on the validation trials. Returns (function (T, n_out) counts -> (T, 2)
+    velocity, chosen ridge), or (None, None) when no ridge beats the model's
+    own readout on the validation trials."""
+    feats = np.vstack([readout_features(model, c)[SCORE_FROM:] for c in train_counts])
+    target = np.vstack([t['v'][SCORE_FROM:] for t in train_trials])
+    mean, std = feats.mean(axis=0), feats.std(axis=0)
+    std[std < 1e-3] = np.inf                    # a feature that barely varies in training is ignored
+    design = lambda f: np.hstack([(f - mean) / std, np.ones((len(f), 1))])  # noqa: E731
+    a = design(feats)
+    val_target = np.vstack([t['v'][SCORE_FROM:] for t in val_trials])
+    val_feats = design(np.vstack([readout_features(model, c)[SCORE_FROM:] for c in val_counts]))
+    best = (rmse(np.vstack([decode(model, c, scale)[SCORE_FROM:] for c in val_counts]), val_target), None, None)
+    for ridge in RIDGES:
+        reg = ridge * len(a) * np.eye(a.shape[1])
+        reg[-1, -1] = 0
+        weights = np.linalg.solve(a.T @ a + reg, a.T @ target)
+        err = rmse(val_feats @ weights, val_target)
+        if err < best[0]:
+            best = (err, weights, ridge)
+    if best[1] is None:
+        return None, None
+    weights = best[1]
+    return (lambda counts: design(readout_features(model, counts)) @ weights), best[2]
 
 
 # --------------------------------------------------------------------------- #
@@ -281,8 +386,12 @@ def slope(pred, ref):
     return float(np.mean([np.polyfit(ref[:, k], pred[:, k], 1)[0] for k in (0, 1)]))
 
 
-def score(model, trials, scale, emulator_shuffle='none', devkit=None, wait_time=0.001, log=print):
-    """Every version on the same trials."""
+def score(model, trials, scale, emulator_shuffle='none', devkit=None, wait_time=0.001, log=print,
+          calib_trials=None, calib_val_trials=None):
+    """Every version on the same trials. With calib_trials, a readout is fitted
+    to the emulated chip's output on those (training) trials, its ridge chosen
+    on calib_val_trials, and applied to the emulated chip and the chip
+    ('emulated_cal', 'chip_cal')."""
     seq = flatten(model)
     qlayers, qseq = quantize(seq)
     widths = list(model.layer_widths)
@@ -315,15 +424,34 @@ def score(model, trials, scale, emulator_shuffle='none', devkit=None, wait_time=
             except Exception:
                 pass
     preds = {v: np.concatenate([decode(model, r[-1], scale)[SCORE_FROM:] for r in rs]) for v, rs in runs.items()}
+    calibration = None
+    if calib_trials and calib_val_trials:
+        t0 = time.time()
+        readout, ridge = fit_readout(model, [emulator.run(t['x'])[-1] for t in calib_trials], calib_trials,
+                                     [emulator.run(t['x'])[-1] for t in calib_val_trials], calib_val_trials, scale)
+        calibration = {'ridge': ridge, 'train_trials': len(calib_trials), 'val_trials': len(calib_val_trials)}
+        if readout is None:
+            readout = lambda counts: decode(model, counts, scale)  # noqa: E731
+            log("    calibrated readout: none beat the model's own on the validation trials; keeping it")
+        else:
+            log(f"    readout calibrated on the emulated chip: {len(calib_trials)} training trials, "
+                f"ridge {ridge} chosen on {len(calib_val_trials)} validation trials ({time.time() - t0:.0f} s)")
+        for v in ('emulated', 'chip'):
+            if v in runs:
+                preds[v + '_cal'] = np.concatenate([readout(r[-1])[SCORE_FROM:] for r in runs[v]])
     out = {'rmse': {v: rmse(p, target) for v, p in preds.items()},
+           'drive': drive_diagnostics(qlayers, qseq, xs),
            'layer_rates': {v: layer_rates(rs) for v, rs in runs.items() if len(rs[0]) == len(widths)},
            'output_rate': {v: float(np.concatenate([r[-1] for r in rs]).mean()) for v, rs in runs.items()},
+           'mean_abs_weight_float': [float(m.weight.detach().abs().mean()) for m in seq if isinstance(m, nn.Linear)],
            'slope_vs_quantized': {v: slope(preds[v], preds['quantized']) for v in preds if v != 'quantized'},
            'synaptic_events_per_step': {v: synaptic_events_per_step(xs, rs, widths)
                                         for v, rs in runs.items() if len(rs[0]) == len(widths)},
            'input_events_per_step': float(np.mean(np.concatenate([x.sum(axis=0) for x in xs])))}
     if chip_info:
         out['chip'] = chip_info
+    if calibration:
+        out['calibration'] = calibration
     return out
 
 
@@ -411,7 +539,8 @@ def cmd_run(args):
             torch.save({'config': cfg, 'n_inputs': train_trials[0]['x'].shape[0], 'scale': scale[:3],
                         'state_dict': model.state_dict(), 'history': history}, model_path)
         log("  scoring")
-        r = score(model, test_trials, scale[:3], args.emulator_shuffle, args.speck_devkit, args.speck_wait_time, log)
+        r = score(model, test_trials, scale[:3], args.emulator_shuffle, args.speck_devkit, args.speck_wait_time, log,
+                  calib_trials=None if args.no_calibrate else train_trials, calib_val_trials=val_trials)
         result_path = os.path.join(args.out_dir, name, 'result.json')
         previous_chip = {}
         if os.path.isfile(result_path):
@@ -419,7 +548,9 @@ def cmd_run(args):
                 previous_chip = json.load(f)['scores']
         if not args.speck_devkit and 'chip' in previous_chip.get('rmse', {}):
             for key in ('rmse', 'output_rate', 'slope_vs_quantized'):     # keep an earlier chip run
-                r[key]['chip'] = previous_chip[key]['chip']
+                for v in ('chip', 'chip_cal'):
+                    if v in previous_chip.get(key, {}):
+                        r[key][v] = previous_chip[key][v]
             r['chip'] = previous_chip.get('chip')
         log("  RMSE " + ', '.join(f"{v} {x:.1f}" for v, x in r['rmse'].items())
             + " | slope vs quantized " + ', '.join(f"{v} {x:.2f}" for v, x in r['slope_vs_quantized'].items()))
@@ -447,16 +578,27 @@ def collect(out_dir):
 
 
 def print_table(results, log):
-    log("\n" + "=" * 110)
-    log(f"{'regime':16s} " + ' '.join(f"{'RMSE ' + v:>15s}" for v in VERSIONS)
+    nan = float('nan')
+    log("\n" + "=" * 118)
+    log("RMSE (cal: readout calibrated on the emulated chip, training trials)")
+    log(f"{'regime':16s} " + ' '.join(f"{v:>12s}" for v in VERSIONS)
         + f" {'slope emu':>9s} {'slope chip':>10s} {'out rate q':>10s} {'out rate emu':>12s} {'syn ev/step emu':>15s}")
     for name, res in results.items():
         r = res['scores']
-        log(f"{name:16s} " + ' '.join(f"{r['rmse'].get(v, float('nan')):15.1f}" for v in VERSIONS)
-            + f" {r['slope_vs_quantized'].get('emulated', float('nan')):9.2f}"
-            + f" {r['slope_vs_quantized'].get('chip', float('nan')):10.2f}"
+        log(f"{name:16s} " + ' '.join(f"{r['rmse'].get(v, nan):12.1f}" for v in VERSIONS)
+            + f" {r['slope_vs_quantized'].get('emulated', nan):9.2f}"
+            + f" {r['slope_vs_quantized'].get('chip', nan):10.2f}"
             + f" {r['output_rate']['quantized']:10.3f} {r['output_rate']['emulated']:12.3f}"
-            + f" {r['synaptic_events_per_step'].get('emulated', float('nan')):15.0f}")
+            + f" {r['synaptic_events_per_step'].get('emulated', nan):15.0f}")
+    if any('drive' in res['scores'] for res in results.values()):
+        log("\nQuantized network, per layer (h1 h2 h3 out): order-sensitive share of neuron-steps | "
+            "cancelled drive per neuron-step (thresholds) | mean |weight| (thresholds)")
+        fmt = lambda xs, f: ' '.join(f.format(x) for x in xs)  # noqa: E731
+        for name, res in results.items():
+            d = res['scores'].get('drive')
+            if d:
+                log(f"{name:16s} [{fmt(d['order_sensitive'], '{:.3f}')}] | [{fmt(d['cancelled'], '{:.2f}')}] | "
+                    f"[{fmt(d['mean_abs_weight'], '{:.3f}')}]")
 
 
 if __name__ == '__main__':
@@ -485,6 +627,8 @@ if __name__ == '__main__':
     r.add_argument('--speck_devkit', default=None, help='also score on the chip, e.g. speck2fdevkit:0')
     r.add_argument('--speck_wait_time', type=float, default=0.001)
     r.add_argument('--seed', type=int, default=0)
+    r.add_argument('--no_calibrate', action='store_true',
+                   help='skip the readout calibrated on the emulated chip (emulated_cal, chip_cal)')
 
     s = sub.add_parser('summary', help='table and figures from every regime already in --out_dir')
     s.add_argument('--out_dir', required=True)
