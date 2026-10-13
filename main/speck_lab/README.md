@@ -131,7 +131,8 @@ regime changes them). Two ways to raise its threshold:
 - `lab.py probe --checkpoint <trained> --snn_dataset <session> [--calibrate]`: the trained
   network with hidden layer 1's threshold (and lower bound) scaled by 1, 1.5, 2, 3
   (`--factors`, `--layers`), no retraining. Shows how far the chip gap closes and what the
-  untrained change costs in PyTorch.
+  untrained change costs in PyTorch. Add `--speck_devkit speck2fdevkit:0` to score the
+  same models on the chip (`chip`, `chip_cal`).
 - Regimes `rate10_h1thr2`, `rate10_h1thr3`: train (or fine-tune with `INIT`) with that
   threshold, so the network can recover its accuracy. Watch hidden layer 1's mean |weight|
   in thresholds: if training scales the weights back up by the same factor, the gain is lost.

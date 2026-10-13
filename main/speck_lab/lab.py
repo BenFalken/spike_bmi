@@ -546,7 +546,7 @@ def cmd_probe(args):
         model.eval()
         name = f"x{factor:g} on layer{'s' if len(args.layers) > 1 else ''} {'+'.join(str(k + 1) for k in args.layers)}"
         print(f"\n=== thresholds {name}: {[c[0] for c in constants]}", flush=True)
-        r = score(model, test_trials, scale, args.emulator_shuffle, None, 0.001, print,
+        r = score(model, test_trials, scale, args.emulator_shuffle, args.speck_devkit, args.speck_wait_time, print,
                   calib_trials=train_trials, calib_val_trials=val_trials)
         rows[name] = {'config': {'thresholds': [c[0] for c in constants]}, 'history': [], 'scores': r}
     print_table(rows, print)
@@ -706,6 +706,8 @@ if __name__ == '__main__':
     pr.add_argument('--calibrate', action='store_true',
                     help='also fit the calibrated readout (emulated_cal) on --n_train training trials')
     pr.add_argument('--emulator_shuffle', default='none', choices=['none', 'input', 'all'])
+    pr.add_argument('--speck_devkit', default=None, help='also score on the chip, e.g. speck2fdevkit:0')
+    pr.add_argument('--speck_wait_time', type=float, default=0.001)
     pr.add_argument('--output', default=None)
 
     s = sub.add_parser('summary', help='table and figures from every regime already in --out_dir')
