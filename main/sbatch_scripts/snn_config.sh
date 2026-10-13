@@ -12,11 +12,9 @@
 #                (no synaptic stage).
 #   per_session  run_snn_per_session_array.sbatch: the Speck SNN ('speck'). 256 -> 128
 #                -> 64, threshold 1.0, 2 EMA stages, no tau_syn, hard reset (soft
-#                reset loses more accuracy on the chip). hkm adds a spike-rate penalty
-#                (train_snn.py --spike-rate-weight): without it the hkm network fires
-#                ~3 spikes per output neuron per timestep, and on the chip, which
-#                updates per input event, its predictions shrink to ~1/5 of the
-#                trained network's (speck_activity_study.py).
+#                reset loses more accuracy on the chip). hkm trains the same way; its
+#                dense input is handled at deployment (hidden layer 1's threshold x2
+#                and a 3 ms wait per step on the chip, run_inference.sbatch).
 #
 # Every model trains on binarized input (train_snn.py --binarize-input, default).
 #
