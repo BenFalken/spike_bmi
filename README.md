@@ -89,6 +89,10 @@ checkpoints are never skipped over or resumed from.
    spikes land in the next step. On the chip, Jenkins at x2 scores 76.5 at 1 ms, 66.1
    at 2 ms, 62.4 at 3 ms and 59.6 at 5 ms (PyTorch 56.6; x1 stays at about 118 at any
    wait); 3 ms keeps each step within the 4 ms of data it covers.
+   `docs/speck_deployment_jenkins.png` (`main/inference/plot_speck_deployment.py`) sums
+   it up: the chip's error along the fixes, both sweeps, every factor tested, and power.
+
+   ![Speck deployment of the Jenkins SNN](docs/speck_deployment_jenkins.png)
 
    Both configurations are in `sbatch_scripts/snn_config.sh`. Every SNN trains on
    **binarized input** (spike counts clipped to 0/1, `train_snn.py --binarize-input`,
