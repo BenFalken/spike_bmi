@@ -130,8 +130,9 @@ def panel_factors(ax, d):
                 va='center', ha='left' if f['delta'] >= 0 else 'right', fontsize=8.5, color=INK)
     for group, r in group_rows.items():
         ax.text(-58, r, group, fontsize=9, fontweight='bold', color=INK, va='center')
+
     ax.set_yticks(rows)
-    ax.set_yticklabels(labels, fontsize=7.8)
+    ax.set_yticklabels(labels, fontsize=8.5)
     ax.set_ylim(rows[-1] + 0.7, -0.4)     # top to bottom
     ax.axvline(0, color=INK_2, linewidth=1)
     ax.set_xlim(-58, 32)
@@ -178,7 +179,7 @@ def main(args):
     ax_f = fig.add_subplot(grid[1, 0])
     panel_factors(ax_f, d)
     pos = ax_f.get_position()
-    ax_f.set_position([pos.x0 + 0.11, pos.y0, pos.width + 0.12, pos.height])
+    ax_f.set_position([pos.x0 + 0.04, pos.y0, pos.width + 0.19, pos.height])
     energy = grid[1, 2].subgridspec(2, 1, hspace=0.75)
     panel_energy(fig.add_subplot(energy[0]), d, 'power_mw', 'mW', 'e  Chip power')
     panel_energy(fig.add_subplot(energy[1]), d, 'energy_uj', 'µJ per timestep', 'f  Chip energy per timestep')
@@ -194,6 +195,8 @@ def main(args):
                         Patch(color=MUTED, label='ruled out'), Patch(color='#c3c2b7', label='alternative not adopted'),
                         Patch(facecolor=SURFACE, edgecolor=INK_2, hatch='///', label='estimate (not measured)')],
                loc='lower center', ncol=5, frameon=False, fontsize=8.5, bbox_to_anchor=(0.5, 0.0))
+    caption = 'd: ' + '; '.join(f"{f['label']}: {f['detail']}" for f in d['factors']) + '.'
+    fig.text(0.06, -0.005, caption, fontsize=8.5, color=INK_2, va='top', ha='left', wrap=True)
     os.makedirs(args.out_dir, exist_ok=True)
     path = os.path.join(args.out_dir, 'speck_deployment_jenkins.png')
     fig.savefig(path, dpi=150, facecolor=SURFACE, bbox_inches='tight')
