@@ -122,6 +122,23 @@ readout, it runs on the host, so it can be deployed as is. `--no_calibrate` skip
 Re-running `run` on an existing `--out_dir` re-scores the saved models with all of this,
 without retraining.
 
+### Hidden-layer-1 thresholds
+
+Hidden layer 1 takes ~32 mixed-sign input events per timestep and is where the chip's error
+starts (its order sensitivity and cancelled drive are the highest of any layer, and no rate
+regime changes them). Two ways to raise its threshold:
+
+- `lab.py probe --checkpoint <trained> --snn_dataset <session> [--calibrate]`: the trained
+  network with hidden layer 1's threshold (and lower bound) scaled by 1, 1.5, 2, 3
+  (`--factors`, `--layers`), no retraining. Shows how far the chip gap closes and what the
+  untrained change costs in PyTorch.
+- Regimes `rate10_h1thr2`, `rate10_h1thr3`: train (or fine-tune with `INIT`) with that
+  threshold, so the network can recover its accuracy. Watch hidden layer 1's mean |weight|
+  in thresholds: if training scales the weights back up by the same factor, the gain is lost.
+
+Fine-tuning keeps the regime's thresholds: a checkpoint stores its thresholds in its state
+dict, which would otherwise overwrite them on loading.
+
 ## Reading the results
 
 `results.json`, the printed table and `lab_rmse.png` give each regime's RMSE as

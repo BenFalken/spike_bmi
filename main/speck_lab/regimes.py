@@ -47,6 +47,13 @@ REGIMES = {
                        'cancel_weight': 5.0},
     'rate10_cancel20': {'spike_rate_weight': 10.0, 'spike_rate_target': [0.1, 0.1, 0.1, 0.25],
                         'cancel_weight': 20.0},
+    # rate10 with a higher hidden-layer-1 threshold: that layer takes ~32 mixed-sign
+    # input events per timestep and is where the chip's error starts. Check its mean
+    # |weight| in thresholds: training may scale the weights back up.
+    'rate10_h1thr2': {'spike_rate_weight': 10.0, 'spike_rate_target': [0.1, 0.1, 0.1, 0.25],
+                      'spike_thresholds': [2.0, 1.0, 1.0, 1.0]},
+    'rate10_h1thr3': {'spike_rate_weight': 10.0, 'spike_rate_target': [0.1, 0.1, 0.1, 0.25],
+                      'spike_thresholds': [3.0, 1.0, 1.0, 1.0]},
     # rate10, keeping the epoch whose emulated-chip validation RMSE is best.
     'rate10_emusel': {'spike_rate_weight': 10.0, 'spike_rate_target': [0.1, 0.1, 0.1, 0.25],
                       'select': 'emulated'},

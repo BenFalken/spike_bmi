@@ -121,6 +121,24 @@ def build_model(cfg, n_inputs, scale):
         velocity_lo=scale[0], velocity_hi=scale[1], velocity_margin=scale[2])
 
 
+def neuron_constants(model):
+    """[(spike_threshold, min_v_mem)] of every spiking layer."""
+    return [(float(torch.as_tensor(m.neuron.spike_threshold)), None if m.neuron.min_v_mem is None
+             else float(torch.as_tensor(m.neuron.min_v_mem))) for m in model.layers if hasattr(m, 'neuron')]
+
+
+def set_neuron_constants(model, constants):
+    for m, (threshold, min_v) in zip([m for m in model.layers if hasattr(m, 'neuron')], constants):
+        for attr, value in (('spike_threshold', threshold), ('min_v_mem', min_v)):
+            current = getattr(m.neuron, attr)
+            if value is None or current is None:
+                continue
+            if torch.is_tensor(current):
+                current.data.copy_(torch.as_tensor(value, dtype=current.dtype))
+            else:
+                setattr(m.neuron, attr, value)
+
+
 def flatten(model):
     return nn.Sequential(*[getattr(m, 'neuron', m) for m in model.layers])
 
@@ -186,7 +204,9 @@ def train(cfg, train_trials, val_trials, scale, epochs, seed, log):
         log(f"  fine-tuning from {cfg['init']}")
         from models.model_hkm import load_model_weights
         source = torch.load(cfg['init'], map_location='cpu', weights_only=False)
+        thresholds = neuron_constants(model)
         load_model_weights(model, source['model_state_dict'], neuron_type='iaf', source_description=cfg['init'])
+        set_neuron_constants(model, thresholds)  # the checkpoint's thresholds are in its state dict; keep the regime's
     n_spiking = len(model.layer_widths)
     targets = cfg['spike_rate_target'] * n_spiking if len(cfg['spike_rate_target']) == 1 \
         else list(cfg['spike_rate_target'])
@@ -500,6 +520,48 @@ def cmd_validate(args):
             json.dump({'study': args.study_json, 'emulated': rows}, f, indent=2)
 
 
+def cmd_probe(args):
+    """A trained checkpoint with chosen layers' thresholds (and lower bounds)
+    scaled, no retraining: how the chip gap and PyTorch accuracy move."""
+    ck = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    a = ck['args']
+    scale = (a['velocity_lo'], a['velocity_hi'], a['velocity_margin'])
+    cfg = regime_config('baseline')
+    cfg.update({k: a[k] for k in ('hidden_dims', 'spike_thresholds', 'n_bins', 'temporal_decay_stages',
+                                  'reset_type', 'min_vmem') if a.get(k) is not None})
+    n_in = ck['model_state_dict']['layers.0.weight'].shape[1]
+    test_trials = load_test_like(args)
+    train_trials = load_trials(args.snn_dataset, 'train', 0, args.n_train) if args.calibrate else None
+    val_trials = load_trials(args.snn_dataset, 'train', args.n_train, args.n_val) if args.calibrate else None
+    from models.model_hkm import load_model_weights
+    rows = {}
+    for factor in args.factors:
+        model = build_model(cfg, n_in, scale)
+        load_model_weights(model, ck['model_state_dict'], neuron_type='iaf', source_description=args.checkpoint)
+        constants = neuron_constants(model)
+        for k in args.layers:
+            th, mv = constants[k]
+            constants[k] = (th * factor, None if mv is None else mv * factor)
+        set_neuron_constants(model, constants)
+        model.eval()
+        name = f"x{factor:g} on layer{'s' if len(args.layers) > 1 else ''} {'+'.join(str(k + 1) for k in args.layers)}"
+        print(f"\n=== thresholds {name}: {[c[0] for c in constants]}", flush=True)
+        r = score(model, test_trials, scale, args.emulator_shuffle, None, 0.001, print,
+                  calib_trials=train_trials, calib_val_trials=val_trials)
+        rows[name] = {'config': {'thresholds': [c[0] for c in constants]}, 'history': [], 'scores': r}
+    print_table(rows, print)
+    if args.output:
+        with open(args.output, 'w') as f:
+            json.dump(rows, f, indent=2)
+        print(f"Saved {args.output}")
+
+
+def load_test_like(args):
+    trials = load_trials(args.snn_dataset, 'test', 0, args.n_test)
+    print(f"{args.snn_dataset}: {len(trials)} test trials ({sum(t['x'].shape[1] for t in trials)} steps)")
+    return trials
+
+
 def cmd_run(args):
     os.makedirs(args.out_dir, exist_ok=True)
     log_path = os.path.join(args.out_dir, 'lab.log')
@@ -630,6 +692,20 @@ if __name__ == '__main__':
     r.add_argument('--no_calibrate', action='store_true',
                    help='skip the readout calibrated on the emulated chip (emulated_cal, chip_cal)')
 
+    pr = sub.add_parser('probe', help='scale chosen layers\' thresholds of a trained checkpoint, no retraining')
+    pr.add_argument('--checkpoint', required=True)
+    pr.add_argument('--snn_dataset', required=True)
+    pr.add_argument('--layers', type=int, nargs='+', default=[0],
+                    help='spiking layers to scale, 0-based (0 = hidden 1; default)')
+    pr.add_argument('--factors', type=float, nargs='+', default=[1.0, 1.5, 2.0, 3.0])
+    pr.add_argument('--n_test', type=int, default=30)
+    pr.add_argument('--n_train', type=int, default=80)
+    pr.add_argument('--n_val', type=int, default=15)
+    pr.add_argument('--calibrate', action='store_true',
+                    help='also fit the calibrated readout (emulated_cal) on --n_train training trials')
+    pr.add_argument('--emulator_shuffle', default='none', choices=['none', 'input', 'all'])
+    pr.add_argument('--output', default=None)
+
     s = sub.add_parser('summary', help='table and figures from every regime already in --out_dir')
     s.add_argument('--out_dir', required=True)
 
@@ -641,4 +717,4 @@ if __name__ == '__main__':
         for path in plot_results(res, a.out_dir):
             print(f"Saved {path}")
     else:
-        {'validate': cmd_validate, 'run': cmd_run}[a.command](a)
+        {'validate': cmd_validate, 'run': cmd_run, 'probe': cmd_probe}[a.command](a)
