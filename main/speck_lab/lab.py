@@ -133,8 +133,17 @@ def set_neuron_constants(model, constants):
             current = getattr(m.neuron, attr)
             if value is None or current is None:
                 continue
-            if torch.is_tensor(current):
+            if torch.is_tensor(current) and current.is_floating_point():
                 current.data.copy_(torch.as_tensor(value, dtype=current.dtype))
+            elif torch.is_tensor(current):     # integer tensor (some sinabs versions): 1.5 would truncate to 1
+                replacement = torch.full_like(current, value, dtype=torch.float32)
+                for store in (m.neuron._parameters, m.neuron._buffers):
+                    if attr in store:
+                        store[attr] = nn.Parameter(replacement, requires_grad=False) if store is m.neuron._parameters \
+                            else replacement
+                        break
+                else:
+                    setattr(m.neuron, attr, replacement)
             else:
                 setattr(m.neuron, attr, value)
 
