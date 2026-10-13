@@ -551,6 +551,8 @@ def cmd_probe(args):
         rows[name] = {'config': {'thresholds': [c[0] for c in constants]}, 'history': [], 'scores': r}
     print_table(rows, print)
     if args.output:
+        if os.path.dirname(args.output):
+            os.makedirs(os.path.dirname(args.output), exist_ok=True)
         with open(args.output, 'w') as f:
             json.dump(rows, f, indent=2)
         print(f"Saved {args.output}")
