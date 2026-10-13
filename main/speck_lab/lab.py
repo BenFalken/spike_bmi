@@ -183,6 +183,7 @@ def train(cfg, train_trials, val_trials, scale, epochs, seed, log):
     n_in = train_trials[0]['x'].shape[0]
     model = build_model(cfg, n_in, scale)
     if cfg['init']:
+        log(f"  fine-tuning from {cfg['init']}")
         from models.model_hkm import load_model_weights
         source = torch.load(cfg['init'], map_location='cpu', weights_only=False)
         load_model_weights(model, source['model_state_dict'], neuron_type='iaf', source_description=cfg['init'])

@@ -48,11 +48,16 @@ for split in train test; do
         exit 1
     fi
 done
+if [ -n "${INIT:-}" ] && [ ! -f "$INIT" ]; then
+    echo "ERROR: INIT=${INIT} does not exist" >&2
+    exit 1
+fi
 mkdir -p "$OUT_DIR"
 LOG="${OUT_DIR}/run_lab_local.log"
 exec > >(tee -a "$LOG") 2>&1
 echo "=== $(date '+%F %T')  ${SNN_DATASET} -> ${OUT_DIR}"
 echo "    regimes: ${REGIMES} | chip: ${DEVKIT} | emulator order: ${SHUFFLE}"
+echo "    start: ${INIT:-from scratch}"
 
 # --- 1. emulator against the real chip (host only, about a minute) ---
 if [ "${SKIP_VALIDATE:-0}" != "1" ]; then
