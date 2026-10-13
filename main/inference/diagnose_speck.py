@@ -263,7 +263,7 @@ def diagnose_session(session, checkpoint, snn_dataset_path, results_dir, experim
 
 
 def layer_activity(checkpoint_path, snn_dataset_path, experiment, trial, start, steps,
-                   devkit=None, wait_time=0.001, raster_dt=0.1):
+                   devkit=None, wait_time=0.001, raster_dt=0.1, h1_threshold_scale=1.0):
     """Spikes of every layer over one test trial, for the PyTorch network and
     for Speck: (input (steps, C), {network label: [(steps, n) per layer]},
     trial index used). Both networks start the trial from rest and run from
@@ -286,7 +286,7 @@ def layer_activity(checkpoint_path, snn_dataset_path, experiment, trial, start, 
     layers = {'PyTorch SNN': speck.run_layers(snn_seq, spikes)}
     if devkit:
         device = speck.open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt,
-                                  monitor_all=True)
+                                  monitor_all=True, h1_threshold_scale=h1_threshold_scale)
         try:
             device.reset()
             device.run(spikes, 2 * model.n_bins)
@@ -488,7 +488,7 @@ def save_layer_activity(args, root, dataset_root, results_dir, session):
     inputs, layers, trial = layer_activity(
         checkpoint, os.path.join(dataset_root, session), args.experiment, figure_trial,
         args.figure_start, args.figure_steps, args.speck_devkit, args.speck_wait_time,
-        args.speck_raster_dt)
+        args.speck_raster_dt, args.speck_h1_threshold_scale)
     title = f'Spike Density by Layer ({session}, test trial {trial})'
     fig = layer_activity_figure(inputs, layers, args.figure_bin, title)
     path = os.path.join(results_dir, f'speck_layer_activity_{session}.png')
@@ -532,4 +532,6 @@ if __name__ == '__main__':
                              "layer monitored; default: emulate the quantized network on the host")
     figure.add_argument('--speck_wait_time', type=float, default=0.001)
     figure.add_argument('--speck_raster_dt', type=float, default=0.1)
+    figure.add_argument('--speck_h1_threshold_scale', type=float, default=1.0,
+                        help='as test_all_decoders.py: hidden layer 1 threshold factor on the chip')
     main(parser.parse_args())

@@ -72,13 +72,18 @@ checkpoints are never skipped over or resumed from.
    threshold 1.0, 2 EMA stages, no `tau_syn` (the chip has no synaptic stage), hard reset
    (soft reset loses more accuracy on the chip; see below), trained
    per session from scratch. At most 50 epochs for bmi, 20 for hkm.
-   For hkm, a spike-rate penalty (`train_snn.py --spike-rate-weight 10`, targets 0.1
-   spikes per neuron per timestep in each hidden layer and 0.25 at the output) keeps the
-   network sparse: trained without it, the Jenkins model fired about 3 spikes per output
-   neuron per timestep, and on the chip its predictions shrank to about a fifth of the
-   trained network's (`inference/speck_activity_study.py`).
    → `snn_checkpoints/<exp>/<subject>/per_session_binarized/<session>/`
-   (hkm: `per_session_binarized_ratereg/`)
+   For hkm, trained the same way but deployed with **hidden layer 1's threshold (and
+   lower bound) doubled on the chip** (`run_inference.sbatch` `SPECK_H1_SCALE`, default 2
+   for hkm; `test_all_decoders.py --speck_h1_threshold_scale`). The chip updates a
+   neuron after every input event, so with hkm's dense input (about 32 events per
+   timestep against 6 for Indy) the excitatory events of a timestep can fire hidden
+   layer 1 before its inhibitory ones arrive, where training, which sums the timestep
+   first, stays silent. The extra spikes pass down the network, roughly double the
+   output firing and shrink the predictions to about a fifth (Jenkins: RMSE 118 on the
+   chip against 57 in PyTorch). Doubling the threshold there removes most of it (emulated
+   chip 57.5, about 44% fewer synaptic events) without retraining; a spike-rate penalty
+   or training at the higher threshold did worse (`main/speck_lab/`).
 
    Both configurations are in `sbatch_scripts/snn_config.sh`. Every SNN trains on
    **binarized input** (spike counts clipped to 0/1, `train_snn.py --binarize-input`,

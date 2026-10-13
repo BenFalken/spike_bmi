@@ -15,7 +15,7 @@
 # Checkpoints (defaults; see run_snn_pooled_*.sbatch and run_snn_per_session_array.sbatch):
 #   'snn'    ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/loso_finetuned_binarized_soft/<session>/
 #   'speck'  ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/per_session_binarized/<session>/
-#            (hkm: per_session_binarized_ratereg, trained with the spike-rate penalty)
+#            (hkm: deployed with hidden layer 1's threshold x2, SPECK_H1_SCALE)
 # Sessions are those with an 'snn' checkpoint; a session without a 'speck'
 # checkpoint is evaluated without 'speck'.
 #
@@ -59,6 +59,7 @@
 #   DATA_ROOT=~/data VENV=~/speck-env bash run_inference.sbatch --local bmi indy
 #   (--local and --report without DATA_ROOT use the data/ folder next to main/, if there is one)
 #   SPECK_WAIT_TIME=0.005 ...   seconds the chip gets per timestep before its output is read
+#   SPECK_H1_SCALE=1 ...        hidden layer 1 threshold factor on the chip (default 2 for hkm, 1 for bmi)
 #   Only rebuild the report:  bash run_inference.sbatch --report bmi indy
 #   (training-duration results missing from sessions/*.json are kept from the
 #   existing combined_metrics_durations.json, or taken from DURATIONS_JSON=...)
@@ -75,7 +76,7 @@ set -eo pipefail
 # Settings this script reads from the environment (see the examples above).
 SETTINGS="DATA_ROOT VENV DECODERS TRAIN_DURATIONS MACHINE SNN_CHECKPOINT_ROOT SNN_CHECKPOINT_SUBDIR
           SPECK_CHECKPOINT_ROOT SPECK_CHECKPOINT_SUBDIR RESULTS_DIR FIGURES FIGURE_DECODERS
-          SPECK_WAIT_TIME ENERGY_METER_NUM_THREADS DURATIONS_JSON LEGACY_HKM SPIKE_DENSITY"
+          SPECK_WAIT_TIME SPECK_H1_SCALE ENERGY_METER_NUM_THREADS DURATIONS_JSON LEGACY_HKM SPIKE_DENSITY"
 
 case "${1:-}" in
     --submit|--local|--report|--figures)
@@ -169,8 +170,11 @@ MODEL_CACHE_ROOT="${DATA_ROOT}/results/model_cache/${EXPERIMENT}/${SUBJECT}"
 SNN_CHECKPOINT_ROOT="${SNN_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/loso_finetuned_binarized_soft}"
 SNN_CHECKPOINT_SUBDIR="${SNN_CHECKPOINT_SUBDIR:-}"
 # 'speck' needs a deployable network (no tau_syn): the per-session models.
-SPECK_SUFFIX=$([ "$EXPERIMENT" = "hkm" ] && echo _ratereg || true)
-SPECK_CHECKPOINT_ROOT="${SPECK_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/per_session_binarized${SPECK_SUFFIX}}"
+SPECK_CHECKPOINT_ROOT="${SPECK_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/per_session_binarized}"
+# hkm's dense input fires hidden layer 1 far more on the chip (each event can
+# fire a neuron at once) than in training; doubling that layer's threshold on
+# the chip removes most of it (main/speck_lab/). The trained model is unchanged.
+SPECK_H1_SCALE="${SPECK_H1_SCALE:-$([ "$EXPERIMENT" = "hkm" ] && echo 2 || echo 1)}"
 SPECK_CHECKPOINT_SUBDIR="${SPECK_CHECKPOINT_SUBDIR:-}"
 if [ "$EXPERIMENT" = "hkm" ]; then
     SNN_DATASET_ROOT="${DATA_ROOT}/snn_datasets/${EXPERIMENT}/${SUBJECT}/mua"          # whole trials
@@ -191,7 +195,7 @@ show_settings() {
         echo "Figures (from saved predictions) for: ${FIGURE_DECODERS:-every decoder}"
     elif [ "${MODE:-}" != "report" ]; then
         echo "SNN checkpoints: ${SNN_CHECKPOINT_ROOT}${SNN_CHECKPOINT_SUBDIR:+ (/<session>/${SNN_CHECKPOINT_SUBDIR})}"
-        [[ ",$DECODERS," == *,speck,* ]] && echo "Speck checkpoints: ${SPECK_CHECKPOINT_ROOT}${SPECK_CHECKPOINT_SUBDIR:+ (/<session>/${SPECK_CHECKPOINT_SUBDIR})}"
+        [[ ",$DECODERS," == *,speck,* ]] && echo "Speck checkpoints: ${SPECK_CHECKPOINT_ROOT}${SPECK_CHECKPOINT_SUBDIR:+ (/<session>/${SPECK_CHECKPOINT_SUBDIR})}, hidden layer 1 threshold x${SPECK_H1_SCALE} on the chip"
         echo "Decoders: ${DECODERS}${FIGURES:+; figures for ${FIGURE_DECODERS:-every decoder}}"
     fi
     [ "${LEGACY_HKM:-}" = "1" ] && echo "LEGACY_HKM=1: ${EVAL_SCRIPT} (trials matched by velocity)"
@@ -277,6 +281,7 @@ run_session() {  # run_session SESSION_ID
         --train_durations "$TRAIN_DURATIONS" \
         --machine "$MACHINE" \
         ${SPECK_WAIT_TIME:+--speck_wait_time "$SPECK_WAIT_TIME"} \
+        --speck_h1_threshold_scale "$SPECK_H1_SCALE" \
         "${figure_args[@]}"
 }
 
@@ -298,6 +303,7 @@ if [ "${RUN:-}" = "--local" ]; then
             --data_root "$DATA_ROOT" --snn_checkpoint_root "$SPECK_CHECKPOINT_ROOT" \
             --snn_checkpoint_subdir "$SPECK_CHECKPOINT_SUBDIR" --results_dir "$RESULTS_DIR" \
             --figure_session all --speck_devkit speck2fdevkit:0 \
+            --speck_h1_threshold_scale "$SPECK_H1_SCALE" \
             ${SPECK_WAIT_TIME:+--speck_wait_time "$SPECK_WAIT_TIME"}
     fi
     exit 0

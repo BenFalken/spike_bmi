@@ -17,7 +17,6 @@
 #   (hkm: sessions under snn_datasets/hkm/<subject>/mua)
 #
 # Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/per_session_binarized/<session>/
-#              (hkm: per_session_binarized_ratereg, with the spike-rate penalty; snn_config.sh)
 # These are the 'speck' checkpoints of run_inference.sbatch.
 # Re-submitting skips finished sessions and resumes interrupted ones.
 

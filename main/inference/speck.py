@@ -96,6 +96,32 @@ def discretized_sequential(network):
     return nn.Sequential(*[m for pair in pairs for m in pair])
 
 
+def scale_first_threshold(snn_seq, factor):
+    """A copy of snn_seq with the first neuron layer's threshold and lower
+    bound multiplied by factor. On the chip each input event can fire a
+    neuron at once, so excitatory events arriving before the inhibitory ones
+    of the same timestep make dense input (hkm) fire hidden layer 1 where
+    training stays silent; a higher threshold there (x2 for hkm, measured in
+    speck_lab/) removes most of that excess firing."""
+    import copy
+    seq = copy.deepcopy(snn_seq)
+    if factor == 1:
+        return seq
+    neuron = next(m for m in seq if not isinstance(m, (nn.Linear, nn.Conv2d, nn.Flatten)))
+    for attr in ('spike_threshold', 'min_v_mem'):
+        value = getattr(neuron, attr, None)
+        if value is None:
+            continue
+        scaled = torch.as_tensor(value).float() * factor   # integer tensors would truncate (-1.5 -> -1)
+        if attr in neuron._parameters:
+            neuron._parameters[attr] = nn.Parameter(scaled, requires_grad=False)
+        elif attr in neuron._buffers:
+            neuron._buffers[attr] = scaled
+        else:
+            setattr(neuron, attr, scaled if torch.is_tensor(value) else float(scaled))
+    return seq
+
+
 def reset_states(seq):
     """sinabs.reset_states(seq), after replacing any neuron state a run left
     as a view of another tensor (sinabs cannot reset those in place: "Can't
@@ -302,15 +328,20 @@ class SpeckDevkit:
 # Test set
 # --------------------------------------------------------------------------- #
 
-def open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt, monitor_all=False):
+def open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt, monitor_all=False,
+               h1_threshold_scale=1.0):
     """Check the checkpoint can be deployed, cross-check the flattened
-    network on the first test trial, and deploy it."""
+    network on the first test trial, and deploy it, with the first neuron
+    layer's threshold scaled by h1_threshold_scale (scale_first_threshold())."""
     check_deployable(model, checkpoint)
     snn_seq = flatten_snn(model)
     snn_seq.eval()
     first = _load_pickle(snn_test_files(snn_dataset_path)[0])['input_spikes']
     cross_check_flattened(model, snn_seq, snn_input(model, first))
-    return SpeckDevkit(snn_seq, model.layers[0].in_features, devkit, wait_time, raster_dt, monitor_all)
+    if h1_threshold_scale != 1:
+        print(f"  [speck] hidden layer 1 threshold and lower bound x{h1_threshold_scale:g}")
+    return SpeckDevkit(scale_first_threshold(snn_seq, h1_threshold_scale), model.layers[0].in_features,
+                       devkit, wait_time, raster_dt, monitor_all)
 
 
 def predict_speck_test_set(model, velocity_scale, trials, device, experiment, continuous_stream=False):

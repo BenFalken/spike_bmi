@@ -77,7 +77,7 @@ pin_torch_threads()
 
 from decoder_eval import (ALL_DECODERS, DEFAULT_CI_N_SPLITS, available_decoders,  # noqa: E402
                           checkpoint_id, duration_checkpoint_path, evaluate_decoders,
-                          snn_checkpoints, test_split_start)
+                          snn_checkpoints, speck_h1_threshold_scale, test_split_start)
 from profiling import profile_decoders  # noqa: E402
 
 
@@ -103,7 +103,11 @@ def changed_checkpoints(full, args, decoders):
     (results recorded before checkpoints were stored count as unchanged)."""
     recorded = full.get('checkpoints') or {}
     current = snn_checkpoints(args.snn_checkpoint_path, args.speck_checkpoint_path)
-    return [d for d in recorded if d in decoders and checkpoint_id(recorded[d]) != checkpoint_id(current[d])]
+    changed = [d for d in recorded if d in decoders and checkpoint_id(recorded[d]) != checkpoint_id(current[d])]
+    if ('speck' in recorded and 'speck' in decoders and 'speck' not in changed
+            and full.get('speck_h1_threshold_scale', 1.0) != speck_h1_threshold_scale(args)):
+        changed.append('speck')     # same checkpoint, deployed with another hidden-layer-1 threshold
+    return changed
 
 
 def _json_ready(result):
@@ -313,6 +317,9 @@ def build_parser():
                        help='Seconds to wait after each timestep\'s input before reading output spikes')
     speck.add_argument('--speck_raster_dt', type=float, default=0.1,
                        help='dt passed to ChipFactory.raster_to_events()')
+    speck.add_argument('--speck_h1_threshold_scale', type=float, default=1.0,
+                       help='Multiply hidden layer 1\'s threshold and lower bound on the chip (2 for hkm: '
+                            'its dense input otherwise fires that layer far more than in training)')
 
     prof = parser.add_argument_group('profiling')
     prof.add_argument('--machine', default='cluster' if 'SLURM_JOB_ID' in os.environ else 'local',

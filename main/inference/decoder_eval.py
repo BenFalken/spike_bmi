@@ -413,12 +413,17 @@ def predict_speck_test_set(model, checkpoint, velocity_scale, trials, cfg):
     timing and power), see speck.py."""
     import speck
     device = speck.open_speck(model, checkpoint, cfg.snn_dataset_path, cfg.speck_devkit,
-                              cfg.speck_wait_time, cfg.speck_raster_dt)
+                              cfg.speck_wait_time, cfg.speck_raster_dt,
+                              h1_threshold_scale=speck_h1_threshold_scale(cfg))
     try:
         return speck.predict_speck_test_set(model, velocity_scale, trials, device,
                                             cfg.experiment, cfg.continuous_snn_test_stream)
     finally:
         device.close()
+
+
+def speck_h1_threshold_scale(cfg):
+    return float(getattr(cfg, 'speck_h1_threshold_scale', 1.0) or 1.0)
 
 
 def snn_checkpoints(snn_checkpoint_path, speck_checkpoint_path=None):
@@ -637,6 +642,7 @@ def evaluate_decoders(data, cfg, decoders, duration_minutes=None, snn_checkpoint
             'start_raw': start, 'end_raw': end, 'n_samples': n,
             'decoders': list(aligned), 'metrics': metrics,
             'checkpoints': {name: checkpoints[name] for name in snn_preds},
+            **({'speck_h1_threshold_scale': speck_h1_threshold_scale(cfg)} if 'speck' in snn_preds else {}),
             'snn_row_offset': snn_row_offset,
             'arrays': {'y_true': y_true, 'y_pos': data['y_test_pos'][start:end], 'pred': aligned,
                        'speck_counts': speck_counts if 'speck' in aligned else None,

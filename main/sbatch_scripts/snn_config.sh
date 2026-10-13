@@ -33,13 +33,8 @@ POOL_SCRIPT="../preprocessing_training/build_pretraining_pool.py"
 # bmi: grouped datasets, batches of 20 equal-length trials.
 # hkm: whole-trial datasets of different lengths, one trial per batch.
 case "$EXPERIMENT" in
-    hkm) DATASET_SUBDIR="mua"; BATCH_SIZE=1
-         # per_session only: weight, then the target rate (spikes per neuron per
-         # timestep) of each spiking layer, hidden 1-3 and output
-         PER_SESSION_RATE_ARGS=(--spike-rate-weight 10 --spike-rate-target 0.1 0.1 0.1 0.25)
-         PER_SESSION_SUFFIX="_ratereg" ;;
-    *)   DATASET_SUBDIR="mua_8_group"; BATCH_SIZE=20
-         PER_SESSION_RATE_ARGS=(); PER_SESSION_SUFFIX="" ;;
+    hkm) DATASET_SUBDIR="mua"; BATCH_SIZE=1 ;;
+    *)   DATASET_SUBDIR="mua_8_group"; BATCH_SIZE=20 ;;
 esac
 SNN_DATASET_ROOT="${DATA_ROOT}/snn_datasets/${EXPERIMENT}/${SUBJECT}/${DATASET_SUBDIR}"
 CHECKPOINT_BASE="${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}"
@@ -53,10 +48,9 @@ esac
 # Checkpoint directories end in _binarized (binarized input), and the
 # fine-tuned ones in _binarized_soft (soft reset), so they never meet the
 # checkpoints of earlier runs, which the skip/resume checks would otherwise take
-# for this pipeline's. hkm per-session models trained with the spike-rate
-# penalty go to per_session_binarized_ratereg.
+# for this pipeline's.
 FINETUNE_ROOT="${CHECKPOINT_BASE}/${POOL_KIND}_finetuned_binarized_soft"
-PER_SESSION_ROOT="${CHECKPOINT_BASE}/per_session_binarized${PER_SESSION_SUFFIX}"
+PER_SESSION_ROOT="${CHECKPOINT_BASE}/per_session_binarized"
 
 # select_model pooled_pretrain|pooled|per_session -> the network and training
 # controls (pooled_pretrain: the pooled network with hard reset).
@@ -85,8 +79,6 @@ select_model() {
     EXP_NAME="bmi_iaf_${RESET_TYPE}"   # file prefix train_snn.py uses (bmi_{neuron}_{reset})
     TAU_SYN_ARGS=()
     [ ${#TAU_SYN[@]} -gt 0 ] && TAU_SYN_ARGS=(--tau-syn "${TAU_SYN[@]}")
-    RATE_ARGS=()
-    [ "$1" = "per_session" ] && RATE_ARGS=("${PER_SESSION_RATE_ARGS[@]}")
     TRAIN_ARGS=(
         --config "$CONFIG_YAML"
         --spike-fn multi
@@ -106,9 +98,8 @@ select_model() {
         --hidden-dims "${HIDDEN_DIMS[@]}"
         --spike-thresholds "${THRESHOLDS[@]}"
         "${TAU_SYN_ARGS[@]}"
-        "${RATE_ARGS[@]}"
     )
-    MODEL_DESC="$1: hidden=${HIDDEN_DIMS[*]} reset=${RESET_TYPE} thresholds=${THRESHOLDS[*]} tau_syn=${TAU_SYN[*]:-none} batch=${BATCH_SIZE} epochs<=${EPOCHS}${RATE_ARGS[*]:+ ${RATE_ARGS[*]}}"
+    MODEL_DESC="$1: hidden=${HIDDEN_DIMS[*]} reset=${RESET_TYPE} thresholds=${THRESHOLDS[*]} tau_syn=${TAU_SYN[*]:-none} batch=${BATCH_SIZE} epochs<=${EPOCHS}"
 }
 
 # Pretraining pool and checkpoint directory; per held-out session with LOSO=1.
