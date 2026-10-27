@@ -12,18 +12,18 @@ and correlation), latency per sample, and energy per sample:
 | `kf` | Kalman filter |
 | `wf` | Wiener filter |
 | `lstm`, `qrnn` | recurrent networks (TensorFlow) |
-| `snn` | feedforward integrate-and-fire SNN (sinabs, PyTorch) with an EMA readout |
-| `speck` | the same SNN, quantized and deployed to a Speck2f devkit |
+| `snn` | recurrent LSNN (PyTorch): 2 × 256 recurrent integrate-and-fire, 90% adaptive, pretrained across sessions (LOSO) and fine-tuned; `MODEL=pooled` gives the earlier feedforward SNN with an EMA readout |
+| `speck` | a feedforward SNN (256 → 128 → 64), quantized and deployed to a Speck2f devkit |
 
 ## Layout
 
 ```
 main/
   preprocessing_training/  raw data -> datasets; trains and evaluates KF, WF, LSTM, QRNN
-  nwb_conversion/          datasets for trial-structured NWB sessions (experiment "hkm")
+  nwb_conversion/          datasets for the trial-structured NWB sessions (experiment "hkm")
   bmi/                     shared decoding code: preprocessing, decoders, CV loop, metrics
   snn_training/            train_snn.py: trains the SNN
-  models/                  SNN model definitions (model_bmi.py, model_hkm.py)
+  models/                  SNN model definitions (model_bmi_lsnn.py: the LSNN; model_bmi.py, model_hkm.py)
   utils/                   early stopping, checkpoints, training curves for train_snn.py
   inference/               evaluation of every decoder, the report, Speck deployment and diagnosis
   sbatch_scripts/          Slurm jobs for every stage (most also run locally with bash)
@@ -37,73 +37,202 @@ it. Data live under one root (`BMI_DATA_ROOT` / `DATA_ROOT`), laid out as
 
 ## Workflow
 
-1. **Datasets and classical/DL decoders.** `preprocessing_training/single_subject_pipeline.py`
-   runs one session end to end: raw `.mat` → binned spikes and kinematics (4 ms bins) →
-   ANN and SNN datasets → KF, WF, LSTM and QRNN, trained on all data and per training
-   duration. On the cluster: `sbatch_scripts/run_bmi_subject_pipeline_array.sbatch`.
-   Every stage skips outputs that already exist.
-2. **SNN training.** `snn_training/train_snn.py`, driven by:
-   - `run_snn_sweep.sbatch`: an architecture/hyperparameter sweep, per session
-     (`--plan`, then submit the printed command).
-   - `run_snn_pooled_pretrain.sbatch`, then `run_snn_pooled_finetune_array.sbatch`:
-     pretrain the "medium" network (256 → 128) on all sessions of a subject, then
-     fine-tune it per session. `RESET_TYPE=hard|soft` and `TAU_SYN` select the variant
-     (`snn_medium_config.sh`).
-3. **Inference and report.** `bash sbatch_scripts/run_inference.sbatch --submit bmi indy`
-   evaluates every decoder on every session (`inference/test_all_decoders.py`), then builds
-   `combined_metrics*.json` and the efficiency, energy and 4x2 comparison figures
-   (`inference/make_report.py`).
+The final pipeline, run the same way for all four subjects: bmi `indy` and `loco`
+(continuous `.mat` sessions), hkm `jenkins` and `nitschke` (NWB sessions of separate
+reaches; see [HKM](#hkm-jenkins-nitschke) for what differs). Steps 1–4 run on the
+cluster, step 5 on the Speck-connected laptop, so every decoder's speed, energy and
+accuracy is measured on one platform.
+
+**All training in one command:** `bash sbatch_scripts/train_all.sh` submits steps 1–4
+for bmi `indy`, bmi `loco` and hkm `jenkins` (`SUBJECTS="exp:subject ..."` changes the
+list) as Slurm jobs chained by dependencies; `DRY_RUN=1` prints them instead. Re-running
+it resumes (cancel its pending jobs first). New SNN checkpoints go to `*_binarized`
+directories (the soft-reset fine-tuned ones to `*_binarized_soft`), so earlier runs'
+checkpoints are never skipped over or resumed from.
+
+1. **Datasets, KF, WF, LSTM, QRNN.** `preprocessing_training/single_subject_pipeline.py`
+   runs one session: raw data → binned spikes and kinematics (4 ms bins) → ANN and SNN
+   datasets → each decoder fit once on the session's training split. No cross-validation
+   folds and no per-duration models by default (`--cv_folds 2`, `--durations 1,2,...,10`
+   add them). Arrays: `run_bmi_subject_pipeline_array.sbatch`; for hkm first
+   `nwb_conversion/run_hkm_nwb_pipeline_array.sbatch`, then
+   `run_hkm_subject_pipeline_array.sbatch`. Every stage skips outputs that already exist.
+2. **Velocity scalers** (once, after the SNN datasets exist):
+   `python compute_velocity_scalers.py --snn-datasets-root $DATA_ROOT/snn_datasets
+   --output ../snn_training/velocity_scalers.json` (merged into the file).
+3. **SNN for PyTorch ('snn'):** `run_snn_pooled_pretrain.sbatch`, then
+   `run_snn_pooled_finetune_array.sbatch` (chained per session; see the pretrain script's
+   header). By default (`MODEL=lsnn`) the recurrent LSNN (`models/model_bmi_lsnn.py`,
+   `train_snn.py --arch lsnn`), ported from the speech decoder: 2 × 256 recurrent
+   integrate-and-fire neurons, 90% with threshold adaptation (500 ms), a synaptic filter per
+   neuron (20 ms–1.3 s), soft reset, at most 3 spikes per step, a linear readout of both
+   layers through two leaky stages; about 223 k parameters. Trained on single sessions it
+   beat the network below on 3 of 4 indy sessions (mean velocity error 54.7 vs 57.2) at
+   about 0.03 spikes per neuron per step and 2.5× less CPU time per step
+   (`snn_training/compare_lsnn.py`, `run_sessions_local.sh`); `snn_training/compare_loso.py`
+   compares the two after LOSO pretraining and fine-tuning.
+   `MODEL=pooled` gives the earlier network: 512 → 256 → 128, threshold 1.0, 2 EMA stages,
+   `tau_syn` initialized at 2, 4, 8 and 16 over the four spiking layers and trained;
+   pretrained with hard reset, fine-tuned with soft reset (`--unit-gain-syn true` keeps its
+   synaptic filters from amplifying their input, 1.5× to 15.5× by layer otherwise).
+   Leave-one-session-out by default
+   (`LOSO=1`): session i is fine-tuned from a model pretrained on every other session, so
+   its own data never reaches pretraining. At most 50 epochs per stage for bmi, 10 for hkm.
+   → `snn_checkpoints/<exp>/<subject>/lsnn_loso_finetuned_binarized/<session>/`
+   (`MODEL=pooled`: `.../loso_finetuned_binarized_soft/<session>/`)
+4. **SNN for Speck ('speck'):** `run_snn_per_session_array.sbatch`. 256 → 128 → 64,
+   threshold 1.0, 2 EMA stages, no `tau_syn` (the chip has no synaptic stage), hard reset
+   (soft reset loses more accuracy on the chip; see below), trained
+   per session from scratch. At most 50 epochs for bmi, 20 for hkm.
+   → `snn_checkpoints/<exp>/<subject>/per_session_binarized/<session>/`
+   For hkm, trained the same way but deployed with **hidden layer 1's threshold (and
+   lower bound) doubled on the chip** (`run_inference.sbatch` `SPECK_H1_SCALE`, default 2
+   for hkm; `test_all_decoders.py --speck_h1_threshold_scale`). The chip updates a
+   neuron after every input event, so with hkm's dense input (about 32 events per
+   timestep against 6 for Indy) the excitatory events of a timestep can fire hidden
+   layer 1 before its inhibitory ones arrive, where training, which sums the timestep
+   first, stays silent. The extra spikes pass down the network, roughly double the
+   output firing and shrink the predictions to about a fifth (Jenkins: RMSE 118 on the
+   chip against 57 in PyTorch). Doubling the threshold there removes most of it (emulated
+   chip 57.5, about 44% fewer synaptic events) without retraining; a spike-rate penalty
+   or training at the higher threshold did worse (`main/speck_lab/`). hkm also waits
+   3 ms per timestep for the chip's output (`SPECK_WAIT_TIME`, 1 ms for bmi): with
+   about 31 input events per step the chip is not done after 1 ms, and late output
+   spikes land in the next step. On the chip, Jenkins at x2 scores 76.5 at 1 ms, 66.1
+   at 2 ms, 62.4 at 3 ms and 59.6 at 5 ms (PyTorch 56.6; x1 stays at about 118 at any
+   wait); 3 ms keeps each step within the 4 ms of data it covers.
+   `docs/speck_deployment_jenkins.png` (`main/inference/plot_speck_deployment.py`) sums
+   it up: the chip's error along the fixes, both sweeps, every factor tested, and power.
+
+   ![Speck deployment of the Jenkins SNN](docs/speck_deployment_jenkins.png)
+
+   Both configurations are in `sbatch_scripts/snn_config.sh`. Every SNN trains on
+   **binarized input** (spike counts clipped to 0/1, `train_snn.py --binarize-input`,
+   default): the chip raises a neuron's membrane once per input event, so bins of several
+   spikes drove the deployed network into runaway spiking. The setting is stored in each
+   checkpoint, and inference, profiling, the chip run and the diagnosis binarize the same
+   way (checkpoints made before it are evaluated unbinarized, as trained).
+   `run_snn_sweep.sbatch` remains for architecture sweeps.
+5. **Inference, report and Speck diagnosis**, on the laptop, per subject:
+   `bash sbatch_scripts/run_inference.sbatch --local <exp> <subject>` (e.g. `--local bmi indy`).
+   - Evaluates every decoder on every session (`inference/test_all_decoders.py`): accuracy,
+     latency and energy per sample, `speck` on the devkit. `snn` runs the
+     `lsnn_loso_finetuned_binarized` checkpoints (`MODEL=pooled`: `loso_finetuned_binarized_soft`) and `speck` the `per_session_binarized` ones (`SNN_CHECKPOINT_ROOT=`,
+     `SPECK_CHECKPOINT_ROOT=` override them).
+   - Builds the report (`inference/make_report.py`): `combined_metrics.json`,
+     `efficiency_summary.json`, and the efficiency, energy and comparison figures. The
+     comparison figure has three rows (accuracy, pairwise comparisons, accuracy over
+     time); the training-duration row is added only when durations are evaluated
+     (`TRAIN_DURATIONS=1,2,...`, which needs per-duration models) or supplied
+     (`DURATIONS_JSON=...`).
+   - Runs `inference/diagnose_speck.py` on the `per_session_binarized` checkpoints: the
+     PyTorch → quantized → chip comparison (`speck_diagnosis.json`) and every session's
+     layer spike-density figure and GIF (`speck_layer_activity_<session>.png/.gif`),
+     recorded on the devkit (`SPIKE_DENSITY=0` skips this step).
+   - The laptop needs the datasets' test splits (`inference/export_test_split.py` writes
+     test-only copies of the ANN datasets), the model bundles, both checkpoint folders and
+     `snn_datasets/.../<session>/test/`.
    - **Overriding settings:** put them after the subject, e.g.
-     `... --local bmi indy SNN_CHECKPOINT_ROOT=... FIGURES=1`. A `NAME=value` typed on a
-     shell line of its own is not seen by the script. The script prints the paths it uses.
-   - **Rebuild only the report:** `--report bmi indy`. Training-duration results that the
-     session files lack are kept from the existing `combined_metrics_durations.json` (or taken
-     from `DURATIONS_JSON=...`), so cluster durations survive a laptop report.
-   - **Redraw only the per-session figures and crosshair GIFs:**
-     `--figures bmi indy FIGURE_DECODERS=snn,speck`. This draws from the saved predictions,
-     with no evaluation and no chip. The GIF grid is two panels wide (ground truth, one panel
-     per decoder, overlay).
-4. **Speck.** On the devkit-connected laptop, `bash sbatch_scripts/run_inference.sbatch --local bmi indy`
-   runs the same evaluation in series with `speck` added. Copy the cluster's
-   `sessions/*.json` in first to extend them. `inference/export_test_split.py` writes the
-   test-only data the laptop needs. `speck` runs the SNN checkpoints unless
-   `SPECK_CHECKPOINT_ROOT` (and `SPECK_CHECKPOINT_SUBDIR`) name others. The PyTorch SNN and
-   the chip can then be scored with different checkpoints on the same test rows; a changed
-   checkpoint re-runs the full-data section.
-5. **Speck diagnosis** (no devkit needed, from `main/inference`):
-   - `diagnose_speck.py` scores each session's checkpoint as trained (`pytorch`) and as
-     quantized for the chip, next to the saved `snn` and `speck` results. It also compares
-     the chip's output spikes with the quantized network's step by step: spike ratio,
-     agreement, delay, re-decoding and a cross-validated readout re-fit. It writes
-     `speck_diagnosis.json`.
-   - `probe_speck.py` (with the devkit) measures how a single chip neuron integrates and
-     fires.
-   - `compare_speck_runs.py` draws the figure below from up to three
-     `speck_diagnosis.json` files.
+     `... --local bmi indy FIGURES=1`. A `NAME=value` typed on a shell line of its own is
+     not seen by the script. The script prints the paths it uses. `FIGURES=1` also saves
+     per-session diagnostic figures and crosshair GIFs (`FIGURE_DECODERS=snn,speck` limits
+     them).
+   - **Rebuild only the report:** `--report <exp> <subject>`. **Redraw only the per-session
+     figures** from the saved predictions (no evaluation, no chip): `--figures <exp> <subject>`.
+   - `--submit` runs the same evaluation (without the chip) as Slurm jobs.
+6. **Other Speck tools** (from `main/inference`): `probe_speck.py` (with the devkit)
+   measures how a single chip neuron integrates and fires; `compare_speck_runs.py` draws
+   one figure from up to three `speck_diagnosis.json` files.
+
+### HKM (Jenkins, Nitschke)
+
+The HKM sessions are NWB files of separate reaches: about 2000–3000 trials per
+session, with most of the recording rest between them. Each reach is therefore
+decoded as its own trial, from rest, never as part of one continuous recording.
+
+1. **Datasets.** `nwb_conversion/run_hkm_nwb_pipeline_array.sbatch` (one task per
+   session; `SUBJECT=` limits it to one subject) runs `run_nwb_pipeline.sh`:
+   - every trial becomes its own raw file, after hand-tracking glitches are removed
+     from the native position samples (`hkm_despike.py`; the Nitschke sessions hold a
+     few hundred position jumps each, which would otherwise become velocity spikes of
+     ~70,000 units/s);
+   - each trial is read from its own recording run (`nwb_pieces.py`). Several Nitschke
+     files join separate runs whose clocks restart, so the same clock time occurs in
+     several runs and the trials table's row slices point to the wrong run. The hand
+     array is cut where its clock steps back. Trials whose time only one piece covers
+     calibrate a linear hand → `hit_target_position` fit; each other trial goes to the
+     piece where the hand ends on its target (its run's majority piece, else its own
+     clear winner, else it is skipped). Spikes are cut and mapped to runs the same way,
+     and units 0/1, which are cut at the wrong place in some sessions, are re-cut.
+     Sessions of one piece (all of Jenkins) convert exactly as before.
+     `conversion_reports/<session>_conversion_report.json` records the pieces, the
+     assignment and its calibration, the trials per run and per piece, the skips and
+     the glitches. For a multi-run session, check there that `resolved_distance_median`
+     is close to `calibration.median_distance` and that no run lost most of its trials;
+   - ANN dataset: 256 ms windows at 4 ms steps within each trial, concatenated
+     (`dataset/hkm/<subject>/mua/<session>_binning.h5`). A trial of T samples gives
+     T − 65 rows, and each row records its trial;
+   - SNN dataset: one `.pkl` per whole trial, of its own length
+     (`snn_datasets/hkm/<subject>/mua/<session>/`);
+   - both hold out the same last trials as the test split (`trial_split.py`), and the
+     build fails if any velocity glitch survived.
+
+   Every run rebuilds its session from scratch. Datasets built before this version
+   lack the trial IDs inference needs, so rebuild them, then retrain every decoder.
+   Nitschke sessions built before the run-aware conversion must be rebuilt too
+   (`REBUILD=1`), even if they have trial IDs.
+2. **KF, WF, LSTM, QRNN.** `sbatch_scripts/run_hkm_subject_pipeline_array.sbatch`
+   trains them on the concatenated windows, with the train/test boundary taken from
+   the dataset (a trial boundary, so no purge gap is needed; WF uses 8 taps: 192 channels
+   × 15 taps exhausts memory). Set `OVERWRITE=1` on the first run after rebuilding the
+   datasets.
+3. **SNN.** The same scripts as bmi with `EXPERIMENT=hkm`. Trials differ in length, so
+   HKM trains with batch size 1, one trial per step with the state reset at its start. An
+   epoch takes about an hour per session, so HKM checkpoints every epoch and resumes when
+   re-submitted.
+4. **Inference.** Every SNN test trial runs from rest (the chip is reset before each,
+   about 1 s per layer), and its timesteps 65 … T − 1 are scored on that trial's own ANN
+   rows. Trials of 65 samples or fewer have no ANN rows and are not scored. The other
+   decoders are scored on the same rows. Before scoring, inference checks that the two
+   datasets hold out the same trials with the same velocity, and compares the SNN's mean
+   per-trial RMSE with the loss recorded in its checkpoint (`training_check` in the
+   session results; they match to within 0.1% for a checkpoint selected on that
+   session). The per-session figures show one trial per grid panel; the spike-density
+   figure follows the session's longest test trial.
+   - **Transition only:** datasets built before trial IDs were stored can be evaluated with
+     `LEGACY_HKM=1` (`inference/test_all_decoders_legacy_hkm.py`), which matches the SNN
+     test trials to ANN rows by velocity and writes to `results/test_all_decoders_legacy/`.
 
 ## Findings
 
+These results predate the final pipeline above: they come from earlier bmi runs
+(unbinarized input, other SNN configurations, the feedforward SNN rather than the LSNN)
+and will be replaced by its results.
+
 ### Decoders (indy, 36 sessions)
 
-- **PyTorch SNN:** `full_cohort_finetuned_optimal` checkpoints (pretrained on all sessions,
-  fine-tuned per session).
+- **PyTorch SNN:** `loso_finetuned_optimal` checkpoints (pretrained, then fine-tuned per
+  session).
 - **Speck:** per-session hard-reset checkpoints, the best case for the chip (see below).
 - **Where it ran:** everything on the Speck-connected laptop. Training durations come from
   the cluster.
 
 ![Decoder comparison, indy](docs/decoder_comparison_4x2_indy.jpg)
 
-| decoder | RMSE | CC | latency / sample | energy / sample |
-|---|---|---|---|---|
-| KF | 60.5 | 0.69 | 0.010 ms | ≈ 500 µJ (RAPL) |
-| WF | 48.0 | 0.72 | 0.05 ms | ≈ 2,000 µJ (RAPL) |
-| LSTM | 39.5 | 0.82 | ≈ 35 ms | ≈ 1.2 J (RAPL) |
-| QRNN | 37.6 | 0.83 | ≈ 35 ms | ≈ 1.2 J (RAPL) |
-| SNN (PyTorch, CPU) | **36.0** | **0.84** | ≈ 0.65 ms | ≈ 24,000 µJ (RAPL) |
-| SNN on Speck2f | 45.1 | 0.75 | ≈ 1.3 ms | **2.7 µJ** (chip power monitor) |
+| decoder | RMSE | CC | latency / sample | energy / sample | mean power |
+|---|---|---|---|---|---|
+| KF | 60.5 | 0.69 | 10.4 µs | 490 µJ (RAPL) | 45.9 W |
+| WF | 48.2 | 0.72 | 50.9 µs | 2.19 mJ (RAPL) | 42.9 W |
+| LSTM | 39.5 | 0.82 | 35.2 ms | 1.23 J (RAPL) | 34.7 W |
+| QRNN | 37.6 | 0.83 | 35.7 ms | 1.24 J (RAPL) | 34.8 W |
+| SNN (PyTorch, CPU) | **36.2** | **0.85** | 634 µs | 24 mJ (RAPL) | 37.8 W |
+| SNN on Speck2f | 45.3 | 0.75 | 1.27 ms | **2.73 µJ** (chip power monitor) | **2.15 mW** |
 
-These are means across sessions, rounded. The exact values are in
+These are means across sessions; RMSE and CC are rounded. The exact values are in
 `results/test_all_decoders/bmi/indy/` (`combined_metrics.json`, `efficiency_summary.json`).
+Energy per sample = mean power × latency per sample (see
+[How the figures were made](#how-the-figures-were-made)): the CPU decoders all draw
+35–46 W, so their energy differs mainly through their latency.
 
 **How to read the 4x2 figure**
 - **a/b:** one point per session. The box spans the quartiles, the line is the median, the
@@ -112,29 +241,34 @@ These are means across sessions, rounded. The exact values are in
   for multiple comparisons (Holm).
 - **c/d, colour:** how often the row decoder beats the column decoder across sessions.
 - **c/d, text:** the median paired difference (row − column), with Holm-corrected stars.
+- **e/f** are empty in this version: the laptop run did not carry over the cluster's
+  training-duration results. The training-data takeaways below are from the earlier report;
+  `run_inference.sbatch --report bmi indy DURATIONS_JSON=<cluster combined_metrics_durations.json>`
+  restores the panels.
 
 **Takeaways**
 - **Accuracy.** The fine-tuned SNN is the most accurate decoder on both RMSE and CC.
-  - It beats QRNN by a median 1.5 RMSE and 0.011 CC per session (RMSE p < 0.001, CC p < 0.01).
-  - It beats LSTM by 3.4 RMSE and 0.025 CC.
+  - It beats QRNN by a median 1.2 RMSE and 0.008 CC per session (RMSE p < 0.001, CC p < 0.01).
+  - It beats LSTM by 3.1 RMSE and 0.021 CC.
   - The margins over the recurrent networks are small but consistent: the SNN wins in
     most sessions.
-- **Speck.** The chip is 8.5 RMSE (0.08 CC) behind the fine-tuned SNN, but it still
-  beats both classical decoders in paired comparisons.
-  - Against WF: 2.6 RMSE better, 0.037 CC better.
-  - Against KF: 16 RMSE better.
+- **Speck.** The chip is a median 9.2 RMSE (0.08 CC) behind the fine-tuned SNN, but it
+  still beats both classical decoders in paired comparisons.
+  - Against WF: 2.5 RMSE better, 0.034 CC better.
+  - Against KF: 15 RMSE better, 0.067 CC better.
   - About 2 RMSE of the gap is the chip's own penalty: the same per-session checkpoints
     score about 43.4 in PyTorch.
   - The rest is the choice of model. The fine-tuned checkpoints lose more on the chip than
     they gain (see below).
-- **Energy.** Speck needs about 2.7 µJ per sample.
+- **Energy.** Speck needs 2.73 µJ per sample, at a mean chip power of 2.15 mW.
   - That is about 9,000× less than the SNN on the laptop CPU.
   - It is about 450,000× less than LSTM/QRNN.
   - It is about 180× less than even the Kalman filter.
   - RAPL measures the whole CPU package and the chip monitor only the chip, so these ratios
     compare deployments, not arithmetic.
-- **Latency.** Speck takes about 1.3 ms per 4 ms bin, so it keeps up in real time. The SNN
-  on CPU takes about 0.65 ms, LSTM/QRNN about 35 ms (slower than the 4 ms bins they decode).
+- **Latency.** Speck takes 1.27 ms per 4 ms bin, so it keeps up in real time; about 1 ms of
+  that is the fixed wait before its output is read (`--speck_wait_time`). The SNN on CPU
+  takes 0.63 ms, LSTM/QRNN about 35 ms (slower than the 4 ms bins they decode).
 - **Training data (e/f; KF, WF, LSTM, QRNN only).**
   - Every decoder improves with more training data, most steeply in the first 2–3 minutes.
   - LSTM and QRNN trained on 2 minutes already match WF trained on 10.
@@ -153,8 +287,8 @@ These are means across sessions, rounded. The exact values are in
 
 **Bottom line.**
 - **Off-chip:** the pretrained and fine-tuned SNN is the most accurate decoder tested. It
-  is also 50× faster than the recurrent networks and uses 50× less energy than them on the
-  same CPU.
+  is also about 55× faster than the recurrent networks and uses about 50× less energy than
+  them on the same CPU.
 - **On Speck:** the SNN decodes in real time at a few µJ per sample. It beats the
   classical decoders, at a cost of about 9 RMSE relative to the best PyTorch SNN.
 - **What limits Speck:** the chip's per-event dynamics (below), not quantization or the
@@ -216,8 +350,135 @@ The chip adds more error the more a model relies on stored state:
 | fine-tuned | fewer spikes, longer-lived sub-threshold charge | 4.4 |
 | soft reset | every spike's remainder is kept | 8.2 |
 
+### Indy against Jenkins: activity, power and energy on Speck
+
+`inference/speck_activity_study.py` ran one Jenkins session (20090912, 30 test trials)
+under five conditions; `inference/plot_speck_activity.py` draws its output
+(`docs/data/speck_activity_jenkins_20090912.json`) against the Indy numbers below.
+
+![Firing rate by layer, Indy and Jenkins](docs/speck_activity_rates.png)
+![Jenkins conditions: output rate against chip fidelity](docs/speck_activity_conditions.png)
+![Input load, chip power, latency and energy](docs/speck_activity_energy.png)
+
+- **Same relative excess, different absolute level.** On both subjects the chip fires about
+  2x the trained network at the output. Indy's network fires 0.23 spikes per output neuron
+  per timestep; Jenkins' fires 3.2, the regime in which the chip's per-event updates
+  compress its predictions to about a fifth (slope 0.21).
+- **Activity, not input, sets the chip's error.** Binarizing the input and a 5 ms wait
+  change nothing. Halving the input helps a little. Doubling the thresholds on the same
+  input (output 0.10) brings the slope to 0.85 and the chip's added RMSE from 63 to 8.
+- **Energy.** Jenkins sends about 5x as many input events per timestep (32 against 6)
+  and uses about 4x the energy per timestep (10.7 against 2.7 uJ). Compare energy, not
+  mW: the 5 ms wait lowers mean power to 2.6 mW but raises energy per timestep.
+
+### Spike density through the layers
+
+One test trial (3 s) of one session, through the per-session Speck checkpoint (96 inputs →
+256 → 128 → 64 → 36 outputs), in PyTorch (top) and recorded on the chip with every layer
+monitored (bottom). Colour is spike density, the mean over a layer's neurons of spikes per
+timestep, in 20 ms bins; each layer's mean over the trial is printed on the right.
+`speck_layer_activity_<session>.gif` animates the same data, the layers drawn left to right.
+
+![Spike density by layer, PyTorch vs. Speck](docs/speck_layer_activity_indy.png)
+
+| layer | PyTorch | Speck | Speck / PyTorch |
+|---|---|---|---|
+| input (96) | 0.054 | 0.054 | 1.0× |
+| hidden 1 (256) | 0.035 | 0.041 | 1.2× |
+| hidden 2 (128) | 0.056 | 0.078 | 1.4× |
+| hidden 3 (64) | 0.087 | 0.146 | 1.7× |
+| output (36) | 0.232 | 0.459 | 2.0× |
+
+- **The chip's excess activity builds up layer by layer.** With identical input, the first
+  hidden layer fires 1.2× as much as in PyTorch and the output 2×. That matches the
+  output-spike ratio in the table above (1.9× for the per-session run). It fits the per-event
+  dynamics described there: each layer adds a little extra firing, and the next layer
+  amplifies it.
+- **The chip's spikes arrive in bursts.** In the chip rows, every hidden and output layer
+  is silent together for one or two 20 ms bins at a time, while the input keeps arriving.
+  This was not investigated further. Because all layers drop out together, it most likely
+  reflects how the monitored events reach the host (they are counted in the timestep in
+  which they are read), not the network itself. Monitoring every layer streams all of their
+  spikes to the host, which the normal decoding run does not do.
+
+## How the figures were made
+
+Every decoder is scored on the same rows of each session's chronological test split (the
+last 10% of the session), with velocity in mm/s. The report figures are drawn by
+`inference/make_report.py` from the per-session results of `inference/test_all_decoders.py`;
+the layer-activity figure by `inference/diagnose_speck.py`.
+
+**Accuracy (4x2 figure, a–d, g–h)**
+- **RMSE:** per velocity axis over all test rows of a session, then averaged over x and y.
+- **CC:** Pearson correlation per axis, averaged over x and y.
+- **Error bars in g/h:** a 95% t-interval over 10 contiguous chunks of the test split.
+- **Statistics:** paired Wilcoxon signed-rank tests across sessions, Holm-corrected within
+  each panel. Only sessions with results for every decoder are used.
+
+**Latency** (`inference/profiling.py`; `inference/speck.py` for Speck)
+- **One prediction per call, never batched,** as a real-time decoder runs: one new 4 ms
+  sample at a time, so per-call framework overhead counts.
+- **CPU decoders:** 50 test samples (`--n_timing_samples`) are predicted one per call. After
+  untimed warm-up passes (Keras traces its graph on the first call), latency is the median
+  over 3 timed passes (2 for LSTM, QRNN and SNN) of the pass time divided by the number of
+  samples.
+- **SNN (PyTorch):** fed one timestep per forward call, with state reset only at the start
+  of a test trial.
+- **Speck:** wall time per timestep of the chip loop over the whole test split. Each step
+  writes that step's input spikes to the chip as events, waits `--speck_wait_time` (1 ms),
+  then reads the output layer's spikes. The wait is part of the latency.
+- **Threads:** math libraries are pinned to one thread on the laptop
+  (`ENERGY_METER_NUM_THREADS=1`), so the CPU decoders are timed on one core.
+- **Efficiency figure:** means across sessions, one panel per machine (here, everything ran
+  on the Speck laptop). Marker area grows with the square root of the parameter count.
+
+**Energy and power** (`inference/energy_meter.py`; `inference/speck.py` for Speck)
+- **CPU decoders, RAPL (measured):** a separate, longer block of 10 passes
+  (`--n_energy_repeats`) runs between two reads of the Intel RAPL energy counters of the CPU
+  package domains (`/sys/class/powercap/intel-rapl/intel-rapl:N/energy_uj`, domains named
+  `package-N`; platform domains such as `psys` are excluded). Energy per sample is the
+  difference divided by the number of predictions in the block. Mean power is the same
+  difference divided by the block's wall time.
+- **CPU decoders, proxy (estimated):** where RAPL cannot be read (no Intel CPU, or no read
+  permission), energy is estimated as elapsed time × the process's CPU utilisation × an
+  assumed 65 W TDP. It is only good for comparing workloads with each other, so the energy
+  figure draws proxy estimates in their own "Estimated (proxy, not measured)" panel. All
+  results above are RAPL.
+- **Speck (measured):** the devkit's power monitor samples the chip's supply rails at
+  100 Hz during the decoding loop. Mean power is the sum over rails of each rail's mean
+  sample, after checking the sample count against 100 Hz × loop time. Energy per sample is
+  mean power × loop time ÷ number of timesteps.
+- **What is included:**
+  - RAPL measures the whole CPU package: all cores, the uncore, the idle baseline and
+    anything else running. No idle baseline is subtracted, which is why every CPU decoder
+    draws 35–46 W.
+  - The chip monitor measures only the chip, not the laptop that drives it over USB or runs
+    the host-side readout.
+  - The ratios between them compare deployments, not arithmetic.
+- **Energy figure:** each bar is the mean across sessions, with a 95% CI, labelled with its
+  energy per sample and mean power.
+
+**Spike density** (`diagnose_speck.py`; `speck.run_layers()` and `SpeckDevkit(monitor_all=True)`)
+- **Trial:** one test trial of one session (`--figure_session`, `--figure_trial`; default
+  the first scored trial), first 750 timesteps (3 s; `--figure_start`, `--figure_steps`).
+  Both networks start the trial from rest.
+- **PyTorch:** the checkpoint's Linear/IAF stack is stepped one timestep at a time, and
+  every neuron layer's output spikes are recorded.
+- **Speck:** the same input is fed to the chip with monitoring enabled on every layer, and
+  each layer's spike events are counted per neuron and timestep. Events still in flight
+  after the wait are counted in a later timestep. Without a devkit, the quantized network
+  as deployed (8-bit weights, integer thresholds) is emulated on the host instead.
+- **Density:** a layer's spike counts are averaged over its neurons and over bins of 5
+  timesteps (20 ms; `--figure_bin`), giving spikes per neuron per timestep. It can exceed 1,
+  because a neuron can fire several spikes per timestep.
+- **Colour:** one sequential colour map for both networks, on a square-root scale so that
+  sparse hidden layers stay visible next to the denser output layer.
+- **GIF:** the same densities, colours and scale. Each frame is one bin, and the layers are
+  drawn left to right in the direction spikes travel, with box height following neuron
+  count. 10 frames per second (`--figure_fps`) plays the trial at one-fifth real time.
+
 ## Requirements
 
 Python 3.11 with numpy, scipy, scikit-learn, h5py, matplotlib, Pillow, PyTorch, sinabs
-(≥ 3) and TensorFlow (LSTM/QRNN). The Speck decoder also needs samna and a Speck2f devkit.
+(≥ 3) and TensorFlow (LSTM/QRNN); pynwb for the HKM conversion. The Speck decoder also needs samna and a Speck2f devkit.
 `diagnose_speck.py` and `compare_speck_runs.py` need sinabs but no devkit.

@@ -163,7 +163,7 @@ class NeuronFactory:
         min_vmem: float,
         spike_fn: Optional[Callable],
         use_squeeze: bool,
-        tau_syn: Optional[float] = None,
+        tau_syn: Optional[Union[float, List[float]]] = None,
         norm_input: bool = True,
     ):
         self.use_squeeze = use_squeeze
@@ -262,13 +262,22 @@ class _SinabsNeuronLayer(nn.Module):
     needed for 1-timestep-at-a-time processing on linear layers (standard,
     non-Squeeze case), or passing through directly for Squeeze layers."""
 
-    def __init__(self, neuron_layer: nn.Module, last_layer_reset: bool = False, is_squeeze: bool = False):
+    def __init__(self, neuron_layer: nn.Module, last_layer_reset: bool = False, is_squeeze: bool = False,
+                 unit_gain_syn: bool = False):
         super().__init__()
         self.neuron = neuron_layer
         self.last_layer_reset = last_layer_reset
         self.is_squeeze = is_squeeze
+        # unit_gain_syn: sinabs' synaptic stage, i_syn <- alpha * (i_syn + input), settles at
+        # alpha / (1 - alpha) times a constant input (1.5x at tau_syn 2 steps, 15.5x at 16);
+        # scaling the input by (1 - alpha) / alpha makes it a unit-gain low-pass filter.
+        # Only acts when the neuron has a synaptic stage (tau_syn set).
+        self.unit_gain_syn = unit_gain_syn and getattr(neuron_layer, "tau_syn", None) is not None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.unit_gain_syn:
+            alpha = self.neuron.alpha_syn_calculated
+            x = x * (1 - alpha) / alpha
         if self.last_layer_reset:
             self.neuron.reset_states()
         if self.is_squeeze:
@@ -314,6 +323,7 @@ def add_linear_block(
     spike_threshold: float = 1.0,
     override_reset_type: Optional[str] = None,
     last_layer_reset: bool = False,
+    unit_gain_syn: bool = False,
 ) -> List[nn.Module]:
     """Append: Linear -> NeuronLayer."""
     layers.append(nn.Linear(in_features, out_features, bias=False))
@@ -321,7 +331,8 @@ def add_linear_block(
     if factory.use_sj:
         layers.append(_SJNeuronLayer(raw, last_layer_reset=last_layer_reset))
     else:
-        layers.append(_SinabsNeuronLayer(raw, last_layer_reset=last_layer_reset, is_squeeze=factory.use_squeeze))
+        layers.append(_SinabsNeuronLayer(raw, last_layer_reset=last_layer_reset, is_squeeze=factory.use_squeeze,
+                                         unit_gain_syn=unit_gain_syn))
     return layers
 
 
@@ -361,11 +372,12 @@ class SNN_Speck(nn.Module):
         temporal_decay_stages: int = 1,
         num_input_channels: int = 96,
         hidden_dims: Optional[List[int]] = None,
-        tau_syn: Optional[float] = None,
+        tau_syn: Optional[Union[float, List[float]]] = None,
         norm_input: bool = True,
         velocity_lo: float = -280.56,
         velocity_hi: float = 316.54,
         velocity_margin: float = 0.05,
+        unit_gain_syn: bool = False,
     ):
         super().__init__()
         self.use_spikingjelly = use_spikingjelly
@@ -386,6 +398,11 @@ class SNN_Speck(nn.Module):
                 f"given hidden_dims={hidden_dims} -> {n_layers} layers total), "
                 f"got {len(thresholds)}")
 
+        # tau_syn: one initial value for every spiking layer, or one per layer.
+        taus = list(tau_syn) if isinstance(tau_syn, (list, tuple)) else [tau_syn] * n_layers
+        if len(taus) != n_layers:
+            raise ValueError(f"tau_syn must have 1 or {n_layers} values (one per layer), got {len(taus)}")
+
         factory = NeuronFactory(
             neuron_type=neuron_type,
             use_spikingjelly=use_spikingjelly,
@@ -404,14 +421,17 @@ class SNN_Speck(nn.Module):
         raw_layers: List[nn.Module] = []
         for i in range(n_layers):
             is_last = (i == n_layers - 1)
+            factory.tau_syn = taus[i]
             add_linear_block(
                 raw_layers, layer_widths[i], layer_widths[i + 1], factory,
                 spike_threshold=thresholds[i],
                 override_reset_type=out_rst if is_last else None,
                 last_layer_reset=last_layer_reset if is_last else False,
+                unit_gain_syn=unit_gain_syn,
             )
         self.layers = nn.ModuleList(raw_layers)
         self.total_neuron_units = sum(layer_widths[1:])
+        self.layer_widths = list(layer_widths[1:])   # neurons per spiking layer
 
         positions_init = torch.linspace(0.0, 1.0, n_bins, dtype=torch.float32)
         self.register_buffer("positions", positions_init)
@@ -563,6 +583,10 @@ class SNN_Speck(nn.Module):
         predictions_over_time = []
         final_layer_spikes = torch.zeros(1, device=x_total.device)
         total_spikes = torch.zeros(1, device=x_total.device)
+        # Spikes summed over the call, one entry per neuron layer (with
+        # gradients), for train_snn.py's per-layer --spike-rate-weight
+        # penalty; widths in self.layer_widths.
+        self.layer_spikes = []
 
         if count_ops:
             op_mac = 0
@@ -576,6 +600,7 @@ class SNN_Speck(nn.Module):
         for ts in range(T):
             x = x_total[ts]  # (N, num_input_channels)
             linear_seen = 0
+            neuron_seen = 0
             for layer in self.layers:
                 if count_ops and isinstance(layer, nn.Linear):
                     out_features = layer.out_features
@@ -609,7 +634,13 @@ class SNN_Speck(nn.Module):
                     # all. --min-vmem should still be set (as it already
                     # is in normal usage) to prevent the instability
                     # itself; this clamp is a backstop, not a substitute.
-                    total_spikes = total_spikes + x.sum().clamp(min=0)
+                    step_spikes = x.sum().clamp(min=0)
+                    total_spikes = total_spikes + step_spikes
+                    if ts == 0:
+                        self.layer_spikes.append(step_spikes)
+                    else:
+                        self.layer_spikes[neuron_seen] = self.layer_spikes[neuron_seen] + step_spikes
+                    neuron_seen += 1
                     if count_ops:
                         units = x.shape[-1]
                         if isinstance(layer, _SinabsNeuronLayer):
@@ -678,11 +709,12 @@ def create_model(
     temporal_decay_stages: int = 1,
     num_input_channels: int = 96,
     hidden_dims: Optional[List[int]] = None,
-    tau_syn: Optional[float] = None,
+    tau_syn: Optional[Union[float, List[float]]] = None,
     norm_input: bool = True,
     velocity_lo: float = -280.56,
     velocity_hi: float = 316.54,
     velocity_margin: float = 0.05,
+    unit_gain_syn: bool = False,
     **kwargs,
 ) -> SNN_Speck:
     """Factory function to create an SNN_Speck model.
@@ -734,6 +766,7 @@ def create_model(
         velocity_lo=velocity_lo,
         velocity_hi=velocity_hi,
         velocity_margin=velocity_margin,
+        unit_gain_syn=unit_gain_syn,
     )
 
     initialize_snn_model(model, weight_init)

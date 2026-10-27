@@ -181,7 +181,7 @@ class NeuronFactory:
         min_vmem: float,
         spike_fn: Optional[Callable],
         use_squeeze: bool,
-        tau_syn: Optional[float] = None,
+        tau_syn: Optional[Union[float, List[float]]] = None,
         norm_input: bool = True,
     ):
         self.use_squeeze = use_squeeze
@@ -379,7 +379,7 @@ class SNN_Speck(nn.Module):
         temporal_decay_stages: int = 1,
         num_input_channels: int = 96,
         hidden_dims: Optional[List[int]] = None,
-        tau_syn: Optional[float] = None,
+        tau_syn: Optional[Union[float, List[float]]] = None,
         norm_input: bool = True,
         velocity_lo: float = -280.56,
         velocity_hi: float = 316.54,
@@ -404,6 +404,11 @@ class SNN_Speck(nn.Module):
                 f"given hidden_dims={hidden_dims} -> {n_layers} layers total), "
                 f"got {len(thresholds)}")
 
+        # tau_syn: one initial value for every spiking layer, or one per layer.
+        taus = list(tau_syn) if isinstance(tau_syn, (list, tuple)) else [tau_syn] * n_layers
+        if len(taus) != n_layers:
+            raise ValueError(f"tau_syn must have 1 or {n_layers} values (one per layer), got {len(taus)}")
+
         factory = NeuronFactory(
             neuron_type=neuron_type,
             use_spikingjelly=use_spikingjelly,
@@ -422,6 +427,7 @@ class SNN_Speck(nn.Module):
         raw_layers: List[nn.Module] = []
         for i in range(n_layers):
             is_last = (i == n_layers - 1)
+            factory.tau_syn = taus[i]
             add_linear_block(
                 raw_layers, layer_widths[i], layer_widths[i + 1], factory,
                 spike_threshold=thresholds[i],
@@ -430,6 +436,7 @@ class SNN_Speck(nn.Module):
             )
         self.layers = nn.ModuleList(raw_layers)
         self.total_neuron_units = sum(layer_widths[1:])
+        self.layer_widths = list(layer_widths[1:])   # neurons per spiking layer
 
         positions_init = torch.linspace(0.0, 1.0, n_bins, dtype=torch.float32)
         self.register_buffer("positions", positions_init)
@@ -593,6 +600,17 @@ class SNN_Speck(nn.Module):
         predictions_over_time = []
         final_layer_spikes = torch.zeros(1, device=x_total.device)
         total_spikes = torch.zeros(1, device=x_total.device)
+        # Spikes summed over the call, one entry per neuron layer (with
+        # gradients), for train_snn.py's per-layer --spike-rate-weight
+        # penalty; widths in self.layer_widths.
+        self.layer_spikes = []
+        # With self.track_cancel (speck_lab), one entry per Linear: the
+        # excitatory input that inhibitory input cancels within the same
+        # timestep, min(W+ x, -(W- x)), summed over neurons and timesteps
+        # (with gradients). The chip integrates a timestep's events one at a
+        # time, so cancelled excitation can fire it where training stays silent.
+        track_cancel = getattr(self, 'track_cancel', False)
+        self.layer_cancel = []
 
         if count_ops:
             op_mac = 0
@@ -606,6 +624,8 @@ class SNN_Speck(nn.Module):
         for ts in range(T):
             x = x_total[ts]  # (N, num_input_channels)
             linear_seen = 0
+            neuron_seen = 0
+            cancel_seen = 0
             for layer in self.layers:
                 if count_ops and isinstance(layer, nn.Linear):
                     out_features = layer.out_features
@@ -625,6 +645,15 @@ class SNN_Speck(nn.Module):
                         # separate unit of accumulate work downstream.
                         op_acc += float(x.sum().item()) * out_features
                     linear_seen += 1
+                if track_cancel and isinstance(layer, nn.Linear):
+                    excitation = nn.functional.linear(x, layer.weight.clamp(min=0))
+                    inhibition = -nn.functional.linear(x, layer.weight.clamp(max=0))
+                    cancelled = torch.minimum(excitation, inhibition).sum()
+                    if ts == 0:
+                        self.layer_cancel.append(cancelled)
+                    else:
+                        self.layer_cancel[cancel_seen] = self.layer_cancel[cancel_seen] + cancelled
+                    cancel_seen += 1
                 x = layer(x)
                 if isinstance(layer, (_SinabsNeuronLayer, _SJNeuronLayer)):
                     # Spike counts are structurally non-negative; clamp
@@ -639,7 +668,13 @@ class SNN_Speck(nn.Module):
                     # all. --min-vmem should still be set (as it already
                     # is in normal usage) to prevent the instability
                     # itself; this clamp is a backstop, not a substitute.
-                    total_spikes = total_spikes + x.sum().clamp(min=0)
+                    step_spikes = x.sum().clamp(min=0)
+                    total_spikes = total_spikes + step_spikes
+                    if ts == 0:
+                        self.layer_spikes.append(step_spikes)
+                    else:
+                        self.layer_spikes[neuron_seen] = self.layer_spikes[neuron_seen] + step_spikes
+                    neuron_seen += 1
                     if count_ops:
                         units = x.shape[-1]
                         if isinstance(layer, _SinabsNeuronLayer):
@@ -708,7 +743,7 @@ def create_model(
     temporal_decay_stages: int = 1,
     num_input_channels: int = 96,
     hidden_dims: Optional[List[int]] = None,
-    tau_syn: Optional[float] = None,
+    tau_syn: Optional[Union[float, List[float]]] = None,
     norm_input: bool = True,
     velocity_lo: float = -280.56,
     velocity_hi: float = 316.54,

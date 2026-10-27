@@ -12,8 +12,16 @@
 #   bash run_inference.sbatch --local bmi indy      # on one machine, e.g. the Speck laptop
 #   bash run_inference.sbatch --local bmi           # every subject of the experiment in turn
 #
+# Checkpoints (defaults; see run_snn_pooled_*.sbatch and run_snn_per_session_array.sbatch):
+#   'snn'    ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/lsnn_loso_finetuned_binarized/<session>/
+#            (the LSNN, MODEL=lsnn, default; MODEL=pooled: .../loso_finetuned_binarized_soft/, the earlier SNN)
+#   'speck'  ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/per_session_binarized/<session>/
+#            (hkm: deployed with hidden layer 1's threshold x2, SPECK_H1_SCALE)
+# Sessions are those with an 'snn' checkpoint; a session without a 'speck'
+# checkpoint is evaluated without 'speck'.
+#
 # Without a subject, every subject with a ${DATA_ROOT}/snn_checkpoints/<experiment>/
-# <subject>/per_session/ directory is run as if named (one report per subject).
+# <subject>/loso_finetuned_binarized_soft/ directory is run as if named (one report per subject).
 #
 # --submit submits (from this directory):
 #   1. an array job, one task per session with an SNN checkpoint, running
@@ -26,8 +34,13 @@
 #
 # --local runs the same steps in series without Slurm. Its defaults suit the
 # Speck-connected laptop: DECODERS adds 'speck' (the SNN on the devkit),
-# TRAIN_DURATIONS is empty (durations come from the cluster run), MACHINE=laptop
-# labels its profile, and math libraries use one thread. The data layout under
+# MACHINE=laptop labels its profile, and math libraries use one thread. When it
+# runs 'speck' it ends with inference/diagnose_speck.py: the chip-vs-PyTorch
+# diagnosis and every session's layer spike-density figure, recorded on the
+# devkit (SPIKE_DENSITY=0 skips it).
+# No training durations are evaluated unless TRAIN_DURATIONS is set (e.g.
+# 1,2,...,10, for models trained per duration); the report's duration row
+# appears only then, or with DURATIONS_JSON. The data layout under
 # DATA_ROOT is the same as on the cluster; to extend the cluster results, copy
 # the cluster's sessions/*.json into the laptop's results directory first: their
 # durations and cluster profile are kept, and full-data results gain 'speck'.
@@ -40,16 +53,22 @@
 #   bash run_inference.sbatch --local bmi indy SNN_CHECKPOINT_ROOT=.../per_session FIGURES=1
 # or in the environment: before the command on the same line, or exported
 # (a plain NAME=value on a line of its own is not seen by this script), e.g.
-#   SNN_CHECKPOINT_ROOT=.../full_cohort_finetuned_medium bash run_inference.sbatch --submit bmi indy
-#   SPECK_CHECKPOINT_ROOT=.../per_session ...   run 'speck' with other checkpoints than 'snn'
+#   SNN_CHECKPOINT_ROOT=.../full_cohort_finetuned_binarized_soft bash run_inference.sbatch --submit bmi indy
+#   SPECK_CHECKPOINT_ROOT=.../other_checkpoints ...   run 'speck' with other checkpoints
 #   FIGURES=1 bash run_inference.sbatch --submit bmi indy     # also per-session diagnostic figures
 #   FIGURE_DECODERS=snn,speck FIGURES=1 ...   only these decoders in them (and the crosshair GIFs)
 #   DATA_ROOT=~/data VENV=~/speck-env bash run_inference.sbatch --local bmi indy
 #   (--local and --report without DATA_ROOT use the data/ folder next to main/, if there is one)
 #   SPECK_WAIT_TIME=0.005 ...   seconds the chip gets per timestep before its output is read
+#                               (default 0.003 for hkm, test_all_decoders.py's 0.001 for bmi)
+#   SPECK_H1_SCALE=1 ...        hidden layer 1 threshold factor on the chip (default 2 for hkm, 1 for bmi)
 #   Only rebuild the report:  bash run_inference.sbatch --report bmi indy
 #   (training-duration results missing from sessions/*.json are kept from the
 #   existing combined_metrics_durations.json, or taken from DURATIONS_JSON=...)
+#   HKM datasets built before trial IDs were stored (transition only):
+#       bash run_inference.sbatch --local hkm jenkins LEGACY_HKM=1 ...
+#   runs inference/test_all_decoders_legacy_hkm.py, which matches SNN test trials to
+#   ANN rows by velocity, and writes to results/test_all_decoders_legacy/ by default.
 #   Only redraw the per-session figures and crosshair GIFs from the saved
 #   predictions (no evaluation, no chip, any checkpoints):
 #       bash run_inference.sbatch --figures bmi indy FIGURE_DECODERS=snn,speck
@@ -59,7 +78,7 @@ set -eo pipefail
 # Settings this script reads from the environment (see the examples above).
 SETTINGS="DATA_ROOT VENV DECODERS TRAIN_DURATIONS MACHINE SNN_CHECKPOINT_ROOT SNN_CHECKPOINT_SUBDIR
           SPECK_CHECKPOINT_ROOT SPECK_CHECKPOINT_SUBDIR RESULTS_DIR FIGURES FIGURE_DECODERS
-          SPECK_WAIT_TIME ENERGY_METER_NUM_THREADS DURATIONS_JSON"
+          SPECK_WAIT_TIME SPECK_H1_SCALE ENERGY_METER_NUM_THREADS DURATIONS_JSON LEGACY_HKM SPIKE_DENSITY"
 
 case "${1:-}" in
     --submit|--local|--report|--figures)
@@ -90,6 +109,13 @@ if [ -z "${EXPERIMENT:-}" ] || { [ -z "${SUBJECT:-}" ] && [ -z "${RUN:-}" ]; }; 
     echo "       bash $0 --report|--figures <experiment> <subject> [NAME=value ...]" >&2
     exit 1
 fi
+# Without a mode flag the script is one Slurm array task (MODE=session, set by
+# --submit); outside Slurm that would quietly run only the first session.
+if [ -z "${RUN:-}" ] && [ -z "${MODE:-}" ] && [ -z "${SLURM_JOB_ID:-}" ]; then
+    echo "ERROR: no mode given. To run every session here: bash $0 --local ${EXPERIMENT} ${SUBJECT:-} [NAME=value ...]" >&2
+    echo "       (or --submit for Slurm, --report / --figures for the report or figures only)" >&2
+    exit 1
+fi
 # Data root: $DATA_ROOT if set; outside Slurm (--local, --report), else the
 # data/ folder next to main/ (repo/main/../data) when it exists; else the
 # cluster scratch directory.
@@ -103,6 +129,12 @@ DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
 # --------------------------------------------------------------------------
 # No subject: run this script once per subject of the experiment
 # --------------------------------------------------------------------------
+# The 'snn' decoder's fine-tuned checkpoints: the LSNN by default, the earlier SNN with MODEL=pooled
+case "${MODEL:-lsnn}" in
+    lsnn)   SNN_FINETUNE_DIRNAME="lsnn_loso_finetuned_binarized" ;;
+    pooled) SNN_FINETUNE_DIRNAME="loso_finetuned_binarized_soft" ;;
+    *) echo "ERROR: MODEL must be lsnn or pooled, got '${MODEL}'" >&2; exit 1 ;;
+esac
 if [ -z "${SUBJECT:-}" ]; then
     if [ -n "${SNN_CHECKPOINT_ROOT:-}${SPECK_CHECKPOINT_ROOT:-}${RESULTS_DIR:-}" ]; then
         echo "ERROR: SNN_CHECKPOINT_ROOT, SPECK_CHECKPOINT_ROOT and RESULTS_DIR are per subject; name a subject to set them" >&2
@@ -110,18 +142,18 @@ if [ -z "${SUBJECT:-}" ]; then
     fi
     SUBJECTS=()
     for d in $(find "${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}" -mindepth 2 -maxdepth 2 -type d \
-                    -name per_session 2>/dev/null | sort); do
+                    -name "$SNN_FINETUNE_DIRNAME" 2>/dev/null | sort); do
         SUBJECTS+=("$(basename "$(dirname "$d")")")
     done
     if [ "${#SUBJECTS[@]}" -eq 0 ]; then
-        echo "ERROR: no ${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/<subject>/per_session/" >&2
+        echo "ERROR: no ${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/<subject>/${SNN_FINETUNE_DIRNAME}/" >&2
         exit 1
     fi
     echo "Subjects of ${EXPERIMENT}: ${SUBJECTS[*]}"
     FAILED=()
     for subject in "${SUBJECTS[@]}"; do
         echo "##### ${EXPERIMENT}/${subject} #####"
-        DATA_ROOT="$DATA_ROOT" bash "$0" "$RUN" "$EXPERIMENT" "$subject" || FAILED+=("$subject")
+        DATA_ROOT="$DATA_ROOT" MODEL="${MODEL:-lsnn}" bash "$0" "$RUN" "$EXPERIMENT" "$subject" || FAILED+=("$subject")
     done
     [ "${#FAILED[@]}" -gt 0 ] && { echo "Failed subjects (see above): ${FAILED[*]}"; exit 1; }
     exit 0
@@ -136,27 +168,37 @@ fi
 FEATURE="mua"
 DECODERS="${DECODERS:-kf,wf,lstm,qrnn,snn}"
 TEST_FRAC=0.1
-TRAIN_DURATIONS="${TRAIN_DURATIONS-1,2,3,4,5,6,7,8,9,10}"
+TRAIN_DURATIONS="${TRAIN_DURATIONS-}"     # e.g. 1,2,3,4,5,6,7,8,9,10 (needs duration-trained models)
 MACHINE="${MACHINE:-cluster}"
 
 DATASET_ROOT="${DATA_ROOT}/dataset/${EXPERIMENT}/${SUBJECT}/mua"
 MODEL_CACHE_ROOT="${DATA_ROOT}/results/model_cache/${EXPERIMENT}/${SUBJECT}"
 # SNN checkpoints: ${SNN_CHECKPOINT_ROOT}/<session>/[${SNN_CHECKPOINT_SUBDIR}/]best_model_weights.pth
 # (SNN_CHECKPOINT_SUBDIR selects one config of a sweep, e.g. wide768_2x)
-SNN_CHECKPOINT_ROOT="${SNN_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/per_session}"
+SNN_CHECKPOINT_ROOT="${SNN_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/${SNN_FINETUNE_DIRNAME}}"
 SNN_CHECKPOINT_SUBDIR="${SNN_CHECKPOINT_SUBDIR:-}"
-# The 'speck' decoder runs the SNN checkpoints unless SPECK_CHECKPOINT_ROOT
-# (and SPECK_CHECKPOINT_SUBDIR) name others, laid out the same way.
-if [ -n "${SPECK_CHECKPOINT_ROOT:-}" ]; then
-    SPECK_CHECKPOINT_SUBDIR="${SPECK_CHECKPOINT_SUBDIR:-}"
-else
-    SPECK_CHECKPOINT_ROOT="$SNN_CHECKPOINT_ROOT"
-    SPECK_CHECKPOINT_SUBDIR="${SPECK_CHECKPOINT_SUBDIR:-$SNN_CHECKPOINT_SUBDIR}"
-fi
+# 'speck' needs a deployable network (no tau_syn): the per-session models.
+SPECK_CHECKPOINT_ROOT="${SPECK_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/per_session_binarized}"
+# hkm's dense input fires hidden layer 1 far more on the chip (each event can
+# fire a neuron at once) than in training; doubling that layer's threshold on
+# the chip removes most of it (main/speck_lab/). The trained model is unchanged.
+SPECK_H1_SCALE="${SPECK_H1_SCALE:-$([ "$EXPERIMENT" = "hkm" ] && echo 2 || echo 1)}"
+# hkm's ~31 input events per step also need more than 1 ms on the chip: output
+# read too early is counted in the next step (Jenkins at x2: chip RMSE 76.5 at
+# 1 ms, 66.1 at 2 ms, 62.4 at 3 ms, 59.6 at 5 ms). 3 ms keeps a step (wait plus
+# ~0.6 ms of host overhead) inside the 4 ms of data it covers.
+SPECK_WAIT_TIME="${SPECK_WAIT_TIME:-$([ "$EXPERIMENT" = "hkm" ] && echo 0.003 || true)}"
+SPECK_CHECKPOINT_SUBDIR="${SPECK_CHECKPOINT_SUBDIR:-}"
 if [ "$EXPERIMENT" = "hkm" ]; then
     SNN_DATASET_ROOT="${DATA_ROOT}/snn_datasets/${EXPERIMENT}/${SUBJECT}/mua"          # whole trials
 else
     SNN_DATASET_ROOT="${DATA_ROOT}/snn_datasets/${EXPERIMENT}/${SUBJECT}/mua_8_group"
+fi
+if [ "${LEGACY_HKM:-}" = "1" ]; then
+    EVAL_SCRIPT="test_all_decoders_legacy_hkm.py"
+    RESULTS_DIR="${RESULTS_DIR:-${DATA_ROOT}/results/test_all_decoders_legacy/${EXPERIMENT}/${SUBJECT}}"
+else
+    EVAL_SCRIPT="test_all_decoders.py"
 fi
 RESULTS_DIR="${RESULTS_DIR:-${DATA_ROOT}/results/test_all_decoders/${EXPERIMENT}/${SUBJECT}}"
 
@@ -166,9 +208,10 @@ show_settings() {
         echo "Figures (from saved predictions) for: ${FIGURE_DECODERS:-every decoder}"
     elif [ "${MODE:-}" != "report" ]; then
         echo "SNN checkpoints: ${SNN_CHECKPOINT_ROOT}${SNN_CHECKPOINT_SUBDIR:+ (/<session>/${SNN_CHECKPOINT_SUBDIR})}"
-        [[ ",$DECODERS," == *,speck,* ]] && echo "Speck checkpoints: ${SPECK_CHECKPOINT_ROOT}${SPECK_CHECKPOINT_SUBDIR:+ (/<session>/${SPECK_CHECKPOINT_SUBDIR})}"
+        [[ ",$DECODERS," == *,speck,* ]] && echo "Speck checkpoints: ${SPECK_CHECKPOINT_ROOT}${SPECK_CHECKPOINT_SUBDIR:+ (/<session>/${SPECK_CHECKPOINT_SUBDIR})}, hidden layer 1 threshold x${SPECK_H1_SCALE}, wait ${SPECK_WAIT_TIME:-0.001} s per step on the chip"
         echo "Decoders: ${DECODERS}${FIGURES:+; figures for ${FIGURE_DECODERS:-every decoder}}"
     fi
+    [ "${LEGACY_HKM:-}" = "1" ] && echo "LEGACY_HKM=1: ${EVAL_SCRIPT} (trials matched by velocity)"
     echo "Results: ${RESULTS_DIR}"
 }
 
@@ -199,7 +242,7 @@ if [ "${RUN:-}" = "--submit" ]; then
     EXPORTS+=",TRAIN_DURATIONS=${TRAIN_DURATIONS//,/:},MACHINE=${MACHINE},SNN_CHECKPOINT_ROOT=${SNN_CHECKPOINT_ROOT}"
     EXPORTS+=",SNN_CHECKPOINT_SUBDIR=${SNN_CHECKPOINT_SUBDIR},SPECK_CHECKPOINT_ROOT=${SPECK_CHECKPOINT_ROOT}"
     EXPORTS+=",SPECK_CHECKPOINT_SUBDIR=${SPECK_CHECKPOINT_SUBDIR},RESULTS_DIR=${RESULTS_DIR},FIGURES=${FIGURES:-}"
-    EXPORTS+=",FIGURE_DECODERS=${FIGURE_DECODERS//,/:},DURATIONS_JSON=${DURATIONS_JSON:-}"
+    EXPORTS+=",FIGURE_DECODERS=${FIGURE_DECODERS//,/:},DURATIONS_JSON=${DURATIONS_JSON:-},LEGACY_HKM=${LEGACY_HKM:-}"
     ARRAY_ID=$(sbatch --parsable --array=0-$(( ${#SESSION_IDS[@]} - 1 )) \
         --export="${EXPORTS},MODE=session" "$0")
     REPORT_ID=$(sbatch --parsable --dependency=afterany:"${ARRAY_ID%%;*}" --time=0:30:00 \
@@ -226,15 +269,17 @@ export MKL_NUM_THREADS=$OMP_NUM_THREADS
 INFERENCE_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}/../inference"
 
 run_report() {
+    local duration_args=()
+    [ -n "${TRAIN_DURATIONS}${DURATIONS_JSON:-}" ] && duration_args=(--durations)
     python3 "$INFERENCE_DIR/make_report.py" --results_dir "$RESULTS_DIR" \
-        ${DURATIONS_JSON:+--durations_json "$DURATIONS_JSON"}
+        ${DURATIONS_JSON:+--durations_json "$DURATIONS_JSON"} "${duration_args[@]}"
 }
 
 run_session() {  # run_session SESSION_ID
     local figure_args=()
     [ -n "${FIGURES:-}" ] && figure_args=(--figures_dir "${RESULTS_DIR}/figures/$1"
                                           --figure_decoders "${FIGURE_DECODERS:-}")
-    python3 "$INFERENCE_DIR/test_all_decoders.py" \
+    python3 "$INFERENCE_DIR/$EVAL_SCRIPT" \
         --experiment "$EXPERIMENT" \
         --session "$1" \
         --input_filepath "${DATASET_ROOT}/$1_binning.h5" \
@@ -249,11 +294,12 @@ run_session() {  # run_session SESSION_ID
         --train_durations "$TRAIN_DURATIONS" \
         --machine "$MACHINE" \
         ${SPECK_WAIT_TIME:+--speck_wait_time "$SPECK_WAIT_TIME"} \
+        --speck_h1_threshold_scale "$SPECK_H1_SCALE" \
         "${figure_args[@]}"
 }
 
 # --------------------------------------------------------------------------
-# LOCAL: every session in series, then the report
+# LOCAL: every session in series, then the report (and the Speck diagnosis)
 # --------------------------------------------------------------------------
 if [ "${RUN:-}" = "--local" ]; then
     show_settings
@@ -264,6 +310,15 @@ if [ "${RUN:-}" = "--local" ]; then
     done
     [ "${#FAILED[@]}" -gt 0 ] && echo "Failed sessions (see above): ${FAILED[*]}"
     run_report
+    if [[ ",$DECODERS," == *,speck,* ]] && [ "${SPIKE_DENSITY:-1}" = "1" ]; then
+        echo "=== Speck diagnosis and layer spike density, every session ==="
+        python3 "$INFERENCE_DIR/diagnose_speck.py" --experiment "$EXPERIMENT" --subject "$SUBJECT" \
+            --data_root "$DATA_ROOT" --snn_checkpoint_root "$SPECK_CHECKPOINT_ROOT" \
+            --snn_checkpoint_subdir "$SPECK_CHECKPOINT_SUBDIR" --results_dir "$RESULTS_DIR" \
+            --figure_session all --speck_devkit speck2fdevkit:0 \
+            --speck_h1_threshold_scale "$SPECK_H1_SCALE" \
+            ${SPECK_WAIT_TIME:+--speck_wait_time "$SPECK_WAIT_TIME"}
+    fi
     exit 0
 fi
 

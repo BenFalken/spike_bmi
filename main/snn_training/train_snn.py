@@ -12,17 +12,45 @@ Every trial is an independent example: the model resets its state at the
 start of each forward pass. The loss is the RMSE between predicted and
 true velocity in physical units.
 
+bmi trials share one length and are batched. hkm trials are whole reaches
+of different lengths (nwb_conversion/make_snn_dataset_whole_trial.py), so
+hkm needs --batch-size 1: one trial per optimizer step.
+
 Synaptic time constant: --tau-syn is off by default (no synaptic-current
 stage). With a value, every spiking layer low-pass filters its input
 current with a time constant (in 4 ms timesteps) initialized to that value
-and trained with the weights, like the readout's EMA decay. The trained
+(or to its own value, given one per spiking layer, e.g. 2 4 8 16) and
+trained with the weights, like the readout's EMA decay. The trained
 per-layer values are part of the model state dict.
+
+Spike-rate penalty (--spike-rate-weight, off by default): adds weight x
+sum over spiking layers of max(0, rate - target) to the training loss, the
+rate being the layer's spikes per neuron per timestep (--spike-rate-target,
+one value or one per layer). On Speck, a densely firing network diverges
+from training (the chip updates per input event), so the deployed per-session
+models keep every layer's rate low. The test loss, which picks the best
+model, stays the RMSE.
+
+Input: spike counts are clipped to 0/1 (--binarize-input, default on).
+A Speck input event raises a neuron's membrane once per event, so bins of
+several spikes drive the chip far harder than training assumed. The
+setting is saved with the checkpoint, and inference applies the same.
 
 Outputs in --checkpoint-dir, with exp_name = bmi_{neuron_type}_{reset_type}:
     best_model_weights.pth                   lowest test loss so far
     checkpoint_{exp_name}_epoch{N}.pth       every --checkpoint-interval epochs
     final_model_{exp_name}.pth               written when training ends
     training_curves_{exp_name}.png, summary_{exp_name}.txt
+
+Architecture (--arch): "snn" (default) is the feedforward SNN above
+(models/model_{experiment}.py); "lsnn" is the recurrent LSNN ported from the
+speech decoder (models/model_bmi_lsnn.py): recurrent integrate-and-fire layers
+(--hidden-dims, default 256 256), a fraction of them with threshold adaptation
+(--lsnn-adaptive-fraction, --lsnn-tau-adapt-ms), per-neuron synaptic filters
+(--lsnn-tau-syn-ms), soft reset, up to --lsnn-max-spikes spikes per step and a
+leaky linear readout (--lsnn-out-tau-ms). It ignores the SNN-only options
+(--neuron-type, --reset-type, --spike-fn, --tau-syn, --n-bins, the EMA
+options) and is written as bmi_lsnn_* files.
 
 Resume an interrupted run with --resume CHECKPOINT; start a new run from
 another run's weights (fresh optimizer and epoch count) with
@@ -61,13 +89,34 @@ def parse_arguments():
                         help="YAML config; its values apply unless the flag is given explicitly")
 
     model = parser.add_argument_group("model")
+    model.add_argument("--arch", type=str, default="snn", choices=["snn", "lsnn"],
+                       help="snn: the feedforward SNN (models/model_{experiment}.py); lsnn: the recurrent "
+                            "LSNN ported from the speech decoder (models/model_bmi_lsnn.py)")
+    model.add_argument("--lsnn-adaptive-fraction", type=float, default=0.9,
+                       help="lsnn: fraction of each layer's neurons with threshold adaptation")
+    model.add_argument("--lsnn-tau-adapt-ms", type=float, default=500.0,
+                       help="lsnn: adaptation time constant (ms)")
+    model.add_argument("--lsnn-adapt-scale", type=float, default=1.8,
+                       help="lsnn: threshold increase per unit of adaptation")
+    model.add_argument("--lsnn-tau-syn-ms", type=float, nargs=2, default=[20.0, 1300.0], metavar=("LO", "HI"),
+                       help="lsnn: per-neuron synaptic time constants, log-spaced over [LO, HI] ms, trained")
+    model.add_argument("--lsnn-out-tau-ms", type=float, default=40.0,
+                       help="lsnn: readout time constant (ms), one per output, trained")
+    model.add_argument("--lsnn-readout-all", type=str2bool, default=False,
+                       help="lsnn: the readout reads every spiking layer, not only the last")
+    model.add_argument("--lsnn-out-stages", type=int, default=1,
+                       help="lsnn: leaky readout stages in series (2+ = a smoother output)")
+    model.add_argument("--lsnn-max-spikes", type=int, default=3, help="lsnn: spikes per neuron per step, at most")
+    model.add_argument("--lsnn-rec-init-scale", type=float, default=0.5,
+                       help="lsnn: scale of the orthogonal recurrent weights at the start")
     model.add_argument("--neuron-type", type=str, default="lif", choices=["iaf", "lif"])
     model.add_argument("--reset-type", type=str, default="hard", choices=["hard", "soft"])
     model.add_argument("--final-layer-reset-type", type=str, default=None, choices=["hard", "soft"],
                        help="Reset for the output layer (default: same as --reset-type)")
     model.add_argument("--tau-mem", type=float, default=12.0, help="LIF membrane time constant")
-    model.add_argument("--tau-syn", type=float, default=None,
-                       help="Initial synaptic time constant, trained per layer (default: none)")
+    model.add_argument("--tau-syn", type=float, nargs="+", default=None,
+                       help="Initial synaptic time constant, trained per layer: one value for "
+                            "every spiking layer or one per layer (default: none)")
     model.add_argument("--hidden-dims", type=int, nargs="+", default=None,
                        help="Hidden layer widths (default: 512 256 128)")
     model.add_argument("--spike-thresholds", type=float, nargs="+", default=None,
@@ -87,6 +136,9 @@ def parse_arguments():
     model.add_argument("--temporal-decay-init", type=float, default=0.8,
                        help="Initial decay of the readout's EMA smoothing")
     model.add_argument("--learnable-temporal-decay", type=str2bool, default=True)
+    model.add_argument("--unit-gain-syn", type=str2bool, default=False,
+                       help="snn with --tau-syn: unit-gain synaptic filters (sinabs' synaptic stage alone amplifies a "
+                            "constant input alpha/(1-alpha) times: 1.5x at tau_syn 2, 15.5x at 16)")
     model.add_argument("--temporal-decay-stages", type=int, default=1,
                        help="Number of cascaded EMA stages in the readout")
     model.add_argument("--use-exodus", type=str2bool, default=None,
@@ -99,6 +151,9 @@ def parse_arguments():
                       help="Directory with train/ and test/ .pkl trials")
     data.add_argument("--experiment", type=str, default=None, choices=["bmi", "hkm"],
                       help="Default: derived from --data-path")
+    data.add_argument("--binarize-input", type=str2bool, default=True,
+                      help="Clip input spike counts to 0/1 (recorded in the checkpoint; inference "
+                           "binarizes the same way)")
     data.add_argument("--batch-size", type=int, default=20)
     data.add_argument("--num-workers", type=int, default=20)
     data.add_argument("--train-data-min", type=float, default=None,
@@ -115,6 +170,13 @@ def parse_arguments():
     train.add_argument("--weight-decay", type=float, default=0.001)
     train.add_argument("--channel-lasso-weight", type=float, default=0.0,
                        help="Group-lasso penalty on the first layer's input channels (0 = off)")
+    train.add_argument("--spike-rate-weight", type=float, default=0.0,
+                       help="Spike-rate penalty (0 = off): weight x the sum over spiking layers of "
+                            "max(0, rate - target), rate in spikes per neuron per timestep. Added "
+                            "to the training loss only; the test loss stays the RMSE")
+    train.add_argument("--spike-rate-target", type=float, nargs="+", default=[0.1],
+                       help="Rate each spiking layer may reach before the penalty applies: one "
+                            "value for every layer or one per layer (len(hidden_dims) + 1)")
     train.add_argument("--patience", type=int, default=20, help="Early-stopping patience (epochs)")
     train.add_argument("--scheduler-patience", type=int, default=10,
                        help="Epochs without improvement before the LR is reduced")
@@ -175,18 +237,32 @@ def unscale_velocity(v_scaled, lo, hi, margin):
     return lo + (hi - lo) * (v_scaled - margin) / (1 - 2 * margin)
 
 
+def spike_rate_penalty(model, n_steps, targets):
+    """(sum over spiking layers of max(0, rate - target), [rate per layer]),
+    rate = the layer's spikes per neuron per timestep in the last forward
+    pass (n_steps = timesteps x batch size)."""
+    rates = [spikes / (n_steps * width) for spikes, width in zip(model.layer_spikes, model.layer_widths)]
+    penalty = sum(torch.relu(rate - target) for rate, target in zip(rates, targets))
+    return penalty, [float(rate.detach()) for rate in rates]
+
+
 def run_epoch(model, loader, criterion, device, scale, loss_eps, optimizer=None, use_amp=False,
-              channel_lasso_weight=0.0, log_interval=50, verbose=True, desc=""):
+              channel_lasso_weight=0.0, spike_rate_weight=0.0, spike_rate_targets=None,
+              log_interval=50, verbose=True, desc=""):
     """One pass over `loader`; trains if an optimizer is given, else evaluates.
 
     Returns (mean loss, metrics dict). Loss is RMSE in physical velocity
-    units (plus the channel-lasso penalty when training with it)."""
+    units (plus the channel-lasso and spike-rate penalties when training
+    with them). metrics["layer_rates"] holds each spiking layer's mean
+    spikes per neuron per timestep."""
     training = optimizer is not None
     model.train(training)
     grad_scaler = torch.cuda.amp.GradScaler() if (training and use_amp) else None
     first_linear = model.layers[0] if channel_lasso_weight > 0 else None
     sums = {k: 0.0 for k in ("loss", "pred_loss", "channel_penalty", "velocity_error",
-                             "membrane_mean", "membrane_max", "non_zero_ratio", "spike_rate")}
+                             "membrane_mean", "membrane_max", "non_zero_ratio", "spike_rate",
+                             "spike_rate_penalty")}
+    layer_rate_sums = None
 
     for batch_idx, (_, inputs, targets) in enumerate(tqdm(loader, desc=desc, disable=not verbose)):
         inputs = inputs.transpose(0, 1).to(device)    # [N, T, C] -> [T, N, C]
@@ -203,6 +279,12 @@ def run_epoch(model, loader, criterion, device, scale, loss_eps, optimizer=None,
                 penalty = torch.norm(first_linear.weight, dim=0).sum()  # L2 per input channel
                 loss = pred_loss + channel_lasso_weight * penalty
                 sums["channel_penalty"] += penalty.item()
+            rate_penalty, layer_rates = spike_rate_penalty(model, T * N, spike_rate_targets or [0.0])
+            if training and spike_rate_weight > 0:
+                loss = loss + spike_rate_weight * rate_penalty
+            sums["spike_rate_penalty"] += float(rate_penalty)
+            layer_rate_sums = layer_rates if layer_rate_sums is None else [
+                a + b for a, b in zip(layer_rate_sums, layer_rates)]
 
         if training:
             optimizer.zero_grad()
@@ -232,22 +314,40 @@ def run_epoch(model, loader, criterion, device, scale, loss_eps, optimizer=None,
                   f"spike_rate={spike_rate:.4f}")
 
     metrics = {k: v / len(loader) for k, v in sums.items()}
+    metrics["layer_rates"] = [v / len(loader) for v in layer_rate_sums]
     if training:
         metrics["learning_rate"] = optimizer.param_groups[0]["lr"]
     return metrics["loss"], metrics
 
 
+def n_trials_for_minutes(dataset, minutes):
+    """Number of leading trials whose summed length is closest to `minutes`
+    (at least one). Trials may differ in length (hkm)."""
+    target = minutes * 60000.0 / STEP_MS
+    total = 0
+    for i in range(len(dataset)):
+        length = dataset.trial_length(i)
+        if total + length >= target:
+            return i + 1 if i == 0 or total + length - target < target - total else i
+        total += length
+    return len(dataset)
+
+
 def build_loaders(args, experiment, subject):
     """Train/test loaders. The test loader never drops trials; it batches
     whole test trials only when they all have the same length."""
+    if experiment == "hkm" and args.batch_size != 1:
+        raise ValueError(f"hkm trials differ in length and cannot be batched; use --batch-size 1 "
+                         f"(got {args.batch_size})")
     train_loader, test_loader = create_dataloaders(
         data_path=args.data_path, batch_size=args.batch_size, num_workers=args.num_workers,
-        shuffle_train=True, experiment=experiment, subject=subject)
+        shuffle_train=True, experiment=experiment, subject=subject, binarize=args.binarize_input)
 
     trial_timesteps = train_loader.dataset[0][1].shape[0]
-    print(f"Train trial length: {trial_timesteps} timesteps ({trial_timesteps * STEP_MS:.0f} ms)")
+    print(f"First train trial: {trial_timesteps} timesteps ({trial_timesteps * STEP_MS:.0f} ms)")
     if args.train_data_min is not None:
-        n_trials = int(round(args.train_data_min * 60000.0 / (trial_timesteps * STEP_MS)))
+        n_trials = n_trials_for_minutes(train_loader.dataset, args.train_data_min)
+        print(f"--train-data-min {args.train_data_min:g}: first {n_trials} training trial(s)")
         subset = Subset(train_loader.dataset, range(min(n_trials, len(train_loader.dataset))))
         train_loader = DataLoader(subset, batch_size=train_loader.batch_size, shuffle=False,
                                   num_workers=train_loader.num_workers,
@@ -271,6 +371,25 @@ def build_loaders(args, experiment, subject):
 
 
 def build_model(args, experiment, num_input_channels, device):
+    if getattr(args, "arch", "snn") == "lsnn":
+        model_module = importlib.import_module("models.model_bmi_lsnn")
+        model = model_module.create_model(
+            num_input_channels=num_input_channels,
+            hidden_dims=args.hidden_dims,
+            adaptive_fraction=args.lsnn_adaptive_fraction,
+            tau_adapt_ms=args.lsnn_tau_adapt_ms,
+            adapt_scale=args.lsnn_adapt_scale,
+            tau_syn_ms=tuple(args.lsnn_tau_syn_ms),
+            out_tau_ms=args.lsnn_out_tau_ms,
+            out_stages=getattr(args, "lsnn_out_stages", 1),
+            readout_all=getattr(args, "lsnn_readout_all", False),
+            max_spikes=args.lsnn_max_spikes,
+            rec_init_scale=args.lsnn_rec_init_scale,
+            velocity_lo=args.velocity_lo,
+            velocity_hi=args.velocity_hi,
+            velocity_margin=args.velocity_margin,
+        ).to(device)
+        return model_module, model
     model_module = importlib.import_module(f"models.model_{experiment}")
     model = model_module.create_model(
         use_spikingjelly=args.use_spikingjelly,
@@ -292,10 +411,11 @@ def build_model(args, experiment, num_input_channels, device):
         temporal_decay_stages=args.temporal_decay_stages,
         num_input_channels=num_input_channels,
         hidden_dims=args.hidden_dims,
-        tau_syn=args.tau_syn,
+        tau_syn=args.tau_syn[0] if args.tau_syn and len(args.tau_syn) == 1 else args.tau_syn,
         velocity_lo=args.velocity_lo,
         velocity_hi=args.velocity_hi,
         velocity_margin=args.velocity_margin,
+        unit_gain_syn=getattr(args, "unit_gain_syn", False),
     ).to(device)
     return model_module, model
 
@@ -323,7 +443,9 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     exp_name = f"bmi_{args.neuron_type}_{args.reset_type}"
-    if args.neuron_type == "lif":
+    if args.arch == "lsnn":
+        exp_name = "bmi_lsnn"
+    elif args.neuron_type == "lif":
         exp_name += f"_tau{args.tau_mem}"
 
     if args.wandb:
@@ -337,7 +459,8 @@ def main():
           f"tau_syn: {args.tau_syn} | decay stages: {args.temporal_decay_stages}")
     print(f"Velocity scaling: lo={args.velocity_lo}, hi={args.velocity_hi}, "
           f"margin={args.velocity_margin}")
-    print(f"Batch size: {args.batch_size} | lr: {args.lr} | epochs: {args.epochs}")
+    print(f"Batch size: {args.batch_size} | lr: {args.lr} | epochs: {args.epochs} | "
+          f"binarized input: {args.binarize_input}")
 
     train_loader, test_loader = build_loaders(args, experiment, subject)
     input_shape = test_loader.dataset[0][1].shape[1:]
@@ -381,6 +504,15 @@ def main():
                 "experiment": experiment, **extra}
 
     scale = (args.velocity_lo, args.velocity_hi, args.velocity_margin)
+    n_spiking = len(model.layer_widths)
+    if len(args.spike_rate_target) not in (1, n_spiking):
+        raise ValueError(f"--spike-rate-target takes 1 or {n_spiking} values (one per spiking "
+                         f"layer), got {len(args.spike_rate_target)}")
+    spike_rate_targets = (args.spike_rate_target * n_spiking if len(args.spike_rate_target) == 1
+                          else list(args.spike_rate_target))
+    if args.spike_rate_weight > 0:
+        print(f"Spike-rate penalty: weight {args.spike_rate_weight}, targets per layer "
+              f"{spike_rate_targets} (spikes per neuron per timestep)")
     training_start = time.time()
     epoch = start_epoch - 1
     for epoch in range(start_epoch, args.epochs):
@@ -388,6 +520,7 @@ def main():
         train_loss, train_metrics = run_epoch(
             model, train_loader, criterion, device, scale, args.loss_eps, optimizer=optimizer,
             use_amp=args.use_amp, channel_lasso_weight=args.channel_lasso_weight,
+            spike_rate_weight=args.spike_rate_weight, spike_rate_targets=spike_rate_targets,
             log_interval=args.log_interval, verbose=args.verbose, desc=f"Epoch {epoch + 1} [train]")
         test_loss, test_metrics = run_epoch(
             model, test_loader, criterion, device, scale, args.loss_eps,
@@ -407,10 +540,19 @@ def main():
         print(f"Epoch {epoch + 1}/{args.epochs} ({epoch_time:.1f}s) | train {train_loss:.5f} | "
               f"test {test_loss:.5f} | velocity error {test_metrics['velocity_error']:.5f} | "
               f"spike rate {test_metrics['spike_rate']:.4f} | lr {train_metrics['learning_rate']:.6f}")
+        print(f"  spikes per neuron per timestep by layer: test "
+              f"[{' '.join(f'{r:.3f}' for r in test_metrics['layer_rates'])}], train "
+              f"[{' '.join(f'{r:.3f}' for r in train_metrics['layer_rates'])}]"
+              + (f", train penalty {train_metrics['spike_rate_penalty']:.4f}"
+                 if args.spike_rate_weight > 0 else ""))
         if args.wandb:
+            def flat(metrics):
+                out = {k: v for k, v in metrics.items() if k != "layer_rates"}
+                out.update({f"layer_rate_{i}": r for i, r in enumerate(metrics["layer_rates"])})
+                return out
             wandb.log({"epoch": epoch + 1, "epoch_time": epoch_time,
-                       **{f"train/{k}": v for k, v in train_metrics.items()},
-                       **{f"test/{k}": v for k, v in test_metrics.items()}}, step=epoch)
+                       **{f"train/{k}": v for k, v in flat(train_metrics).items()},
+                       **{f"test/{k}": v for k, v in flat(test_metrics).items()}}, step=epoch)
 
         if test_loss < best_loss:
             best_loss = test_loss

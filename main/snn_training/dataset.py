@@ -6,6 +6,12 @@ A dataset directory has train/ and test/ subfolders of trials named 0.pkl,
     input_spikes  (n_units, T)  spike counts per 4 ms bin
     velocity      (T, 2)        hand velocity in physical units
 
+bmi trials of one split share one length. hkm trials are whole reaches of
+different lengths (nwb_conversion/make_snn_dataset_whole_trial.py), so they
+can only be loaded one per batch (--batch-size 1).
+
+With binarize=True (train_snn.py's default) spike counts are clipped to 0/1.
+
 Velocity is scaled to [margin, 1 - margin] using per-subject bounds from
 velocity_scalers.json (written by preprocessing_training/
 compute_velocity_scalers.py; override the path with
@@ -76,8 +82,10 @@ class CustomDataset(Dataset):
     experiment/subject default to the values derived from `path`."""
 
     def __init__(self, path: str, train: bool = True,
-                 experiment: Optional[str] = None, subject: Optional[str] = None):
+                 experiment: Optional[str] = None, subject: Optional[str] = None,
+                 binarize: bool = False):
         super().__init__()
+        self.binarize = binarize
         self.split_dir = os.path.join(path, 'train' if train else 'test')
         if not os.path.exists(self.split_dir):
             raise FileNotFoundError(f"Split directory not found: {self.split_dir}")
@@ -97,10 +105,17 @@ class CustomDataset(Dataset):
     def __len__(self) -> int:
         return len(self.files)
 
+    def trial_length(self, idx: int) -> int:
+        """Timesteps of trial idx."""
+        with open(os.path.join(self.split_dir, self.files[idx]), 'rb') as f:
+            return pkl.load(f)['input_spikes'].shape[1]
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with open(os.path.join(self.split_dir, self.files[idx]), 'rb') as f:
             data = pkl.load(f)
         spikes = torch.from_numpy(data['input_spikes'].T).float()
+        if self.binarize:
+            spikes = (spikes > 0).float()
         # Inverted by train_snn.unscale_velocity().
         velocity = torch.from_numpy(
             self.v_margin + (1 - 2 * self.v_margin) * (data['velocity'] - self.v_lo) / (self.v_hi - self.v_lo)
@@ -115,6 +130,10 @@ def _natural_key(name: str):
 
 def collate_fn(batch: list) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     labels, spikes, velocity = zip(*batch)
+    lengths = sorted({s.shape[0] for s in spikes})
+    if len(lengths) > 1:
+        raise ValueError(f"Cannot batch trials of different lengths ({lengths[:5]}...); "
+                         f"whole-trial datasets (hkm) need --batch-size 1")
     return torch.stack(labels), torch.stack(spikes), torch.stack(velocity)
 
 
@@ -126,11 +145,14 @@ def create_dataloaders(
     drop_last: bool = True,
     experiment: Optional[str] = None,
     subject: Optional[str] = None,
+    binarize: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """(train_loader, test_loader) for one dataset directory; both splits use
-    the same velocity scalers."""
-    train_dataset = CustomDataset(data_path, train=True, experiment=experiment, subject=subject)
-    test_dataset = CustomDataset(data_path, train=False, experiment=experiment, subject=subject)
+    the same velocity scalers and input binarization."""
+    train_dataset = CustomDataset(data_path, train=True, experiment=experiment, subject=subject,
+                                  binarize=binarize)
+    test_dataset = CustomDataset(data_path, train=False, experiment=experiment, subject=subject,
+                                 binarize=binarize)
     common = dict(batch_size=batch_size, num_workers=num_workers, drop_last=drop_last,
                   pin_memory=True, collate_fn=collate_fn)
     return (DataLoader(train_dataset, shuffle=shuffle_train, **common),

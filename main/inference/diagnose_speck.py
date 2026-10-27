@@ -36,12 +36,31 @@ as --snn_checkpoint_root: they must be the ones the results recorded for
 'speck', and the rows come from the recorded offset. The 'snn' column is then
 the other checkpoint's result.
 
-Writes {results_dir}/speck_diagnosis.json.
+Last, a figure follows one test trial through both networks layer by layer
+(input at the top, output at the bottom), one stacked raster per network on
+a shared time axis, coloured by spike density (spikes per neuron per
+timestep, averaged over --figure_bin steps). The Speck raster comes from the
+chip with every layer monitored when --speck_devkit is given, otherwise from
+the network as deployed (quantized), emulated on the host.
+
+The same densities are also animated as a GIF: per network, the layers
+side by side in the direction spikes travel, each box coloured by the
+current bin's density, one frame per bin.
+
+--figure_session all draws them for every session (run_inference.sbatch
+--local does this whenever it runs 'speck'). Inputs are binarized when the
+checkpoint was trained on binarized input.
+
+Writes {results_dir}/speck_diagnosis.json,
+{results_dir}/speck_layer_activity_{session}.png and .gif.
 
 Usage (no devkit needed):
     python diagnose_speck.py --experiment bmi --subject indy --data_root ../../data \
-        --snn_checkpoint_root ../../data/snn_checkpoints/bmi/indy/full_cohort_finetuned_medium \
+        --snn_checkpoint_root ../../data/snn_checkpoints/bmi/indy/per_session \
         --results_dir ../../data/results/test_all_decoders_finetuned/bmi/indy
+
+    Add --speck_devkit speck2fdevkit:0 (devkit connected) for the chip's own
+    layer activity in the figure.
 """
 
 import argparse
@@ -53,8 +72,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 import numpy as np  # noqa: E402
 
-from decoder_eval import (BASE_NPERSEG, _load_pickle, checkpoint_id, load_snn_model,  # noqa: E402
-                          snn_test_files, unscale_velocity)
+from decoder_eval import (BASE_NPERSEG, STEP_S, _load_pickle, checkpoint_id, load_snn_model,  # noqa: E402
+                          snn_input, snn_test_files, unscale_velocity)
 import speck  # noqa: E402
 
 VERSIONS = ('pytorch', 'quantized')
@@ -64,8 +83,12 @@ MATCH_TOL = 1e-3
 
 def decode_versions(checkpoint_path, snn_dataset_path, experiment):
     """({version: (n, 2) velocity}, (n, 2) SNN dataset velocity, {version:
-    (n, 2 * n_bins) output spike counts}, decode) over the test trials, first
-    window dropped; decode(counts) -> velocity, as for the chip."""
+    (n, 2 * n_bins) output spike counts}, decode) over the test trials, with
+    the rows test_all_decoders.py scores: bmi drops the first window, hkm
+    keeps timesteps [nperseg, T) of every trial (each trial run from rest),
+    which concatenated are the ANN test rows. decode(counts) -> velocity, as
+    for the chip (for hkm, re-decoding concatenated counts carries the
+    readout's EMA across trials, unlike the chip run)."""
     model, checkpoint, scale = load_snn_model(checkpoint_path, experiment)
     speck.check_deployable(model, checkpoint)
     snn_seq = speck.flatten_snn(model)
@@ -77,10 +100,11 @@ def decode_versions(checkpoint_path, snn_dataset_path, experiment):
     files = snn_test_files(snn_dataset_path)
     preds, counts_kept, targets = {v: [] for v in runners}, {v: [] for v in runners}, []
     for i, path in enumerate(files):
-        if i == 0 and len(files) > 1:
+        if experiment != 'hkm' and i == 0 and len(files) > 1:
             continue                                # dropped, as in test_all_decoders.py
         trial = _load_pickle(path)
-        keep = slice(BASE_NPERSEG, None) if len(files) == 1 else slice(None)
+        trial['input_spikes'] = snn_input(model, trial['input_spikes'])
+        keep = slice(BASE_NPERSEG, None) if experiment == 'hkm' or len(files) == 1 else slice(None)
         targets.append(trial['velocity'][keep])
         for version, run in runners.items():
             counts = run(trial['input_spikes'])
@@ -238,6 +262,159 @@ def diagnose_session(session, checkpoint, snn_dataset_path, results_dir, experim
     return row, note
 
 
+def layer_activity(checkpoint_path, snn_dataset_path, experiment, trial, start, steps,
+                   devkit=None, wait_time=0.001, raster_dt=0.1, h1_threshold_scale=1.0):
+    """Spikes of every layer over one test trial, for the PyTorch network and
+    for Speck: (input (steps, C), {network label: [(steps, n) per layer]},
+    trial index used). Both networks start the trial from rest and run from
+    its first step; the window [start, start + steps) is returned. Speck is
+    the chip with every layer monitored when devkit is given, otherwise the
+    quantized network as deployed, emulated on the host."""
+    model, checkpoint, _ = load_snn_model(checkpoint_path, experiment)
+    speck.check_deployable(model, checkpoint)
+    snn_seq = speck.flatten_snn(model)
+    snn_seq.eval()
+    files = snn_test_files(snn_dataset_path)
+    if trial < 0:      # the longest test trial (hkm trials are separate reaches of any length)
+        trial = int(np.argmax([_load_pickle(f)['input_spikes'].shape[1] for f in files]))
+    trial = min(trial, len(files) - 1)
+    spikes = snn_input(model, _load_pickle(files[trial])['input_spikes'][:, :start + steps])
+    # Discretize before running snn_seq: the run leaves its neuron states as
+    # views, which the copied layers could then not reset.
+    quant_seq = None if devkit else speck.discretized_sequential(
+        speck.discretize(snn_seq, model.layers[0].in_features))
+    layers = {'PyTorch SNN': speck.run_layers(snn_seq, spikes)}
+    if devkit:
+        device = speck.open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt,
+                                  monitor_all=True, h1_threshold_scale=h1_threshold_scale)
+        try:
+            device.reset()
+            device.run(spikes, 2 * model.n_bins)
+            layers[f'Speck SNN (chip, {devkit})'] = device.layer_counts
+        finally:
+            device.close()
+    else:
+        layers['Speck SNN (emulated on host)'] = speck.run_layers(quant_seq, spikes)
+    window = slice(start, start + steps)
+    return spikes.T[window], {k: [l[window] for l in v] for k, v in layers.items()}, trial
+
+
+LAYER_CMAP = 'Blues'
+
+
+def layer_densities(inputs, layers, bin_steps):
+    """({network: (n_layers + 1, n_bins) spike density}, row labels, neuron
+    counts, colour norm): each layer's spikes per neuron per timestep,
+    averaged over bin_steps, input first; one norm for every network."""
+    from matplotlib.colors import PowerNorm
+
+    def density(x):
+        n = len(x) // bin_steps * bin_steps
+        return x[:n].reshape(-1, bin_steps, x.shape[1]).mean(axis=(1, 2))
+
+    rasters = {name: np.vstack([density(inputs)] + [density(l) for l in layer_list])
+               for name, layer_list in layers.items()}
+    first = next(iter(layers.values()))
+    sizes = [inputs.shape[1]] + [l.shape[1] for l in first]
+    labels = ['input'] + [f'hidden {i + 1}' for i in range(len(first) - 1)] + ['output']
+    vmax = max(r.max() for r in rasters.values()) or 1.0
+    return rasters, labels, sizes, PowerNorm(0.5, vmin=0, vmax=vmax)
+
+
+def layer_activity_figure(inputs, layers, bin_steps=5, title=''):
+    """One stacked raster per network (rows: input, hidden layers, output),
+    on a shared time axis; colour = spikes per neuron per timestep, averaged
+    over bin_steps, on one colour scale for both networks."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    rasters, names, sizes, norm = layer_densities(inputs, layers, bin_steps)
+    labels = [f'{name} ({size})' for name, size in zip(names, sizes)]
+    n_rows = len(labels)
+    duration = rasters[next(iter(rasters))].shape[1] * bin_steps * STEP_S
+    fig, axes = plt.subplots(len(rasters), 1, figsize=(12, 1.2 + 0.55 * n_rows * len(rasters)),
+                             sharex=True, squeeze=False)
+    for ax, (name, raster) in zip(axes[:, 0], rasters.items()):
+        im = ax.imshow(raster, aspect='auto', interpolation='nearest', cmap=LAYER_CMAP,
+                       norm=norm, extent=(0, duration, n_rows - 0.5, -0.5))
+        ax.set_yticks(np.arange(n_rows), labels, fontsize=8)
+        ax.set_yticks(np.arange(n_rows + 1) - 0.5, minor=True)
+        ax.grid(which='minor', axis='y', color='white', linewidth=2)
+        ax.tick_params(which='minor', length=0)
+        ax.set_title(name, fontsize=10, loc='left', fontweight='bold')
+        for row, layer_density in enumerate(raster.mean(axis=1)):
+            ax.annotate(f'{layer_density:.3f}', (1.005, row), xycoords=('axes fraction', 'data'),
+                        va='center', fontsize=7, color='0.3')
+        ax.annotate('mean', (1.005, -0.5), xycoords=('axes fraction', 'data'), va='bottom',
+                    fontsize=7, color='0.3')
+    axes[-1, 0].set_xlabel(f'Time in trial (s; {bin_steps * STEP_S * 1000:g} ms bins)')
+    bar = fig.colorbar(im, ax=axes[:, 0], fraction=0.025, pad=0.07)
+    bar.set_label('Spike density (spikes / neuron / timestep)')
+    fig.suptitle(title or 'Spike density by layer over time', fontsize=11)
+    return fig
+
+
+def save_layer_activity_gif(inputs, layers, path, bin_steps=5, title='', fps=10):
+    """The data of layer_activity_figure() as an animation: per network, a
+    row of layers left to right in the direction spikes travel (input,
+    hidden layers, output), each a box whose height follows its neuron
+    count, coloured by its spike density in the current bin (same colours
+    and scale as the figure). One frame per bin, played at fps."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, PillowWriter
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.patches import FancyArrowPatch, Rectangle
+
+    rasters, names, sizes, norm = layer_densities(inputs, layers, bin_steps)
+    cmap = plt.get_cmap(LAYER_CMAP)
+    n_layers, n_frames = len(names), next(iter(rasters.values())).shape[1]
+    heights = 0.25 + 0.75 * np.asarray(sizes) / max(sizes)     # box height ~ neuron count
+    box_w, gap = 0.5 / 3, 0.6 / 3
+    xs = np.arange(n_layers) * (box_w + gap)
+    shorts = ['in'] + [f'h{i}' for i in range(1, n_layers - 1)] + ['out']   # names fit the narrow boxes
+
+    fig, axes = plt.subplots(len(rasters), 1, figsize=(2.3 + 0.45 * n_layers, 0.6 + 2.0 * len(rasters)),
+                             squeeze=False)
+    boxes, values = {}, {}
+    for ax, name in zip(axes[:, 0], rasters):
+        boxes[name], values[name] = [], []
+        for x, h, short, size in zip(xs, heights, shorts, sizes):
+            box = Rectangle((x, -h / 2), box_w, h, facecolor=cmap(0.0), edgecolor='black', linewidth=0.8)
+            ax.add_patch(box)
+            boxes[name].append(box)
+            ax.text(x + box_w / 2, -0.55, f'{short}\n{size}', ha='center', va='top', fontsize=7)
+            values[name].append(ax.text(x + box_w / 2, h / 2 + 0.04, '', ha='center', va='bottom', fontsize=7,
+                                        color='0.3'))
+        for x0, x1 in zip(xs[:-1], xs[1:]):
+            ax.add_patch(FancyArrowPatch((x0 + box_w + 0.02, 0), (x1 - 0.02, 0), arrowstyle='-|>',
+                                         mutation_scale=8, color='0.4', linewidth=1.2))
+        ax.set_xlim(xs[0] - 0.1, xs[-1] + box_w + 0.1)
+        ax.set_ylim(-0.8, 0.65)
+        ax.set_aspect('equal')
+        ax.axis('off')
+        ax.set_title(name, fontsize=9, loc='left', fontweight='bold')
+    fig.subplots_adjust(left=0.02, right=0.68, top=1 - 0.6 / fig.get_figheight(), bottom=0.02, hspace=0.15)
+    bar = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=fig.add_axes([0.7, 0.25, 0.035, 0.5]))
+    bar.set_label('Spike density (spikes / neuron / timestep)', fontsize=8)
+    clock = fig.suptitle('', fontsize=10)
+
+    def draw(frame):
+        t0 = frame * bin_steps * STEP_S
+        clock.set_text(f"{title or 'Spike density by layer'}\n"
+                       f"t = {t0:5.2f}-{t0 + bin_steps * STEP_S:.2f} s")
+        for name, raster in rasters.items():
+            for box, text, value in zip(boxes[name], values[name], raster[:, frame]):
+                box.set_facecolor(cmap(norm(value)))
+                text.set_text(f'{value:.3f}')
+        return []
+
+    FuncAnimation(fig, draw, frames=n_frames).save(path, writer=PillowWriter(fps=fps), dpi=100)
+    plt.close(fig)
+
+
 def main(args):
     root = args.snn_checkpoint_root or os.path.join(
         args.data_root, 'snn_checkpoints', args.experiment, args.subject, 'per_session')
@@ -293,6 +470,35 @@ def main(args):
         json.dump(report, f, indent=2)
     print(f"Saved {path}")
 
+    if args.figure_session == 'all':
+        figure_sessions = list(report['sessions'])
+    else:
+        figure_sessions = [args.figure_session or next(iter(report['sessions']), None)]
+    for figure_session in figure_sessions:
+        if args.figure_steps > 0 and figure_session:
+            save_layer_activity(args, root, dataset_root, results_dir, figure_session)
+
+
+def save_layer_activity(args, root, dataset_root, results_dir, session):
+    """The layer spike-density figure and GIF of one session."""
+    import matplotlib.pyplot as plt
+    checkpoint = os.path.join(root, session, args.snn_checkpoint_subdir, 'best_model_weights.pth')
+    figure_trial = args.figure_trial if args.figure_trial is not None else (
+        -1 if args.experiment == 'hkm' else 1)
+    inputs, layers, trial = layer_activity(
+        checkpoint, os.path.join(dataset_root, session), args.experiment, figure_trial,
+        args.figure_start, args.figure_steps, args.speck_devkit, args.speck_wait_time,
+        args.speck_raster_dt, args.speck_h1_threshold_scale)
+    title = f'Spike Density by Layer ({session}, test trial {trial})'
+    fig = layer_activity_figure(inputs, layers, args.figure_bin, title)
+    path = os.path.join(results_dir, f'speck_layer_activity_{session}.png')
+    fig.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved {path}")
+    path = os.path.join(results_dir, f'speck_layer_activity_{session}.gif')
+    save_layer_activity_gif(inputs, layers, path, args.figure_bin, title, fps=args.figure_fps)
+    print(f"Saved {path}")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__,
@@ -309,4 +515,23 @@ if __name__ == '__main__':
     parser.add_argument('--max_lag', type=int, default=50,
                         help='Largest chip output delay (in steps) searched for the best-lag correlation')
     parser.add_argument('--output', default=None)
+    figure = parser.add_argument_group('layer activity figure')
+    figure.add_argument('--figure_session', default=None,
+                        help="Session to draw, or 'all' for every session (default: the first diagnosed)")
+    figure.add_argument('--figure_trial', type=int, default=None,
+                        help='Test trial drawn; -1 is the longest (default: 1 for bmi, the longest for hkm)')
+    figure.add_argument('--figure_start', type=int, default=0, help='First timestep shown')
+    figure.add_argument('--figure_steps', type=int, default=750,
+                        help='Timesteps shown (4 ms each); 0 skips the figure')
+    figure.add_argument('--figure_bin', type=int, default=5,
+                        help='Timesteps averaged per colour cell (and per GIF frame)')
+    figure.add_argument('--figure_fps', type=int, default=10,
+                        help='GIF frames per second (default 10: 200 ms of trial per second at --figure_bin 5)')
+    figure.add_argument('--speck_devkit', default=None,
+                        help="Record the Speck raster on this devkit (e.g. speck2fdevkit:0), every "
+                             "layer monitored; default: emulate the quantized network on the host")
+    figure.add_argument('--speck_wait_time', type=float, default=0.001)
+    figure.add_argument('--speck_raster_dt', type=float, default=0.1)
+    figure.add_argument('--speck_h1_threshold_scale', type=float, default=1.0,
+                        help='as test_all_decoders.py: hidden layer 1 threshold factor on the chip')
     main(parser.parse_args())

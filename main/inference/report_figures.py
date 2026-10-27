@@ -2,10 +2,12 @@
 Report figures across the sessions of one subject (called by make_report.py).
 
     efficiency figure   RMSE vs. per-sample latency, marker area ~ parameter
-                        count; one panel per profiled machine (e.g. the cluster
-                        and the Speck-connected laptop)
+                        count, each marker labelled with its latency; one
+                        panel per profiled machine (e.g. the cluster and the
+                        Speck-connected laptop)
     energy figure       energy per sample, with proxy estimates and real
-                        (RAPL / chip) measurements in separate panels
+                        (RAPL / chip) measurements in separate panels; each
+                        bar labelled with its energy and mean power
     4x2 figure          a/b RMSE and CC boxplots over sessions (box = quartiles,
                         whiskers = 1.5 IQR, white dot = mean) with Wilcoxon
                         significance against the best decoder, c/d pairwise
@@ -43,6 +45,16 @@ def display_label(name):
     return 'SNN (Speck)' if name == 'speck' else name.upper()
 
 
+def format_si(value, unit, digits=3):
+    """value in base units as e.g. '412 uW', '1.27 mW', '35.2 W' (3 significant digits)."""
+    if value is None:
+        return 'n/a'
+    for scale, prefix in ((1, ''), (1e-3, 'm'), (1e-6, 'u'), (1e-9, 'n')):
+        if abs(value) >= scale:
+            break
+    return f"{value / scale:.{digits}g} {prefix}{unit}"
+
+
 def mean_ci(values, confidence=0.95):
     """(mean, low, high) with a t-distribution confidence interval."""
     values = np.asarray(values, dtype=float)
@@ -62,6 +74,36 @@ def average_cc(entry):
 # Efficiency and energy
 # --------------------------------------------------------------------------- #
 
+def _label_markers(ax, records, sizes, height=24, width=70):
+    """Name (bold) over latency, right of each marker; labels that would
+    overlap a neighbour's (within `width` points across) are pushed apart
+    vertically, with a thin leader line to their marker."""
+    ax.get_xlim(), ax.get_ylim()                        # settle autoscaling so transData is final
+    points_per_px = 72 / ax.figure.dpi
+    anchors = [ax.transData.transform((r['latency_s'] * 1000, r['rmse'])) * points_per_px for r in records]
+    radii = [np.sqrt(size / np.pi) for size in sizes]
+    label_y = [a[1] for a in anchors]
+    for _ in range(50):                                 # settle overlaps, lowest label first
+        moved = False
+        order = np.argsort(label_y)
+        for k, i in enumerate(order):
+            for j in order[k + 1:]:
+                gap = label_y[j] - label_y[i]
+                if abs((anchors[i][0] + radii[i]) - (anchors[j][0] + radii[j])) < width and gap < height:
+                    shift = (height - gap) / 2
+                    label_y[i], label_y[j] = label_y[i] - shift, label_y[j] + shift
+                    moved = True
+        if not moved:
+            break
+    for rec, anchor, radius, ly in zip(records, anchors, radii, label_y):
+        x, y, dy = rec['latency_s'] * 1000, rec['rmse'], ly - anchor[1]
+        leader = dict(arrowstyle='-', color='0.5', lw=0.6, shrinkA=0, shrinkB=radius) if abs(dy) > 2 else None
+        ax.annotate(display_label(rec['name']), (x, y), textcoords='offset points', xytext=(radius + 4, dy + 1),
+                    ha='left', va='bottom', fontsize=9, fontweight='bold', arrowprops=leader)
+        ax.annotate(format_si(rec['latency_s'], 's'), (x, y), textcoords='offset points',
+                    xytext=(radius + 4, dy - 1), ha='left', va='top', fontsize=8)
+
+
 def efficiency_panel(ax, records, colors=EFFICIENCY_COLORS, error_bars=False):
     """RMSE vs. latency (log x); records have name, rmse, latency_s,
     param_count, and (for error_bars) rmse_lo/hi, latency_lo/hi."""
@@ -72,8 +114,6 @@ def efficiency_panel(ax, records, colors=EFFICIENCY_COLORS, error_bars=False):
         x, y = rec['latency_s'] * 1000, rec['rmse']
         ax.scatter(x, y, s=size, color=colors.get(rec['name'], 'gray'), edgecolor='black',
                    linewidth=0.8, alpha=0.85, zorder=3, hatch=HATCHES.get(rec['name']))
-        ax.annotate(display_label(rec['name']), (x, y), textcoords='offset points', xytext=(0, 12),
-                    ha='center', fontsize=9, fontweight='bold')
         if error_bars:
             xerr = [[max(0, x - rec['latency_lo'] * 1000)], [max(0, rec['latency_hi'] * 1000 - x)]]
             yerr = [[max(0, y - rec['rmse_lo'])], [max(0, rec['rmse_hi'] - y)]]
@@ -83,7 +123,8 @@ def efficiency_panel(ax, records, colors=EFFICIENCY_COLORS, error_bars=False):
     ax.set_xlabel('Per-sample inference latency (ms, log scale)')
     ax.set_ylabel('Mean RMSE (across sessions)')
     ax.grid(True, which='both', linestyle=':', alpha=0.4)
-    ax.margins(y=0.18)
+    ax.margins(x=0.12, y=0.18)                         # room for the labels right of the markers
+    _label_markers(ax, records, sizes)
     handles = [ax.scatter([], [], s=60 + 900 * np.sqrt(f), color='gray', edgecolor='black', alpha=0.6,
                           label=f'{int(f * max_params):,} params') for f in (0.1, 0.5, 1.0)]
     ax.legend(handles=handles, title='Parameter count (rough scale)', loc='upper center',
@@ -118,7 +159,9 @@ def _energy_panel(ax, records, title):
         method = {'rapl': 'RAPL', 'chip_power_monitor': 'chip',
                   'proxy_psutil': 'proxy'}.get(rec['energy_method'], rec['energy_method'] or 'unknown')
         ax.annotate(f"{display_label(rec['name'])}\n{rec['machine']}, {method}", (i, e), textcoords='offset points',
-                    xytext=(0, 8), ha='center', fontsize=8, fontweight='bold')
+                    xytext=(0, 30), ha='center', fontsize=8, fontweight='bold')
+        ax.annotate(f"{format_si(rec['energy_j'], 'J')}/sample\n{format_si(rec.get('power_w'), 'W')}", (i, e),
+                    textcoords='offset points', xytext=(0, 6), ha='center', fontsize=8)
     ax.set_xticks(np.arange(len(records)), [])
     ax.set_yscale('log')
     ax.set_title(title, fontsize=10)
@@ -278,10 +321,12 @@ def _over_x(ax, x_values, series, decoders, ylabel, xlabel, fmt, clip_decoder=No
                                 arrowprops=dict(arrowstyle='-|>', color=color, lw=1.2))
 
 
-def comparison_4x2_figure(combined, durations=None):
+def comparison_4x2_figure(combined, durations=None, show_durations=False):
     """combined: {session: {decoder: metrics}}; durations: {session: {"Nmin":
-    {decoder: metrics}}} or None. Sessions missing any decoder are left out
-    of rows a-d and g-h so the paired tests compare the same sessions."""
+    {decoder: metrics}}} or None. Rows: accuracy box plots, pairwise
+    matrices, accuracy vs. training duration (only with show_durations) and
+    accuracy over time. Sessions missing any decoder are left out of every
+    row but the duration row, so the paired tests compare the same sessions."""
     present = {d for entry in combined.values() for d in entry}
     decoders = [d for d in DECODER_ORDER if d in present]
     sessions = []
@@ -301,7 +346,8 @@ def comparison_4x2_figure(combined, durations=None):
     reference = min(decoders, key=lambda d: np.mean(rmse[d]))
     print(f"  [4x2] {len(sessions)} sessions; significance vs. {reference.upper()}")
 
-    fig, axes = plt.subplots(4, 2, figsize=(12, 20))
+    n_rows = 4 if show_durations else 3
+    fig, axes = plt.subplots(n_rows, 2, figsize=(12, 5 * n_rows))
     for col, (values, ylabel) in enumerate([(rmse, 'Average RMSE'), (cc, 'Average CC')]):
         others = [d for d in decoders if d != reference]
         p_adj = _holm([_wilcoxon_p(values[d], values[reference]) for d in others])
@@ -309,32 +355,10 @@ def comparison_4x2_figure(combined, durations=None):
         _boxplot(axes[0, col], values, decoders, sig, ylabel)
         _pairwise_matrix(axes[1, col], values, decoders, higher_is_better=(col == 1))
 
-    # e/f: accuracy vs. training duration, mean and 95% CI across sessions
-    samples = {}   # (decoder, minutes) -> ([rmse], [cc])
-    for per_tag in (durations or {}).values():
-        for tag, entry in per_tag.items():
-            for d, m in entry.items():
-                r, c = samples.setdefault((d, float(tag[:-3])), ([], []))
-                r.append(m['rmse'])
-                c.append(average_cc(m))
-    duration_decoders = [d for d in DECODER_ORDER if any(k[0] == d for k in samples)]
-    minutes = sorted({k[1] for k in samples})
-    for col, (idx, ylabel, clip) in enumerate([(0, 'RMSE', 'wf'), (1, 'Correlation', None)]):
-        ax = axes[2, col]
-        if not duration_decoders:
-            ax.text(0.5, 0.5, 'No training-duration results', ha='center', va='center',
-                    transform=ax.transAxes, fontsize=10, color='gray')
-            continue
-        series = {}
-        for d in duration_decoders:
-            stats = [mean_ci(samples[(d, m)][idx]) if (d, m) in samples else (np.nan,) * 3 for m in minutes]
-            series[d] = tuple(zip(*stats))
-        # WF's unregularized short-duration fits can explode; clip them so
-        # the other decoders stay readable (RMSE only; CC is bounded).
-        _over_x(ax, minutes, series, duration_decoders, ylabel, 'Training Duration (min)',
-                lambda x: f"{x:g}", clip_decoder=clip)
+    if show_durations:
+        _duration_row(axes[2], durations)
 
-    # g/h: accuracy vs. days since the first session
+    # last row: accuracy vs. days since the first session
     first = min(session_date(s) for s in sessions)
     days = [(session_date(s) - first).days for s in sessions]
     for col, (key, ylabel) in enumerate([('rmse', 'RMSE'), ('cc', 'Correlation')]):
@@ -348,13 +372,41 @@ def comparison_4x2_figure(combined, durations=None):
                 mean = [average_cc(e) for e in entries]
                 series[d] = (mean, [e.get('cc_ci_low', m) for e, m in zip(entries, mean)],
                              [e.get('cc_ci_high', m) for e, m in zip(entries, mean)])
-        _over_x(axes[3, col], days, series, decoders, ylabel, 'Days Since Implantation',
+        _over_x(axes[-1, col], days, series, decoders, ylabel, 'Days Since Implantation',
                 lambda x: str(int(round(x))))
 
-    handles, labels = axes[3, 0].get_legend_handles_labels()
+    handles, labels = axes[-1, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='upper center', ncol=len(decoders), bbox_to_anchor=(0.5, 1.01),
                frameon=False)
     for ax, letter in zip(axes.flat, 'abcdefgh'):
         ax.text(-0.12, 1.05, letter, transform=ax.transAxes, fontsize=13, fontweight='bold', va='top')
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     return fig
+
+
+def _duration_row(axes, durations):
+    """Accuracy vs. training duration, mean and 95% CI across sessions."""
+    samples = {}   # (decoder, minutes) -> ([rmse], [cc])
+    for per_tag in (durations or {}).values():
+        for tag, entry in per_tag.items():
+            for d, m in entry.items():
+                r, c = samples.setdefault((d, float(tag[:-3])), ([], []))
+                r.append(m['rmse'])
+                c.append(average_cc(m))
+    duration_decoders = [d for d in DECODER_ORDER if any(k[0] == d for k in samples)]
+    minutes = sorted({k[1] for k in samples})
+    for col, (idx, ylabel, clip) in enumerate([(0, 'RMSE', 'wf'), (1, 'Correlation', None)]):
+        ax = axes[col]
+        if not duration_decoders:
+            ax.text(0.5, 0.5, 'No training-duration results', ha='center', va='center',
+                    transform=ax.transAxes, fontsize=10, color='gray')
+            continue
+        series = {}
+        for d in duration_decoders:
+            stats = [mean_ci(samples[(d, m)][idx]) if (d, m) in samples else (np.nan,) * 3 for m in minutes]
+            series[d] = tuple(zip(*stats))
+        # WF's unregularized short-duration fits can explode; clip them so
+        # the other decoders stay readable (RMSE only; CC is bounded).
+        _over_x(ax, minutes, series, duration_decoders, ylabel, 'Training Duration (min)',
+                lambda x: f"{x:g}", clip_decoder=clip)
+

@@ -20,6 +20,11 @@ The file has three sections, each computed only where missing (or with
                and its method, and parameter count per decoder (profiling.py;
                'speck' copied from its chip measurement)
 
+hkm sessions are scored trial by trial: every SNN test trial (one whole
+reach) runs from rest, and its output is placed on that trial's own ANN test
+rows (see decoder_eval.py). This needs the trial IDs that
+nwb_conversion/run_nwb_pipeline.sh stores in both datasets.
+
 The full-data predictions are also saved next to --output as
 <session>_arrays.npz, so --figures_dir can redraw the per-session figures
 (session_figures.py) without evaluating again, e.g. without the chip;
@@ -72,19 +77,25 @@ pin_torch_threads()
 
 from decoder_eval import (ALL_DECODERS, DEFAULT_CI_N_SPLITS, available_decoders,  # noqa: E402
                           checkpoint_id, duration_checkpoint_path, evaluate_decoders,
-                          snn_checkpoints, test_split_start)
+                          snn_checkpoints, speck_h1_threshold_scale, test_split_start)
 from profiling import profile_decoders  # noqa: E402
 
 
 def load_session_data(args):
+    """The test rows of the ANN dataset, with each row's trial ID where the
+    dataset records them (hkm: nwb_conversion/combine_trial_windows_to_ann_h5.py)."""
     with h5py.File(args.input_filepath, 'r') as f:
         X = f[f'X_{args.feature}'][()]
         y_task = f['y_task'][()]
+        trial_id = f['trial_id'][()] if 'trial_id' in f else None
         n_train_attr = f.attrs.get('n_train')
     n_train = test_split_start(len(X), args.test_frac, n_train_attr, args.n_train_override)
-    print(f"Chronological split: {n_train} train rows, {len(X) - n_train} test rows")
+    test_trial_id = None if trial_id is None else trial_id[n_train:]
+    print(f"Chronological split: {n_train} train rows, {len(X) - n_train} test rows"
+          + ("" if test_trial_id is None else f" ({len(np.unique(test_trial_id))} trials)"))
     return {'X_test': X[n_train:], 'y_test_full': y_task[n_train:],
-            'y_test_vel': y_task[n_train:, 2:4], 'y_test_pos': y_task[n_train:, 0:2]}
+            'y_test_vel': y_task[n_train:, 2:4], 'y_test_pos': y_task[n_train:, 0:2],
+            'test_trial_id': test_trial_id}
 
 
 def changed_checkpoints(full, args, decoders):
@@ -92,7 +103,11 @@ def changed_checkpoints(full, args, decoders):
     (results recorded before checkpoints were stored count as unchanged)."""
     recorded = full.get('checkpoints') or {}
     current = snn_checkpoints(args.snn_checkpoint_path, args.speck_checkpoint_path)
-    return [d for d in recorded if d in decoders and checkpoint_id(recorded[d]) != checkpoint_id(current[d])]
+    changed = [d for d in recorded if d in decoders and checkpoint_id(recorded[d]) != checkpoint_id(current[d])]
+    if ('speck' in recorded and 'speck' in decoders and 'speck' not in changed
+            and full.get('speck_h1_threshold_scale', 1.0) != speck_h1_threshold_scale(args)):
+        changed.append('speck')     # same checkpoint, deployed with another hidden-layer-1 threshold
+    return changed
 
 
 def _json_ready(result):
@@ -102,6 +117,8 @@ def _json_ready(result):
 def save_arrays(arrays, path):
     extra = {} if arrays.get('speck_counts') is None else {
         'speck_counts': arrays['speck_counts'].astype(np.uint16)}
+    if arrays.get('trial_starts') is not None:
+        extra['trial_starts'] = arrays['trial_starts']
     np.savez_compressed(path, y_true=arrays['y_true'], y_pos=arrays['y_pos'], **extra,
                         **{f"pred_{name}": y for name, y in arrays['pred'].items()})
 
@@ -110,6 +127,7 @@ def load_arrays(path):
     with np.load(path) as f:
         return {'y_true': f['y_true'], 'y_pos': f['y_pos'],
                 'speck_counts': f['speck_counts'] if 'speck_counts' in f.files else None,
+                'trial_starts': f['trial_starts'] if 'trial_starts' in f.files else None,
                 'pred': {k[len('pred_'):]: f[k] for k in f.files if k.startswith('pred_')}}
 
 
@@ -238,7 +256,8 @@ def main(args):
         chip = results['full']['metrics'].get('speck', {}).get('chip')
         if 'speck' in todo and chip:
             profile['speck'] = {'latency_s': chip['latency_s'], 'energy_j': chip['energy_j'],
-                                'energy_method': 'chip_power_monitor', 'param_count': chip['param_count']}
+                                'energy_method': 'chip_power_monitor', 'power_w': chip.get('power_w'),
+                                'param_count': chip['param_count']}
         entry = results['profiles'].setdefault(args.machine, {'decoders': {}})
         entry['host'] = platform.node()
         entry['decoders'].update(profile)
@@ -288,7 +307,8 @@ def build_parser():
     ev.add_argument('--ci_n_splits', type=int, default=DEFAULT_CI_N_SPLITS,
                     help='Contiguous chunks used for the within-session CIs')
     ev.add_argument('--continuous_snn_test_stream', action='store_true',
-                    help='HKM only: carry SNN state across test trials instead of resetting')
+                    help='HKM only: carry SNN state across test trials instead of starting each '
+                         'from rest (as in training)')
     ev.add_argument('--verbose', type=int, default=0)
 
     speck = parser.add_argument_group("the 'speck' decoder (needs samna and a connected devkit)")
@@ -297,6 +317,9 @@ def build_parser():
                        help='Seconds to wait after each timestep\'s input before reading output spikes')
     speck.add_argument('--speck_raster_dt', type=float, default=0.1,
                        help='dt passed to ChipFactory.raster_to_events()')
+    speck.add_argument('--speck_h1_threshold_scale', type=float, default=1.0,
+                       help='Multiply hidden layer 1\'s threshold and lower bound on the chip (2 for hkm: '
+                            'its dense input otherwise fires that layer far more than in training)')
 
     prof = parser.add_argument_group('profiling')
     prof.add_argument('--machine', default='cluster' if 'SLURM_JOB_ID' in os.environ else 'local',

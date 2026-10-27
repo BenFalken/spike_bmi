@@ -21,7 +21,12 @@ updates a neuron after every input event and fires at most once per event
 threshold at every spike rather than once per timestep.
 
 run_discretized() steps the discretized network (8-bit weights, integer
-thresholds) one timestep at a time, like training, for diagnose_speck.py.
+thresholds) one timestep at a time, like training, for diagnose_speck.py;
+run_layers() does the same for either network but returns every neuron
+layer's spikes. A SpeckDevkit opened with monitor_all=True streams every
+layer's spikes from the chip as well (for diagnose_speck.py's layer
+activity figure; the extra traffic makes its latency and power
+unrepresentative).
 
 samna and the dynapcnn backend are imported only when a chip run is
 requested, so machines without a devkit never need them.
@@ -34,7 +39,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from decoder_eval import BASE_NPERSEG, _load_pickle, snn_test_files, unscale_velocity
+from decoder_eval import _load_pickle, snn_input, snn_test_files, unscale_velocity
 
 POWER_SAMPLE_RATE_HZ = 100
 RESET_SETTLE_S = 1.0     # after writing zeroed membrane values to a layer
@@ -91,11 +96,48 @@ def discretized_sequential(network):
     return nn.Sequential(*[m for pair in pairs for m in pair])
 
 
+def scale_first_threshold(snn_seq, factor):
+    """A copy of snn_seq with the first neuron layer's threshold and lower
+    bound multiplied by factor. On the chip each input event can fire a
+    neuron at once, so excitatory events arriving before the inhibitory ones
+    of the same timestep make dense input (hkm) fire hidden layer 1 where
+    training stays silent; a higher threshold there (x2 for hkm, measured in
+    speck_lab/) removes most of that excess firing."""
+    import copy
+    seq = copy.deepcopy(snn_seq)
+    if factor == 1:
+        return seq
+    neuron = next(m for m in seq if not isinstance(m, (nn.Linear, nn.Conv2d, nn.Flatten)))
+    for attr in ('spike_threshold', 'min_v_mem'):
+        value = getattr(neuron, attr, None)
+        if value is None:
+            continue
+        scaled = torch.as_tensor(value).float() * factor   # integer tensors would truncate (-1.5 -> -1)
+        if attr in neuron._parameters:
+            neuron._parameters[attr] = nn.Parameter(scaled, requires_grad=False)
+        elif attr in neuron._buffers:
+            neuron._buffers[attr] = scaled
+        else:
+            setattr(neuron, attr, scaled if torch.is_tensor(value) else float(scaled))
+    return seq
+
+
+def reset_states(seq):
+    """sinabs.reset_states(seq), after replacing any neuron state a run left
+    as a view of another tensor (sinabs cannot reset those in place: "Can't
+    detach views in-place")."""
+    import sinabs
+    for m in seq.modules():
+        for name, buf in list(m._buffers.items()):
+            if buf is not None and buf._base is not None:
+                m._buffers[name] = buf.detach().clone()
+    sinabs.reset_states(seq)
+
+
 def run_float(snn_seq, input_spikes):
     """(C, T) input -> (T, n_out) output spikes of the flattened network."""
-    import sinabs
     x = torch.from_numpy(input_spikes.T.astype(np.float32))
-    sinabs.reset_states(snn_seq)
+    reset_states(snn_seq)
     with torch.no_grad():
         return torch.cat([snn_seq(x[t:t + 1]) for t in range(len(x))]).numpy()
 
@@ -103,11 +145,31 @@ def run_float(snn_seq, input_spikes):
 def run_discretized(disc_seq, input_spikes):
     """(C, T) input -> (T, n_out) output spikes of the quantized network,
     one timestep per call (state carried between calls, as in training)."""
-    import sinabs
     x = torch.from_numpy(input_spikes.T.astype(np.float32))[:, :, None, None]
-    sinabs.reset_states(disc_seq)
+    reset_states(disc_seq)
     with torch.no_grad():
         return torch.cat([disc_seq(x[t:t + 1]).reshape(1, -1) for t in range(len(x))]).numpy()
+
+
+def run_layers(seq, input_spikes):
+    """(C, T) input -> [(T, n) spikes of each neuron layer of seq], in order,
+    one timestep per call; seq is the flattened (Linear) or the discretized
+    (Conv2d) network."""
+    conv = any(isinstance(m, nn.Conv2d) for m in seq)
+    x = torch.from_numpy(input_spikes.T.astype(np.float32))
+    if conv:
+        x = x[:, :, None, None]
+    reset_states(seq)
+    steps = []
+    with torch.no_grad():
+        for t in range(len(x)):
+            out, spikes = x[t:t + 1], []
+            for module in seq:
+                out = module(out)
+                if not isinstance(module, (nn.Linear, nn.Conv2d, nn.Flatten)):
+                    spikes.append(out.reshape(-1).numpy())
+            steps.append(spikes)
+    return [np.stack(layer) for layer in zip(*steps)]
 
 
 def check_deployable(model, checkpoint):
@@ -124,14 +186,13 @@ def check_deployable(model, checkpoint):
 def cross_check_flattened(model, snn_seq, input_spikes, tol=1e-4):
     """Run one trial (C, T) through snn_seq + host decode and model(); they
     must agree, or the network deployed to the chip is not the trained one."""
-    import sinabs
     x = torch.from_numpy(input_spikes.T.astype(np.float32))           # (T, C)
-    sinabs.reset_states(snn_seq)
+    reset_states(snn_seq)
     with torch.no_grad():
         spikes = torch.cat([snn_seq(x[t:t + 1]) for t in range(len(x))])
         flat = decode_spike_counts(model, spikes)
         ref = model(x[:, None, :])[0].squeeze(1).numpy()
-    sinabs.reset_states(snn_seq)
+    reset_states(snn_seq)
     max_diff = float(np.abs(flat - ref).max())
     if max_diff > tol:
         raise RuntimeError(f"Flattened network differs from model() by {max_diff:.2e} "
@@ -161,13 +222,17 @@ def measure_chip_power(power_events, loop_s, sample_rate_hz=POWER_SAMPLE_RATE_HZ
 class SpeckDevkit:
     """A converted network deployed on a Speck2f devkit."""
 
-    def __init__(self, snn_seq, n_inputs, devkit='speck2fdevkit:0', wait_time=0.001, raster_dt=0.1):
+    def __init__(self, snn_seq, n_inputs, devkit='speck2fdevkit:0', wait_time=0.001, raster_dt=0.1,
+                 monitor_all=False):
         import samna
         import sinabs.backend.dynapcnn.io as sio
         from sinabs.backend.dynapcnn.chip_factory import ChipFactory
 
         self.samna, self.wait_time, self.raster_dt = samna, wait_time, raster_dt
+        self.monitor_all, self.layer_counts = monitor_all, None
         self.network = discretize(snn_seq, n_inputs)
+        self.layer_sizes = [m.out_channels for m in discretized_sequential(self.network)
+                            if isinstance(m, nn.Conv2d)]
         self.param_count = sum(p.numel() for m in self.network.modules() if isinstance(m, nn.Conv2d)
                                for p in (m.weight, m.bias) if p is not None)
 
@@ -190,9 +255,9 @@ class SpeckDevkit:
         self.cores = [ordering[k] for k in sorted(ordering)] if isinstance(ordering, dict) else list(ordering)
         config.dvs_layer.pass_sensor_events = False
         for core in self.cores:
-            # Only the output layer is read; monitoring the hidden layers would
-            # stream all of their spikes to the host as well.
-            config.cnn_layers[core].monitor_enable = core == self.cores[-1]
+            # Normally only the output layer is read; monitoring the hidden
+            # layers streams all of their spikes to the host as well.
+            config.cnn_layers[core].monitor_enable = monitor_all or core == self.cores[-1]
         self.device.get_model().apply_configuration(config)
         self.resets = ['hard' if config.cnn_layers[c].return_to_zero else 'soft' for c in self.cores]
         print(f"  [speck] {devkit}: chip layers {self.cores}, reset {'/'.join(self.resets)}, "
@@ -222,10 +287,12 @@ class SpeckDevkit:
         """Feed one trial (C, T) a timestep at a time. Returns (output spike
         counts (T, n_outputs), loop seconds, mean power in W, input events
         sent). Output spikes still in flight after the wait are counted in
-        a later timestep."""
+        a later timestep. With monitor_all, self.layer_counts is then the
+        list of every layer's spike counts (T, layer size), in order."""
         frames = torch.from_numpy(input_spikes.T.astype(np.float32))[:, None, :, None, None]
         spike_type, last_core = self.samna.speck2f.event.Spike, self.cores[-1]
         counts = np.zeros((len(frames), n_outputs))
+        layer_counts = [np.zeros((len(frames), n)) for n in self.layer_sizes] if self.monitor_all else None
         n_input_events = 0
         self.power_monitor.start_auto_power_measurement(POWER_SAMPLE_RATE_HZ)
         start = time.perf_counter()
@@ -236,13 +303,18 @@ class SpeckDevkit:
                 self.stop_watch.start(reset=True)
                 self.input_source.write(events)
             time.sleep(self.wait_time)
-            features = [ev.feature for ev in self.output_sink.get_events()
-                        if isinstance(ev, spike_type) and ev.layer == last_core]
+            spikes = [ev for ev in self.output_sink.get_events() if isinstance(ev, spike_type)]
+            features = [ev.feature for ev in spikes if ev.layer == last_core]
             counts[t] = np.bincount(features, minlength=n_outputs)[:n_outputs]
+            if layer_counts is not None:
+                for core, layer in zip(self.cores, layer_counts):
+                    features = [ev.feature for ev in spikes if ev.layer == core]
+                    layer[t] = np.bincount(features, minlength=layer.shape[1])[:layer.shape[1]]
         loop_s = time.perf_counter() - start
         self.power_monitor.stop_auto_power_measurement()
         power_events = self.power_sink.get_events()
         power_w, count_ok = measure_chip_power(power_events, loop_s)
+        self.layer_counts = layer_counts
         if not count_ok:
             print(f"  WARNING: {len(power_events)} power samples over {loop_s:.2f} s is not what "
                   f"{POWER_SAMPLE_RATE_HZ} Hz per channel predicts; this trial's power may be unreliable")
@@ -256,50 +328,53 @@ class SpeckDevkit:
 # Test set
 # --------------------------------------------------------------------------- #
 
-def open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt):
+def open_speck(model, checkpoint, snn_dataset_path, devkit, wait_time, raster_dt, monitor_all=False,
+               h1_threshold_scale=1.0):
     """Check the checkpoint can be deployed, cross-check the flattened
-    network on the first test trial, and deploy it."""
+    network on the first test trial, and deploy it, with the first neuron
+    layer's threshold scaled by h1_threshold_scale (scale_first_threshold())."""
     check_deployable(model, checkpoint)
     snn_seq = flatten_snn(model)
     snn_seq.eval()
-    cross_check_flattened(model, snn_seq, _load_pickle(snn_test_files(snn_dataset_path)[0])['input_spikes'])
-    return SpeckDevkit(snn_seq, model.layers[0].in_features, devkit, wait_time, raster_dt)
+    first = _load_pickle(snn_test_files(snn_dataset_path)[0])['input_spikes']
+    cross_check_flattened(model, snn_seq, snn_input(model, first))
+    if h1_threshold_scale != 1:
+        print(f"  [speck] hidden layer 1 threshold and lower bound x{h1_threshold_scale:g}")
+    return SpeckDevkit(scale_first_threshold(snn_seq, h1_threshold_scale), model.layers[0].in_features,
+                       devkit, wait_time, raster_dt, monitor_all)
 
 
-def predict_speck_test_set(model, velocity_scale, snn_dataset_path, device, experiment,
-                           continuous_stream=False):
-    """The chip counterpart of decoder_eval.predict_snn_test_set(): the same
-    trials, the same dropped first window, so its output aligns the same way.
+def predict_speck_test_set(model, velocity_scale, trials, device, experiment, continuous_stream=False):
+    """The chip counterpart of decoder_eval.predict_snn_trials(): the same
+    test trials (decoder_eval.load_test_trials()), each from a reset chip
+    unless continuous_stream (hkm only) carries the state across trials.
+    With several bmi trials, trial 0 is not run: decoder_eval drops its
+    output anyway (see its module docstring).
 
-    Returns (pred (n, 2), chip, output spike counts (n, 2 * n_bins)) with
-    chip = {latency_s, energy_j (per sample), power_w, param_count,
-    n_timesteps, output_spikes_per_step, input_events_sent,
-    input_spikes, wait_time_s, raster_dt}; input_events_sent should equal
-    input_spikes (the summed input counts)."""
-    files = snn_test_files(snn_dataset_path)
+    Returns (predictions (T, 2) per trial, output spike counts
+    (T, 2 * n_bins) per trial, chip), the lists in trial order with None for
+    a trial not run, and chip = {latency_s, energy_j (per sample), power_w,
+    param_count, n_timesteps, output_spikes_per_step, input_events_sent,
+    input_spikes, wait_time_s, raster_dt} over every trial run;
+    input_events_sent should equal input_spikes (the summed input counts)."""
     continuous = continuous_stream and experiment == 'hkm'
     n_outputs = 2 * model.n_bins
-    preds, kept_counts, loop_s, energy_j, n_timed, n_spikes = [], [], 0.0, 0.0, 0, 0.0
-    n_events, n_input = 0, 0
-    for i, path in enumerate(files):
-        if i == 0 and len(files) > 1 and not continuous:
+    preds, counts_per_trial = [None] * len(trials), [None] * len(trials)
+    loop_s, energy_j, n_timed, n_spikes, n_events, n_input = 0.0, 0.0, 0, 0.0, 0, 0
+    for i, trial in enumerate(trials):
+        if experiment != 'hkm' and i == 0 and len(trials) > 1:
             continue                                  # dropped anyway; skip the chip time
-        if i == 0 or not continuous:
+        if not continuous or i == 0:
             device.reset()
-        spikes = _load_pickle(path)['input_spikes']
+        spikes = snn_input(model, trial['input_spikes'])
         counts, seconds, power_w, events = device.run(spikes, n_outputs)
         n_events, n_input = n_events + events, n_input + int(np.round(spikes).sum())
-        print(f"  [speck] trial {i + 1}/{len(files)}: {spikes.shape[1]} timesteps, "
+        print(f"  [speck] trial {i + 1}/{len(trials)}: {spikes.shape[1]} timesteps, "
               f"{seconds * 1000 / spikes.shape[1]:.3f} ms/timestep, {power_w * 1000:.3f} mW")
         loop_s, energy_j, n_timed = loop_s + seconds, energy_j + power_w * seconds, n_timed + len(counts)
         n_spikes += counts.sum()
-        y_pred = unscale_velocity(decode_spike_counts(model, counts), velocity_scale)
-        if len(files) == 1:
-            preds.append(y_pred[BASE_NPERSEG:])
-            kept_counts.append(counts[BASE_NPERSEG:])
-        elif i > 0:
-            preds.append(y_pred)
-            kept_counts.append(counts)
+        preds[i] = unscale_velocity(decode_spike_counts(model, counts), velocity_scale)
+        counts_per_trial[i] = counts
     if n_events != n_input:
         print(f"  WARNING: {n_events} input events sent to the chip for {n_input} input spikes")
     chip = {'latency_s': loop_s / n_timed, 'energy_j': energy_j / n_timed,
@@ -308,4 +383,4 @@ def predict_speck_test_set(model, velocity_scale, snn_dataset_path, device, expe
             'output_spikes_per_step': float(n_spikes / n_timed),
             'input_events_sent': int(n_events), 'input_spikes': int(n_input),
             'wait_time_s': device.wait_time, 'raster_dt': device.raster_dt}
-    return np.concatenate(preds, axis=0), chip, np.concatenate(kept_counts, axis=0)
+    return preds, counts_per_trial, chip
