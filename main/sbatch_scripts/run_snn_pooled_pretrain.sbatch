@@ -16,6 +16,8 @@
 #   LOSO=0            one job: pretrained on every session.
 #
 # Pools are symlinks to the sessions' .pkl files (build_pretraining_pool.py).
+# By default (MODEL=lsnn) this pretrains the recurrent LSNN (snn_config.sh) into lsnn_*
+# checkpoint directories; MODEL=pooled (on both scripts) runs the earlier pooled SNN.
 #
 # Submit (from this directory), each fine-tune task starting when its
 # pretraining succeeds:
@@ -39,7 +41,7 @@ if [ -z "${EXPERIMENT:-}" ] || [ -z "${SUBJECT:-}" ]; then
 fi
 DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
 source ./snn_config.sh
-select_model pooled_pretrain   # hard reset; fine-tuning uses soft
+select_model "${MODEL:-lsnn}_pretrain"   # default the LSNN; MODEL=pooled: the earlier SNN (hard reset here, soft in fine-tuning)
 
 EXCLUDE_ARGS=()
 if [ "$LOSO" = "1" ]; then

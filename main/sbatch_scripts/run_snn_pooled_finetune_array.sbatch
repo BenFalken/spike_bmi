@@ -16,7 +16,9 @@
 #
 # Checkpoints: ${DATA_ROOT}/snn_checkpoints/<exp>/<subject>/loso_finetuned_binarized_soft/<session>/
 #              (LOSO=0: .../full_cohort_finetuned_binarized_soft/<session>/)
-# These are the 'snn' checkpoints of run_inference.sbatch.
+# These are the 'snn' checkpoints of run_inference.sbatch. The default (MODEL=lsnn) writes
+#   .../lsnn_loso_finetuned_binarized/<session>/; MODEL=pooled the paths above (compare the
+#   two: snn_training/compare_loso.py).
 # Re-submitting skips finished sessions and resumes interrupted ones.
 
 set -eo pipefail
@@ -27,7 +29,7 @@ if [ -z "${EXPERIMENT:-}" ] || [ -z "${SUBJECT:-}" ]; then
 fi
 DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
 source ./snn_config.sh
-select_model pooled
+select_model "${MODEL:-lsnn}"   # default the LSNN; MODEL=pooled: the earlier SNN (snn_config.sh)
 array_session
 
 PRETRAINED_CHECKPOINT="$(pretrain_dir "$SESSION_ID")/best_model_weights.pth"

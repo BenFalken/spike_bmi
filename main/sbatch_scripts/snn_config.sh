@@ -10,6 +10,13 @@
 #                pooled), the most accurate in PyTorch; the reset has no weights, so the
 #                hard-reset pretrained weights load unchanged. Not deployable to Speck
 #                (no synaptic stage).
+#   lsnn         The DEFAULT of the two pooled scripts (MODEL=lsnn): the recurrent LSNN
+#                (train_snn.py --arch lsnn, models/model_bmi_lsnn.py) through the
+#                same LOSO pretrain -> fine-tune pipeline: 2 x 256 recurrent IAF,
+#                90% adaptive, synaptic filters 20 ms-1.3 s, readout from both layers,
+#                two readout stages. Its checkpoints go to lsnn_* directories; the
+#                pooled SNN above stays available with MODEL=pooled (its own
+#                directories, untouched).
 #   per_session  run_snn_per_session_array.sbatch: the Speck SNN ('speck'). 256 -> 128
 #                -> 64, threshold 1.0, 2 EMA stages, no tau_syn, hard reset (soft
 #                reset loses more accuracy on the chip). hkm trains the same way; its
@@ -72,9 +79,40 @@ select_model() {
             else
                 EPOCHS=50; PATIENCE=10; SCHEDULER_PATIENCE=5; CHECKPOINT_INTERVAL=10
             fi ;;
-        *) echo "ERROR: select_model pooled_pretrain|pooled|per_session, got '$1'" >&2; exit 1 ;;
+        lsnn|lsnn_pretrain)
+            # one network for both stages (no reset switch); epochs and patience as pooled
+            HIDDEN_DIMS=(256 256); THRESHOLDS=(); TAU_SYN=(); RESET_TYPE=soft
+            if [ "$EXPERIMENT" = "hkm" ]; then
+                EPOCHS=10; PATIENCE=5; SCHEDULER_PATIENCE=5; CHECKPOINT_INTERVAL=1
+            else
+                EPOCHS=50; PATIENCE=10; SCHEDULER_PATIENCE=10; CHECKPOINT_INTERVAL=10
+            fi ;;
+        *) echo "ERROR: select_model pooled_pretrain|pooled|lsnn_pretrain|lsnn|per_session, got '$1'" >&2; exit 1 ;;
     esac
     EXP_NAME="bmi_iaf_${RESET_TYPE}"   # file prefix train_snn.py uses (bmi_{neuron}_{reset})
+    CKPT_PREFIX=""
+    FINETUNE_ROOT="${CHECKPOINT_BASE}/${POOL_KIND}_finetuned_binarized_soft"
+    if [ "${1#lsnn}" != "$1" ]; then
+        EXP_NAME="bmi_lsnn"; CKPT_PREFIX="lsnn_"
+        FINETUNE_ROOT="${CHECKPOINT_BASE}/lsnn_${POOL_KIND}_finetuned_binarized"
+        TRAIN_ARGS=(
+            --config "$CONFIG_YAML"
+            --arch lsnn
+            --hidden-dims "${HIDDEN_DIMS[@]}"
+            --lsnn-out-stages 2
+            --lsnn-readout-all true
+            --weight-init kaiming
+            --binarize-input true
+            --batch-size "$BATCH_SIZE"
+            --num-workers 0
+            --epochs "$EPOCHS"
+            --patience "$PATIENCE"
+            --scheduler-patience "$SCHEDULER_PATIENCE"
+            --checkpoint-interval "$CHECKPOINT_INTERVAL"
+        )
+        MODEL_DESC="$1: LSNN hidden=${HIDDEN_DIMS[*]} (recurrent, 90% adaptive, readout from both layers, 2 readout stages) batch=${BATCH_SIZE} epochs<=${EPOCHS}"
+        return
+    fi
     TAU_SYN_ARGS=()
     [ ${#TAU_SYN[@]} -gt 0 ] && TAU_SYN_ARGS=(--tau-syn "${TAU_SYN[@]}")
     TRAIN_ARGS=(
@@ -111,9 +149,9 @@ pool_dir() {
 }
 pretrain_dir() {
     if [ "$LOSO" = "1" ]; then
-        echo "${CHECKPOINT_BASE}/loso_pretrained_binarized/$1"
+        echo "${CHECKPOINT_BASE}/${CKPT_PREFIX:-}loso_pretrained_binarized/$1"
     else
-        echo "${CHECKPOINT_BASE}/full_cohort_pretrained_binarized"
+        echo "${CHECKPOINT_BASE}/${CKPT_PREFIX:-}full_cohort_pretrained_binarized"
     fi
 }
 

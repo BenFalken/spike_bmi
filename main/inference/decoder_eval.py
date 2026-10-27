@@ -36,6 +36,7 @@ session's test split).
 import json
 import os
 import pickle as pkl
+import sys
 
 import numpy as np
 import torch
@@ -166,10 +167,20 @@ def load_snn_model(checkpoint_path, experiment, num_input_channels=None):
 
     Returns (model, checkpoint, velocity_scale); velocity_scale is
     (v_lo, v_hi, margin) as used in training."""
-    module = _model_module(experiment)
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     args = checkpoint['args']
     state_dict = checkpoint['model_state_dict']
+    if args.get('arch') == 'lsnn':
+        # the recurrent LSNN (train_snn.py --arch lsnn): rebuilt with the same call as in training
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'snn_training'))
+        from types import SimpleNamespace
+        from train_snn import build_model
+        _, model = build_model(SimpleNamespace(**args), experiment, checkpoint['input_shape'][0], torch.device('cpu'))
+        model.load_state_dict(state_dict)
+        model.eval()
+        model.binarize_input = bool(args.get('binarize_input', False))
+        return model, checkpoint, (args['velocity_lo'], args['velocity_hi'], args['velocity_margin'])
+    module = _model_module(experiment)
     n_channels = (num_input_channels or (checkpoint.get('input_shape') or [None])[0]
                   or state_dict['layers.0.weight'].shape[1])
     spike_fn = {'multi': MultiSpike, 'single': SingleSpike}.get(args.get('spike_fn'))

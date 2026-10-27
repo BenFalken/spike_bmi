@@ -12,8 +12,8 @@ and correlation), latency per sample, and energy per sample:
 | `kf` | Kalman filter |
 | `wf` | Wiener filter |
 | `lstm`, `qrnn` | recurrent networks (TensorFlow) |
-| `snn` | feedforward integrate-and-fire SNN (sinabs, PyTorch) with an EMA readout |
-| `speck` | the same SNN, quantized and deployed to a Speck2f devkit |
+| `snn` | recurrent LSNN (PyTorch): 2 × 256 recurrent integrate-and-fire, 90% adaptive, pretrained across sessions (LOSO) and fine-tuned; `MODEL=pooled` gives the earlier feedforward SNN with an EMA readout |
+| `speck` | a feedforward SNN (256 → 128 → 64), quantized and deployed to a Speck2f devkit |
 
 ## Layout
 
@@ -23,7 +23,7 @@ main/
   nwb_conversion/          datasets for the trial-structured NWB sessions (experiment "hkm")
   bmi/                     shared decoding code: preprocessing, decoders, CV loop, metrics
   snn_training/            train_snn.py: trains the SNN
-  models/                  SNN model definitions (model_bmi.py, model_hkm.py)
+  models/                  SNN model definitions (model_bmi_lsnn.py: the LSNN; model_bmi.py, model_hkm.py)
   utils/                   early stopping, checkpoints, training curves for train_snn.py
   inference/               evaluation of every decoder, the report, Speck deployment and diagnosis
   sbatch_scripts/          Slurm jobs for every stage (most also run locally with bash)
@@ -62,12 +62,24 @@ checkpoints are never skipped over or resumed from.
    --output ../snn_training/velocity_scalers.json` (merged into the file).
 3. **SNN for PyTorch ('snn'):** `run_snn_pooled_pretrain.sbatch`, then
    `run_snn_pooled_finetune_array.sbatch` (chained per session; see the pretrain script's
-   header). 512 → 256 → 128, threshold 1.0, 2 EMA stages, `tau_syn` initialized at 2, 4, 8
-   and 16 over the four spiking layers and trained; pretrained with hard reset, fine-tuned
-   with soft reset. Leave-one-session-out by default
+   header). By default (`MODEL=lsnn`) the recurrent LSNN (`models/model_bmi_lsnn.py`,
+   `train_snn.py --arch lsnn`), ported from the speech decoder: 2 × 256 recurrent
+   integrate-and-fire neurons, 90% with threshold adaptation (500 ms), a synaptic filter per
+   neuron (20 ms–1.3 s), soft reset, at most 3 spikes per step, a linear readout of both
+   layers through two leaky stages; about 223 k parameters. Trained on single sessions it
+   beat the network below on 3 of 4 indy sessions (mean velocity error 54.7 vs 57.2) at
+   about 0.03 spikes per neuron per step and 2.5× less CPU time per step
+   (`snn_training/compare_lsnn.py`, `run_sessions_local.sh`); `snn_training/compare_loso.py`
+   compares the two after LOSO pretraining and fine-tuning.
+   `MODEL=pooled` gives the earlier network: 512 → 256 → 128, threshold 1.0, 2 EMA stages,
+   `tau_syn` initialized at 2, 4, 8 and 16 over the four spiking layers and trained;
+   pretrained with hard reset, fine-tuned with soft reset (`--unit-gain-syn true` keeps its
+   synaptic filters from amplifying their input, 1.5× to 15.5× by layer otherwise).
+   Leave-one-session-out by default
    (`LOSO=1`): session i is fine-tuned from a model pretrained on every other session, so
    its own data never reaches pretraining. At most 50 epochs per stage for bmi, 10 for hkm.
-   → `snn_checkpoints/<exp>/<subject>/loso_finetuned_binarized_soft/<session>/`
+   → `snn_checkpoints/<exp>/<subject>/lsnn_loso_finetuned_binarized/<session>/`
+   (`MODEL=pooled`: `.../loso_finetuned_binarized_soft/<session>/`)
 4. **SNN for Speck ('speck'):** `run_snn_per_session_array.sbatch`. 256 → 128 → 64,
    threshold 1.0, 2 EMA stages, no `tau_syn` (the chip has no synaptic stage), hard reset
    (soft reset loses more accuracy on the chip; see below), trained
@@ -105,7 +117,7 @@ checkpoints are never skipped over or resumed from.
    `bash sbatch_scripts/run_inference.sbatch --local <exp> <subject>` (e.g. `--local bmi indy`).
    - Evaluates every decoder on every session (`inference/test_all_decoders.py`): accuracy,
      latency and energy per sample, `speck` on the devkit. `snn` runs the
-     `loso_finetuned_binarized_soft` checkpoints and `speck` the `per_session_binarized` ones (`SNN_CHECKPOINT_ROOT=`,
+     `lsnn_loso_finetuned_binarized` checkpoints (`MODEL=pooled`: `loso_finetuned_binarized_soft`) and `speck` the `per_session_binarized` ones (`SNN_CHECKPOINT_ROOT=`,
      `SPECK_CHECKPOINT_ROOT=` override them).
    - Builds the report (`inference/make_report.py`): `combined_metrics.json`,
      `efficiency_summary.json`, and the efficiency, energy and comparison figures. The
@@ -194,7 +206,8 @@ decoded as its own trial, from rest, never as part of one continuous recording.
 ## Findings
 
 These results predate the final pipeline above: they come from earlier bmi runs
-(unbinarized input, other SNN configurations) and will be replaced by its results.
+(unbinarized input, other SNN configurations, the feedforward SNN rather than the LSNN)
+and will be replaced by its results.
 
 ### Decoders (indy, 36 sessions)
 

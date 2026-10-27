@@ -15,7 +15,7 @@
 #      (one fit each on the training split; no CV folds, no durations)
 #   3. velocity scalers, once, after every subject's datasets:
 #      compute_velocity_scalers.py -> ../snn_training/velocity_scalers.json (merged)
-#   4. PyTorch SNN, after 3: run_snn_pooled_pretrain.sbatch, then per session
+#   4. PyTorch SNN (MODEL=lsnn by default: the recurrent LSNN), after 3: run_snn_pooled_pretrain.sbatch, then per session
 #      run_snn_pooled_finetune_array.sbatch (aftercorr: session i starts when its
 #      pretraining succeeds); LOSO=1 by default
 #   5. Speck SNN, after 3: run_snn_per_session_array.sbatch
@@ -27,6 +27,8 @@
 # A dependency on a job that failed stays pending forever: cancel it and re-run.
 #
 # Settings (environment): DATA_ROOT, SUBJECTS ("exp:subject ..."), LOSO (0/1),
+# MODEL (step 4's network: lsnn, the default, or pooled, the earlier SNN),
+# AFTER (job ids, colon-separated: nothing starts until they have ended),
 # HKM_TIME (Slurm time limit for hkm SNN jobs, default 48:00:00; an hkm epoch
 # takes about an hour per session), DRY_RUN=1.
 
@@ -36,6 +38,9 @@ cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 export DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
 SUBJECTS="${SUBJECTS:-bmi:indy bmi:loco hkm:jenkins}"
 export LOSO="${LOSO:-1}"
+export MODEL="${MODEL:-lsnn}"
+AFTER_ARGS=()
+[ -n "${AFTER:-}" ] && AFTER_ARGS=(--dependency=afterany:"$AFTER")
 HKM_TIME="${HKM_TIME:-48:00:00}"
 
 # submit [sbatch args...] -> prints the job id (DRY_RUN: prints the command to stderr)
@@ -49,7 +54,7 @@ submit() {
 }
 
 mkdir -p logs snn_logs bmi_logs hkm_logs ../nwb_conversion/logs
-echo "DATA_ROOT=$DATA_ROOT  subjects: $SUBJECTS  LOSO=$LOSO$([ "${DRY_RUN:-0}" = "1" ] && echo "  (dry run)")"
+echo "DATA_ROOT=$DATA_ROOT  subjects: $SUBJECTS  LOSO=$LOSO  MODEL=$MODEL${AFTER:+  after: $AFTER}$([ "${DRY_RUN:-0}" = "1" ] && echo "  (dry run)")"
 
 # --- 1-2: datasets, then the classical and DL decoders, per subject ---
 declare -A N_SESSIONS
@@ -72,12 +77,12 @@ for entry in $SUBJECTS; do
     array="--array=0-$((n - 1))"
     echo "${exp}/${subject}: ${n} sessions"
     if [ "$exp" = "hkm" ]; then
-        datasets=$(cd ../nwb_conversion && submit --export=ALL,SUBJECT="$subject" "$array" \
+        datasets=$(cd ../nwb_conversion && submit "${AFTER_ARGS[@]}" --export=ALL,SUBJECT="$subject" "$array" \
                    run_hkm_nwb_pipeline_array.sbatch)
         decoders=$(submit --dependency=afterany:"$datasets" --export=ALL,SUBJECT="$subject" "$array" \
                    run_hkm_subject_pipeline_array.sbatch)
     else
-        datasets=$(submit --export=ALL,SUBJECT="$subject",STAGE=datasets "$array" \
+        datasets=$(submit "${AFTER_ARGS[@]}" --export=ALL,SUBJECT="$subject",STAGE=datasets "$array" \
                    run_bmi_subject_pipeline_array.sbatch)
         decoders=$(submit --dependency=afterany:"$datasets" --export=ALL,SUBJECT="$subject" "$array" \
                    run_bmi_subject_pipeline_array.sbatch)
@@ -100,7 +105,7 @@ echo "velocity scalers: job $scalers"
 for entry in $SUBJECTS; do
     exp="${entry%%:*}"; subject="${entry#*:}"
     array="--array=0-$((N_SESSIONS[$entry] - 1))"
-    env_args="--export=ALL,EXPERIMENT=${exp},SUBJECT=${subject},LOSO=${LOSO}"
+    env_args="--export=ALL,EXPERIMENT=${exp},SUBJECT=${subject},LOSO=${LOSO},MODEL=${MODEL}"
     time_args=()
     [ "$exp" = "hkm" ] && time_args=(--time="$HKM_TIME")
     if [ "$LOSO" = "1" ]; then

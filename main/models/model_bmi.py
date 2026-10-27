@@ -262,13 +262,22 @@ class _SinabsNeuronLayer(nn.Module):
     needed for 1-timestep-at-a-time processing on linear layers (standard,
     non-Squeeze case), or passing through directly for Squeeze layers."""
 
-    def __init__(self, neuron_layer: nn.Module, last_layer_reset: bool = False, is_squeeze: bool = False):
+    def __init__(self, neuron_layer: nn.Module, last_layer_reset: bool = False, is_squeeze: bool = False,
+                 unit_gain_syn: bool = False):
         super().__init__()
         self.neuron = neuron_layer
         self.last_layer_reset = last_layer_reset
         self.is_squeeze = is_squeeze
+        # unit_gain_syn: sinabs' synaptic stage, i_syn <- alpha * (i_syn + input), settles at
+        # alpha / (1 - alpha) times a constant input (1.5x at tau_syn 2 steps, 15.5x at 16);
+        # scaling the input by (1 - alpha) / alpha makes it a unit-gain low-pass filter.
+        # Only acts when the neuron has a synaptic stage (tau_syn set).
+        self.unit_gain_syn = unit_gain_syn and getattr(neuron_layer, "tau_syn", None) is not None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.unit_gain_syn:
+            alpha = self.neuron.alpha_syn_calculated
+            x = x * (1 - alpha) / alpha
         if self.last_layer_reset:
             self.neuron.reset_states()
         if self.is_squeeze:
@@ -314,6 +323,7 @@ def add_linear_block(
     spike_threshold: float = 1.0,
     override_reset_type: Optional[str] = None,
     last_layer_reset: bool = False,
+    unit_gain_syn: bool = False,
 ) -> List[nn.Module]:
     """Append: Linear -> NeuronLayer."""
     layers.append(nn.Linear(in_features, out_features, bias=False))
@@ -321,7 +331,8 @@ def add_linear_block(
     if factory.use_sj:
         layers.append(_SJNeuronLayer(raw, last_layer_reset=last_layer_reset))
     else:
-        layers.append(_SinabsNeuronLayer(raw, last_layer_reset=last_layer_reset, is_squeeze=factory.use_squeeze))
+        layers.append(_SinabsNeuronLayer(raw, last_layer_reset=last_layer_reset, is_squeeze=factory.use_squeeze,
+                                         unit_gain_syn=unit_gain_syn))
     return layers
 
 
@@ -366,6 +377,7 @@ class SNN_Speck(nn.Module):
         velocity_lo: float = -280.56,
         velocity_hi: float = 316.54,
         velocity_margin: float = 0.05,
+        unit_gain_syn: bool = False,
     ):
         super().__init__()
         self.use_spikingjelly = use_spikingjelly
@@ -415,6 +427,7 @@ class SNN_Speck(nn.Module):
                 spike_threshold=thresholds[i],
                 override_reset_type=out_rst if is_last else None,
                 last_layer_reset=last_layer_reset if is_last else False,
+                unit_gain_syn=unit_gain_syn,
             )
         self.layers = nn.ModuleList(raw_layers)
         self.total_neuron_units = sum(layer_widths[1:])
@@ -701,6 +714,7 @@ def create_model(
     velocity_lo: float = -280.56,
     velocity_hi: float = 316.54,
     velocity_margin: float = 0.05,
+    unit_gain_syn: bool = False,
     **kwargs,
 ) -> SNN_Speck:
     """Factory function to create an SNN_Speck model.
@@ -752,6 +766,7 @@ def create_model(
         velocity_lo=velocity_lo,
         velocity_hi=velocity_hi,
         velocity_margin=velocity_margin,
+        unit_gain_syn=unit_gain_syn,
     )
 
     initialize_snn_model(model, weight_init)

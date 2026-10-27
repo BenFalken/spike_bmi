@@ -13,7 +13,8 @@
 #   bash run_inference.sbatch --local bmi           # every subject of the experiment in turn
 #
 # Checkpoints (defaults; see run_snn_pooled_*.sbatch and run_snn_per_session_array.sbatch):
-#   'snn'    ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/loso_finetuned_binarized_soft/<session>/
+#   'snn'    ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/lsnn_loso_finetuned_binarized/<session>/
+#            (the LSNN, MODEL=lsnn, default; MODEL=pooled: .../loso_finetuned_binarized_soft/, the earlier SNN)
 #   'speck'  ${DATA_ROOT}/snn_checkpoints/<experiment>/<subject>/per_session_binarized/<session>/
 #            (hkm: deployed with hidden layer 1's threshold x2, SPECK_H1_SCALE)
 # Sessions are those with an 'snn' checkpoint; a session without a 'speck'
@@ -128,6 +129,12 @@ DATA_ROOT="${DATA_ROOT:-/users/bfalkenb/scratch/bfalkenb/data}"
 # --------------------------------------------------------------------------
 # No subject: run this script once per subject of the experiment
 # --------------------------------------------------------------------------
+# The 'snn' decoder's fine-tuned checkpoints: the LSNN by default, the earlier SNN with MODEL=pooled
+case "${MODEL:-lsnn}" in
+    lsnn)   SNN_FINETUNE_DIRNAME="lsnn_loso_finetuned_binarized" ;;
+    pooled) SNN_FINETUNE_DIRNAME="loso_finetuned_binarized_soft" ;;
+    *) echo "ERROR: MODEL must be lsnn or pooled, got '${MODEL}'" >&2; exit 1 ;;
+esac
 if [ -z "${SUBJECT:-}" ]; then
     if [ -n "${SNN_CHECKPOINT_ROOT:-}${SPECK_CHECKPOINT_ROOT:-}${RESULTS_DIR:-}" ]; then
         echo "ERROR: SNN_CHECKPOINT_ROOT, SPECK_CHECKPOINT_ROOT and RESULTS_DIR are per subject; name a subject to set them" >&2
@@ -135,18 +142,18 @@ if [ -z "${SUBJECT:-}" ]; then
     fi
     SUBJECTS=()
     for d in $(find "${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}" -mindepth 2 -maxdepth 2 -type d \
-                    -name loso_finetuned_binarized_soft 2>/dev/null | sort); do
+                    -name "$SNN_FINETUNE_DIRNAME" 2>/dev/null | sort); do
         SUBJECTS+=("$(basename "$(dirname "$d")")")
     done
     if [ "${#SUBJECTS[@]}" -eq 0 ]; then
-        echo "ERROR: no ${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/<subject>/loso_finetuned_binarized_soft/" >&2
+        echo "ERROR: no ${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/<subject>/${SNN_FINETUNE_DIRNAME}/" >&2
         exit 1
     fi
     echo "Subjects of ${EXPERIMENT}: ${SUBJECTS[*]}"
     FAILED=()
     for subject in "${SUBJECTS[@]}"; do
         echo "##### ${EXPERIMENT}/${subject} #####"
-        DATA_ROOT="$DATA_ROOT" bash "$0" "$RUN" "$EXPERIMENT" "$subject" || FAILED+=("$subject")
+        DATA_ROOT="$DATA_ROOT" MODEL="${MODEL:-lsnn}" bash "$0" "$RUN" "$EXPERIMENT" "$subject" || FAILED+=("$subject")
     done
     [ "${#FAILED[@]}" -gt 0 ] && { echo "Failed subjects (see above): ${FAILED[*]}"; exit 1; }
     exit 0
@@ -168,7 +175,7 @@ DATASET_ROOT="${DATA_ROOT}/dataset/${EXPERIMENT}/${SUBJECT}/mua"
 MODEL_CACHE_ROOT="${DATA_ROOT}/results/model_cache/${EXPERIMENT}/${SUBJECT}"
 # SNN checkpoints: ${SNN_CHECKPOINT_ROOT}/<session>/[${SNN_CHECKPOINT_SUBDIR}/]best_model_weights.pth
 # (SNN_CHECKPOINT_SUBDIR selects one config of a sweep, e.g. wide768_2x)
-SNN_CHECKPOINT_ROOT="${SNN_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/loso_finetuned_binarized_soft}"
+SNN_CHECKPOINT_ROOT="${SNN_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/${SNN_FINETUNE_DIRNAME}}"
 SNN_CHECKPOINT_SUBDIR="${SNN_CHECKPOINT_SUBDIR:-}"
 # 'speck' needs a deployable network (no tau_syn): the per-session models.
 SPECK_CHECKPOINT_ROOT="${SPECK_CHECKPOINT_ROOT:-${DATA_ROOT}/snn_checkpoints/${EXPERIMENT}/${SUBJECT}/per_session_binarized}"

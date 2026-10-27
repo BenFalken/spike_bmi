@@ -42,6 +42,16 @@ Outputs in --checkpoint-dir, with exp_name = bmi_{neuron_type}_{reset_type}:
     final_model_{exp_name}.pth               written when training ends
     training_curves_{exp_name}.png, summary_{exp_name}.txt
 
+Architecture (--arch): "snn" (default) is the feedforward SNN above
+(models/model_{experiment}.py); "lsnn" is the recurrent LSNN ported from the
+speech decoder (models/model_bmi_lsnn.py): recurrent integrate-and-fire layers
+(--hidden-dims, default 256 256), a fraction of them with threshold adaptation
+(--lsnn-adaptive-fraction, --lsnn-tau-adapt-ms), per-neuron synaptic filters
+(--lsnn-tau-syn-ms), soft reset, up to --lsnn-max-spikes spikes per step and a
+leaky linear readout (--lsnn-out-tau-ms). It ignores the SNN-only options
+(--neuron-type, --reset-type, --spike-fn, --tau-syn, --n-bins, the EMA
+options) and is written as bmi_lsnn_* files.
+
 Resume an interrupted run with --resume CHECKPOINT; start a new run from
 another run's weights (fresh optimizer and epoch count) with
 --init-weights-from CHECKPOINT.
@@ -79,6 +89,26 @@ def parse_arguments():
                         help="YAML config; its values apply unless the flag is given explicitly")
 
     model = parser.add_argument_group("model")
+    model.add_argument("--arch", type=str, default="snn", choices=["snn", "lsnn"],
+                       help="snn: the feedforward SNN (models/model_{experiment}.py); lsnn: the recurrent "
+                            "LSNN ported from the speech decoder (models/model_bmi_lsnn.py)")
+    model.add_argument("--lsnn-adaptive-fraction", type=float, default=0.9,
+                       help="lsnn: fraction of each layer's neurons with threshold adaptation")
+    model.add_argument("--lsnn-tau-adapt-ms", type=float, default=500.0,
+                       help="lsnn: adaptation time constant (ms)")
+    model.add_argument("--lsnn-adapt-scale", type=float, default=1.8,
+                       help="lsnn: threshold increase per unit of adaptation")
+    model.add_argument("--lsnn-tau-syn-ms", type=float, nargs=2, default=[20.0, 1300.0], metavar=("LO", "HI"),
+                       help="lsnn: per-neuron synaptic time constants, log-spaced over [LO, HI] ms, trained")
+    model.add_argument("--lsnn-out-tau-ms", type=float, default=40.0,
+                       help="lsnn: readout time constant (ms), one per output, trained")
+    model.add_argument("--lsnn-readout-all", type=str2bool, default=False,
+                       help="lsnn: the readout reads every spiking layer, not only the last")
+    model.add_argument("--lsnn-out-stages", type=int, default=1,
+                       help="lsnn: leaky readout stages in series (2+ = a smoother output)")
+    model.add_argument("--lsnn-max-spikes", type=int, default=3, help="lsnn: spikes per neuron per step, at most")
+    model.add_argument("--lsnn-rec-init-scale", type=float, default=0.5,
+                       help="lsnn: scale of the orthogonal recurrent weights at the start")
     model.add_argument("--neuron-type", type=str, default="lif", choices=["iaf", "lif"])
     model.add_argument("--reset-type", type=str, default="hard", choices=["hard", "soft"])
     model.add_argument("--final-layer-reset-type", type=str, default=None, choices=["hard", "soft"],
@@ -106,6 +136,9 @@ def parse_arguments():
     model.add_argument("--temporal-decay-init", type=float, default=0.8,
                        help="Initial decay of the readout's EMA smoothing")
     model.add_argument("--learnable-temporal-decay", type=str2bool, default=True)
+    model.add_argument("--unit-gain-syn", type=str2bool, default=False,
+                       help="snn with --tau-syn: unit-gain synaptic filters (sinabs' synaptic stage alone amplifies a "
+                            "constant input alpha/(1-alpha) times: 1.5x at tau_syn 2, 15.5x at 16)")
     model.add_argument("--temporal-decay-stages", type=int, default=1,
                        help="Number of cascaded EMA stages in the readout")
     model.add_argument("--use-exodus", type=str2bool, default=None,
@@ -338,6 +371,25 @@ def build_loaders(args, experiment, subject):
 
 
 def build_model(args, experiment, num_input_channels, device):
+    if getattr(args, "arch", "snn") == "lsnn":
+        model_module = importlib.import_module("models.model_bmi_lsnn")
+        model = model_module.create_model(
+            num_input_channels=num_input_channels,
+            hidden_dims=args.hidden_dims,
+            adaptive_fraction=args.lsnn_adaptive_fraction,
+            tau_adapt_ms=args.lsnn_tau_adapt_ms,
+            adapt_scale=args.lsnn_adapt_scale,
+            tau_syn_ms=tuple(args.lsnn_tau_syn_ms),
+            out_tau_ms=args.lsnn_out_tau_ms,
+            out_stages=getattr(args, "lsnn_out_stages", 1),
+            readout_all=getattr(args, "lsnn_readout_all", False),
+            max_spikes=args.lsnn_max_spikes,
+            rec_init_scale=args.lsnn_rec_init_scale,
+            velocity_lo=args.velocity_lo,
+            velocity_hi=args.velocity_hi,
+            velocity_margin=args.velocity_margin,
+        ).to(device)
+        return model_module, model
     model_module = importlib.import_module(f"models.model_{experiment}")
     model = model_module.create_model(
         use_spikingjelly=args.use_spikingjelly,
@@ -363,6 +415,7 @@ def build_model(args, experiment, num_input_channels, device):
         velocity_lo=args.velocity_lo,
         velocity_hi=args.velocity_hi,
         velocity_margin=args.velocity_margin,
+        unit_gain_syn=getattr(args, "unit_gain_syn", False),
     ).to(device)
     return model_module, model
 
@@ -390,7 +443,9 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     exp_name = f"bmi_{args.neuron_type}_{args.reset_type}"
-    if args.neuron_type == "lif":
+    if args.arch == "lsnn":
+        exp_name = "bmi_lsnn"
+    elif args.neuron_type == "lif":
         exp_name += f"_tau{args.tau_mem}"
 
     if args.wandb:
